@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mowen": {
+      "command": "node",
+      "args": ["__REPLACE_WITH_FULL_PATH__/mowen-plugin/mcp-server/dist/index.js"],
+      "env": {
+        "MOWEN_API_KEY": "__REPLACE_WITH_YOUR_API_KEY__"
+      }
+    }
+  }
+}
