@@ -194,10 +194,11 @@ function extractWithReadability(url: string, domain: string): ExtractResult {
 
   const title = article.title || document.title;
   const contentHtml = article.content || '';
-  const contentEl = article.contentElement;
 
-  // Extract images from content
-  const images = contentEl ? extractImages(contentEl) : extractImages(document.body);
+  // Extract images from original content BEFORE cleaning
+  // This preserves images that might be in containers removed by cleanContent
+  const imageEl = article.imageElement || article.contentElement || document.body;
+  const images = extractImages(imageEl);
 
   // Parse blocks
   const tempDiv = document.createElement('div');
@@ -226,6 +227,7 @@ function extractArticle(doc: Document): {
   author?: string;
   publishTime?: string;
   contentElement?: HTMLElement;
+  imageElement?: HTMLElement;  // For image extraction before cleaning
 } {
   // Common article selectors
   const articleSelectors = [
@@ -255,13 +257,37 @@ function extractArticle(doc: Document): {
     contentElement = doc.body;
   }
 
-  // Clone and clean
+  // Clone for image extraction BEFORE cleaning (to preserve all images)
+  const imageClone = contentElement.cloneNode(true) as HTMLElement;
+
+  // Clone and clean for content extraction
   const clone = contentElement.cloneNode(true) as HTMLElement;
   cleanContent(clone);
 
-  // Extract title
+  // Extract title from original document
+  // Clone the title element to avoid modifying the original DOM
   const titleEl = doc.querySelector('h1') || doc.querySelector('title');
-  const title = titleEl?.textContent?.trim() || '';
+  let title = '';
+  if (titleEl) {
+    const titleClone = titleEl.cloneNode(true) as HTMLElement;
+    // Remove anchor links (# symbols) from title
+    titleClone.querySelectorAll('a.header-anchor, a.heading-anchor, a.anchor, .header-anchor').forEach(el => el.remove());
+    title = titleClone.textContent?.trim() || '';
+  }
+
+  // Remove ALL h1 elements from cloned content to avoid title duplication
+  // (api.ts will add the title as a separate h1 heading)
+  const clonedH1s = clone.querySelectorAll('h1');
+  clonedH1s.forEach(h1 => {
+    // Clean anchor links from h1 for comparison
+    const h1Clone = h1.cloneNode(true) as HTMLElement;
+    h1Clone.querySelectorAll('a.header-anchor, a.heading-anchor, a.anchor, .header-anchor').forEach(el => el.remove());
+    const h1Text = h1Clone.textContent?.trim() || '';
+    // Remove if matches title (or if it's empty after cleaning)
+    if (h1Text === title || h1Text === '') {
+      h1.remove();
+    }
+  });
 
   // Try to extract author
   const authorSelectors = [
@@ -303,6 +329,7 @@ function extractArticle(doc: Document): {
     author,
     publishTime,
     contentElement: clone,
+    imageElement: imageClone,
   };
 }
 
@@ -322,6 +349,53 @@ function cleanContent(element: HTMLElement): void {
     '.related-posts',
     '[aria-hidden="true"]',
     'iframe[src*="ads"]',
+    // Comment sections (various comment plugins)
+    '.vssue',
+    '.vssue-container',
+    '.gitalk-container',
+    '.gitalk',
+    '.giscus',
+    '.giscus-frame',
+    '.utterances',
+    '.disqus_thread',
+    '#disqus_thread',
+    '.comment-section',
+    '#comments',
+    '[class*="comment"]',
+    // VuePress/VitePress specific
+    '.page-edit',
+    '.page-nav',
+    '.page-meta',
+    '.last-updated',
+    // Header anchor links (the # links before headings)
+    'a.header-anchor',
+    'a.heading-anchor',
+    'a.anchor',
+    '.header-anchor',
+    // Twitter/X specific - profile info, subscribe buttons, engagement stats
+    '[data-testid="User-Name"]',
+    '[data-testid="UserName"]',
+    '[data-testid="User-Names"]',
+    '[data-testid="subscribe"]',
+    '[data-testid="reply"]',
+    '[data-testid="retweet"]',
+    '[data-testid="like"]',
+    '[data-testid="bookmark"]',
+    '[data-testid="share"]',
+    '[data-testid="analyticsButton"]',
+    '[data-testid="app-text-transition-container"]',  // Engagement numbers
+    // Note: Removed [role="group"] as it's too broad and removes images on Twitter
+    // Social media engagement stats patterns (more specific)
+    '[class*="engagement-bar"]',
+    '[class*="reactions-bar"]',
+    '[class*="like-count"]',
+    '[class*="retweet-count"]',
+    '[class*="reply-count"]',
+    '[class*="share-count"]',
+    '[class*="view-count"]',
+    // Subscribe/follow buttons
+    '[class*="subscribe-button"]',
+    '[class*="follow-button"]',
   ];
 
   for (const selector of removeSelectors) {
@@ -603,26 +677,8 @@ async function fetchImageAsBase64(url: string): Promise<{ base64: string; mimeTy
       }
     }
 
-    // Strategy 2: Direct fetch with credentials (same-origin or CORS-enabled)
-    if (!blob || blob.size === 0) {
-      try {
-        const response = await fetch(url, {
-          mode: 'cors',
-          credentials: 'include',
-          headers: {
-            'Accept': 'image/*,*/*;q=0.8',
-          },
-        });
-        if (response.ok) {
-          blob = await response.blob();
-          console.log('[墨问 Content] fetchImageAsBase64: direct fetch ok, size:', blob.size);
-        }
-      } catch (e) {
-        console.log('[墨问 Content] fetchImageAsBase64: direct fetch failed:', e);
-      }
-    }
-
-    // Strategy 3: Try without credentials (for some CDNs)
+    // Strategy 2: Try without credentials first (better for CDNs like Twitter pbs.twimg.com)
+    // This avoids CORS errors when servers don't support credentials mode
     if (!blob || blob.size === 0) {
       try {
         const response = await fetch(url, {
@@ -635,6 +691,25 @@ async function fetchImageAsBase64(url: string): Promise<{ base64: string; mimeTy
         }
       } catch (e) {
         console.log('[墨问 Content] fetchImageAsBase64: no-cred fetch failed:', e);
+      }
+    }
+
+    // Strategy 3: Direct fetch with credentials (for same-origin or sites that require auth)
+    if (!blob || blob.size === 0) {
+      try {
+        const response = await fetch(url, {
+          mode: 'cors',
+          credentials: 'include',
+          headers: {
+            'Accept': 'image/*,*/*;q=0.8',
+          },
+        });
+        if (response.ok) {
+          blob = await response.blob();
+          console.log('[墨问 Content] fetchImageAsBase64: with-cred fetch ok, size:', blob.size);
+        }
+      } catch (e) {
+        console.log('[墨问 Content] fetchImageAsBase64: with-cred fetch failed:', e);
       }
     }
 

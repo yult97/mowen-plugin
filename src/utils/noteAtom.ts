@@ -220,12 +220,12 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
       const codeIndex = parseInt(codeMatch[1]);
       const codeData = codeBlocks[codeIndex];
       if (codeData) {
-        // Create code block as paragraph with ``` wrapper
+        // Create code block as quote for better visual presentation
         const codeText = stripHtmlAndDecode(codeData.content).trim();
         if (codeText) {
           blocks.push({
-            type: 'paragraph',
-            content: [{ type: 'text', text: '```\n' + codeText + '\n```' }]
+            type: 'quote',
+            content: [{ type: 'text', text: codeText }]
           });
           stats.code++;
         }
@@ -344,7 +344,8 @@ function postProcessBlocks(blocks: NoteAtom[]): NoteAtom[] {
   }
 
   // Deduplicate consecutive empty paragraphs - keep only one
-  return deduplicateEmptyParagraphs(result);
+  // Also filter out unwanted social media content
+  return filterAndDeduplicateBlocks(result);
 }
 
 /**
@@ -356,40 +357,105 @@ function isEmptyParagraph(block: NoteAtom): boolean {
 
 /**
  * Collapse consecutive empty paragraphs into a single one
- * No matter how many empty lines in original, only keep one
- * Also removes leading and trailing empty paragraphs
+ * Also filter out unwanted social media metadata content
  */
-function deduplicateEmptyParagraphs(blocks: NoteAtom[]): NoteAtom[] {
-  const deduplicated: NoteAtom[] = [];
+function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
+  const filtered: NoteAtom[] = [];
 
-  for (const block of blocks) {
-    const lastBlock = deduplicated[deduplicated.length - 1];
+  // Patterns to filter out (social media metadata) - but NOT bullet-only content
+  const unwantedPatterns = [
+    /^订阅$/,
+    /^点击\s*订阅\s*到/,
+    /^Subscribe$/i,
+    /^Click.*subscribe/i,
+    /^Follow$/i,
+    /^\d+\.\s*$/,  // Number-only list items (no content)
+  ];
+
+  // Patterns that indicate a bullet prefix to merge with next paragraph
+  const bulletPatterns = [
+    /^•\s*$/,  // Bullet-only content
+    /^·\s*$/,  // Alternative bullet
+    /^[-–—]\s*$/,  // Dash-only
+  ];
+
+  let pendingBullet: string | null = null;
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+
+    // Check if this block should be filtered
+    if (block.type === 'paragraph' && block.content) {
+      const text = getTextFromAtom(block).trim();
+
+      // Skip if matches unwanted patterns
+      const shouldFilter = unwantedPatterns.some(pattern => pattern.test(text));
+      if (shouldFilter) {
+        continue;
+      }
+
+      // Check if this is a bullet-only paragraph
+      const isBulletOnly = bulletPatterns.some(pattern => pattern.test(text));
+      if (isBulletOnly) {
+        // Save the bullet prefix and skip this paragraph
+        pendingBullet = text.replace(/\s*$/, ' '); // Normalize to "• "
+        continue;
+      }
+
+      // If we have a pending bullet, prepend it to this paragraph
+      if (pendingBullet && block.content && block.content.length > 0) {
+        const firstNode = block.content[0];
+        if (firstNode.type === 'text' && firstNode.text) {
+          firstNode.text = pendingBullet + firstNode.text;
+        } else {
+          // Insert a new text node with the bullet
+          block.content.unshift({ type: 'text', text: pendingBullet });
+        }
+        pendingBullet = null;
+      }
+    }
+
+    // Reset pending bullet if we encounter non-paragraph block
+    if (block.type !== 'paragraph') {
+      pendingBullet = null;
+    }
+
+    const lastBlock = filtered[filtered.length - 1];
 
     // If current and previous are both empty paragraphs, skip current
     if (isEmptyParagraph(block) && lastBlock && isEmptyParagraph(lastBlock)) {
       continue; // Skip duplicate empty paragraph
     }
 
-    deduplicated.push(block);
+    filtered.push(block);
   }
 
   // Remove leading empty paragraphs
-  while (deduplicated.length > 0 && isEmptyParagraph(deduplicated[0])) {
-    deduplicated.shift();
+  while (filtered.length > 0 && isEmptyParagraph(filtered[0])) {
+    filtered.shift();
   }
 
   // Remove trailing empty paragraphs
-  while (deduplicated.length > 0 && isEmptyParagraph(deduplicated[deduplicated.length - 1])) {
-    deduplicated.pop();
+  while (filtered.length > 0 && isEmptyParagraph(filtered[filtered.length - 1])) {
+    filtered.pop();
   }
 
-  return deduplicated;
+  return filtered;
 }
 
 /**
  * Process a single block and apply formatting/empty line rules
  */
 function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
+  // Rule: Add empty paragraph BEFORE quote blocks (if there's content before)
+  if (block.type === 'quote' && result.length > 0) {
+    const lastBlock = result[result.length - 1];
+    // Only add empty paragraph if last block is not already empty
+    if (!isEmptyParagraph(lastBlock)) {
+      result.push({ type: 'paragraph' });
+    }
+  }
+
   // Apply formatting (Heading detection)
   if (block.type === 'paragraph') {
     const text = getTextFromAtom(block).trim();
@@ -438,8 +504,10 @@ function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
 
   result.push(block);
 
-  // Rule 5: Smart Empty Lines (REMOVED per user request)
-  // We rely on original content (<br>, empty paragraphs) for spacing.
+  // Rule: Add empty paragraph AFTER quote blocks
+  if (block.type === 'quote') {
+    result.push({ type: 'paragraph' });
+  }
 }
 
 /**
@@ -529,9 +597,15 @@ function convertListItems(listHtml: string, ordered: boolean): string {
   let match;
 
   while ((match = liRegex.exec(listHtml)) !== null) {
-    const content = match[1].trim();
+    let content = match[1];
+    // Strip inner <p> tags to avoid extra block creation
+    content = content.replace(/<\/?p[^>]*>/gi, '').trim();
+    // Skip empty list items
+    if (!content) continue;
+
     const prefix = ordered ? `${itemIndex}. ` : '• ';
-    result += `\n<p>${prefix}${content}</p>\n`;
+    // Use compact format: no extra newlines between items
+    result += `<p>${prefix}${content}</p>`;
     itemIndex++;
   }
 

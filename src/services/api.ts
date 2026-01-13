@@ -4,8 +4,8 @@ import { htmlToNoteAtom } from '../utils/noteAtom';
 
 const API_BASE_URL = 'https://open.mowen.cn/api/open/api/v1';
 
-// Rate limiting: 1 request per second for upload APIs (per docs)
-const UPLOAD_RATE_LIMIT_MS = 1100;
+// Rate limiting: 1000ms between upload API calls (per official docs: 1 req/sec)
+const UPLOAD_RATE_LIMIT_MS = 1000;
 let lastUploadApiTime = 0;
 
 interface ApiResponse<T> {
@@ -378,13 +378,17 @@ export async function createNote(
     // Privacy is already set via autoPublish in the create request
     // No need to call /note/set endpoint separately
 
-    // Build note URL from noteId
-    const noteUrl = `https://note.mowen.cn/detail/${noteId}`;
+    // Build note URLs from noteId
+    // noteUrl: for direct access (editor for private, detail for public)
+    // shareUrl: always detail for sharing/collection links
+    const shareUrl = `https://note.mowen.cn/detail/${noteId}`;
+    const noteUrl = isPublic ? shareUrl : `https://note.mowen.cn/editor/${noteId}`;
 
     return {
       success: true,
       noteId,
       noteUrl,
+      shareUrl,
     };
   } catch (error) {
     // Even if the API returns an error, check if the note was actually created
@@ -396,11 +400,13 @@ export async function createNote(
 
       if (fallbackNoteId) {
         // Note was created successfully despite error response
-        const noteUrl = `https://note.mowen.cn/detail/${fallbackNoteId}`;
+        const shareUrl = `https://note.mowen.cn/detail/${fallbackNoteId}`;
+        const noteUrl = isPublic ? shareUrl : `https://note.mowen.cn/editor/${fallbackNoteId}`;
         return {
           success: true,
           noteId: fallbackNoteId,
           noteUrl,
+          shareUrl,
         };
       }
 
@@ -562,6 +568,7 @@ export async function uploadPrepare(
   console.log(`[img] local prepare start fileName=${fileName}`);
 
   try {
+    // Acquire rate limit before API call
     await waitForRateLimit();
 
     const data = await apiRequest<UploadPrepareResponse>('/upload/prepare', apiKey, {

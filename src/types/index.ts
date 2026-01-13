@@ -16,7 +16,7 @@ export const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   defaultPublic: false,
   defaultIncludeImages: true,
-  maxImages: 20,
+  maxImages: 10,
   createIndexNote: true,
   debugMode: false,
   lastTestStatus: null,
@@ -88,13 +88,14 @@ export interface NotePart {
 export interface NoteCreateResult {
   success: boolean;
   noteId?: string;
-  noteUrl?: string;
+  noteUrl?: string;      // URL for jumping (based on public/private setting)
+  shareUrl?: string;     // URL for sharing/collection (always /detail/)
   error?: string;
   errorCode?: string;
 }
 
 // Save progress types
-export type SaveStatus = 'idle' | 'extracting' | 'uploading' | 'creating' | 'success' | 'failed';
+export type SaveStatus = 'idle' | 'extracting' | 'uploading' | 'creating' | 'success' | 'failed' | 'cancelled';
 
 export interface SaveProgress {
   status: SaveStatus;

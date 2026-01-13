@@ -14,7 +14,10 @@ import {
   RefreshCw,
   ExternalLink,
   AlertCircle,
+  Key,
+  BookOpen,
 } from 'lucide-react';
+import TutorialModal from '../components/TutorialModal';
 
 // Card 4 state machine: P0-P5
 type PreviewState = 'P0_Idle' | 'P1_PreviewLoading' | 'P2_PreviewReady' | 'P3_Saving' | 'P4_Success' | 'P5_Failed';
@@ -34,6 +37,8 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [isClippable, setIsClippable] = useState(true);
   const [previewState, setPreviewState] = useState<PreviewState>('P0_Idle');
   const [loading, setLoading] = useState(true);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
 
   // State to trigger auto-fetch preview
   const [autoFetchTrigger, setAutoFetchTrigger] = useState(0);
@@ -724,6 +729,35 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     setProgress({ status: 'idle' });
   };
 
+  // Show cancel confirmation modal
+  const handleCancelClick = () => {
+    setShowCancelConfirm(true);
+  };
+
+  // User confirms cancel - actually stop the save
+  const handleConfirmCancel = async () => {
+    console.log('[墨问 Popup] ❌ User confirmed cancel');
+    setShowCancelConfirm(false);
+    try {
+      await chrome.runtime.sendMessage({ type: 'CANCEL_SAVE' });
+    } catch (err) {
+      console.error('[墨问 Popup] Failed to send cancel message:', err);
+    }
+    setPreviewState('P5_Failed');
+    setProgress({ status: 'cancelled' });
+  };
+
+  // User wants to continue saving
+  const handleContinueSave = () => {
+    setShowCancelConfirm(false);
+  };
+
+  // Reset to try again after cancel
+  const handleRestartAfterCancel = () => {
+    setPreviewState('P2_PreviewReady');
+    setProgress({ status: 'idle' });
+  };
+
   const handleRetryExtraction = () => {
     handleGetPreview();
   };
@@ -838,22 +872,31 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     // 1. No API Key
     if (!hasApiKey) {
       return (
-        <div className="card p-4 mb-3">
-          <div className="text-center py-2">
-            <div className="w-12 h-12 bg-brand-soft rounded-full flex items-center justify-center mx-auto mb-3">
-              <SettingsIcon className="text-brand-primary" size={24} />
+        <div className="card p-5 mb-3 bg-brand-soft/30 border-brand-soft">
+          <div className="text-center">
+            <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center mx-auto mb-3 shadow-sm border border-brand-soft">
+              <Key className="text-brand-primary" size={24} />
             </div>
-            <h4 className="text-sm font-semibold text-text-primary mb-1">还没配置 API Key</h4>
-            <p className="text-xs text-text-secondary mb-4">配置后才能创建笔记并上传图片</p>
-            <button className="btn-primary w-full mb-2" onClick={() => openOptions()}>
-              去配置 API Key
-            </button>
-            <button
-              className="text-xs text-brand-primary hover:underline"
-              onClick={() => window.open('https://mowen.cn/help/api', '_blank')}
-            >
-              查看教程
-            </button>
+            <h4 className="text-sm font-semibold text-text-primary mb-1">未配置 API Key</h4>
+            <p className="text-xs text-text-secondary mb-4 leading-relaxed">
+              配置后即可保存到墨问<br />
+              请先在<strong>墨问微信小程序</strong>生成 Key
+            </p>
+            <div className="flex flex-col gap-2">
+              <button
+                className="btn-primary w-full"
+                onClick={() => openOptions()}
+              >
+                去设置
+              </button>
+              <button
+                className="text-xs text-brand-primary hover:underline flex items-center justify-center gap-1.5 py-1"
+                onClick={() => setShowTutorial(true)}
+              >
+                <BookOpen size={12} />
+                查看获取教程
+              </button>
+            </div>
           </div>
         </div>
       );
@@ -862,21 +905,17 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     // 2. Not Tested
     if (!testSuccess) {
       return (
-        <div className="card p-4 mb-3">
-          <div className="text-center py-2">
-            <div className="w-12 h-12 bg-yellow-100 rounded-full flex items-center justify-center mx-auto mb-3">
+        <div className="card p-5 mb-3 bg-yellow-50/50 border-yellow-100">
+          <div className="text-center">
+            <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center mx-auto mb-3 shadow-sm border border-yellow-100">
               <AlertCircle className="text-yellow-600" size={24} />
             </div>
-            <h4 className="text-sm font-semibold text-text-primary mb-1">API Key 已填写</h4>
-            <p className="text-xs text-text-secondary mb-4">建议先测试连接,避免保存时失败</p>
-            <button className="btn-primary w-full mb-2" onClick={() => openOptions('test')}>
-              去测试连接
-            </button>
-            <button
-              className="text-xs text-text-secondary hover:text-text-primary"
-              onClick={() => { /* In a real app, we might set a flag to ignore this warning */ }}
-            >
-              稍后再说
+            <h4 className="text-sm font-semibold text-text-primary mb-1">API Key 未通过测试</h4>
+            <p className="text-xs text-text-secondary mb-4">
+              建议先进行连接测试，以确保 API 有效
+            </p>
+            <button className="btn-primary w-full mb-2" onClick={() => openOptions()}>
+              测试连接
             </button>
           </div>
         </div>
@@ -989,81 +1028,146 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
     // P3 Saving
     if (previewState === 'P3_Saving') {
+      const imageProgress = progress.totalImages ? (progress.uploadedImages || 0) / progress.totalImages : 0;
+      const noteProgress = progress.totalParts ? (progress.currentPart || 0) / progress.totalParts : 0;
+      const isUploadingImages = progress.totalImages && (progress.uploadedImages || 0) < progress.totalImages;
+
+      // Generate cancel confirmation description
+      const getCancelDescription = () => {
+        if (progress.totalImages && progress.totalImages > 0) {
+          return `已上传 ${progress.uploadedImages || 0}/${progress.totalImages} 张图片，停止后本次内容不会写入墨问。`;
+        }
+        return '正在准备保存，停止后本次内容不会写入墨问。';
+      };
+
       return (
-        <div className="card p-4 mb-3">
-          <h3 className="text-sm font-semibold text-text-primary mb-3">剪藏预览</h3>
-          <div className="text-center py-6">
-            <RefreshCw className="animate-spin text-brand-primary mx-auto mb-3" size={32} />
-            <p className="text-sm font-medium text-text-primary mb-2">正在保存到墨问…</p>
-            <div className="text-xs text-text-secondary space-y-1">
-              {progress.currentPart && progress.totalParts && (
-                <p>创建笔记 ({progress.currentPart}/{progress.totalParts})</p>
-              )}
-              {progress.uploadedImages !== undefined && progress.totalImages !== undefined && (
-                <p>上传图片 ({progress.uploadedImages}/{progress.totalImages})</p>
-              )}
-              <p>设置公开/私密</p>
-            </div>
+        <div className="card p-4 mb-3 relative">
+          {/* Header with X button */}
+          <div className="flex justify-between items-center mb-3">
+            <h3 className="text-sm font-semibold text-text-primary">剪藏预览</h3>
             <button
-              className="text-xs text-text-secondary hover:text-text-primary mt-4"
-              onClick={() => {/* Show details */ }}
+              className="w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-brand-primary hover:bg-brand-soft transition-colors"
+              onClick={handleCancelClick}
+              title="停止保存"
             >
-              查看详情
+              <X size={16} />
             </button>
           </div>
-        </div>
-      );
-    }
 
-    // P4 Success
-    if (previewState === 'P4_Success') {
-      const notes = progress.notes || [];
-      const indexNote = notes.find(n => n.isIndex);
-      const partNotes = notes.filter(n => !n.isIndex);
-
-      return (
-        <div className="card p-4 mb-3">
-          <h3 className="text-sm font-semibold text-text-primary mb-3">剪藏预览</h3>
           <div className="text-center py-4">
-            <div className="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-3">
-              <Check className="text-green-600" size={24} />
+            <RefreshCw className="animate-spin text-brand-primary mx-auto mb-3" size={32} />
+            <p className="text-sm font-medium text-text-primary mb-4">正在保存到墨问…</p>
+
+            {/* Progress Bars */}
+            <div className="space-y-3 text-left px-2">
+              {/* Image Upload Progress */}
+              {progress.totalImages !== undefined && progress.totalImages > 0 && (
+                <div>
+                  <div className="flex justify-between items-center text-xs mb-1">
+                    <span className="text-text-secondary">
+                      {isUploadingImages ? '正在上传图片...' : '图片上传完成'}
+                    </span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-text-secondary">{progress.uploadedImages || 0}/{progress.totalImages}</span>
+                      <button
+                        className="text-brand-primary hover:underline px-2 py-1"
+                        onClick={handleCancelClick}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                  <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-brand-primary rounded-full transition-all duration-300"
+                      style={{ width: `${imageProgress * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Note Creation Progress */}
+              {progress.totalParts !== undefined && progress.totalParts > 0 && (
+                <div>
+                  <div className="flex justify-between items-center text-xs mb-1">
+                    <span className="text-text-secondary">
+                      {progress.currentPart && progress.currentPart < progress.totalParts ? '正在创建笔记...' : '笔记创建'}
+                    </span>
+                    <span className="text-text-secondary">{progress.currentPart || 0}/{progress.totalParts}</span>
+                  </div>
+                  <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-green-500 rounded-full transition-all duration-300"
+                      style={{ width: `${noteProgress * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Status Text when no progress bars shown */}
+              {!progress.totalImages && !progress.totalParts && (
+                <p className="text-xs text-text-secondary text-center">处理中...</p>
+              )}
             </div>
-            <p className="text-sm font-medium text-text-primary mb-3">保存成功!</p>
-
-            {indexNote && (
-              <a
-                href={indexNote.noteUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="btn-primary w-full mb-2 inline-flex items-center justify-center gap-2"
-              >
-                打开索引笔记 <ExternalLink size={16} />
-              </a>
-            )}
-
-            {partNotes.length > 0 && (
-              <div className="space-y-2 mt-2">
-                {partNotes.map((note, index) => (
-                  <a
-                    key={index}
-                    href={note.noteUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center justify-between p-2.5 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors text-sm"
-                  >
-                    <span className="text-text-primary">第 {note.partIndex + 1} 篇</span>
-                    <ExternalLink size={14} className="text-brand-primary" />
-                  </a>
-                ))}
-              </div>
-            )}
           </div>
+
+          {/* Confirmation Modal */}
+          {showCancelConfirm && (
+            <div className="absolute inset-0 bg-white/95 rounded-xl flex flex-col items-center justify-center p-4 z-10">
+              <AlertCircle className="text-brand-primary mb-3" size={32} />
+              <h4 className="text-base font-semibold text-text-primary mb-2">停止保存？</h4>
+              <p className="text-sm text-text-secondary text-center mb-4 px-2">
+                {getCancelDescription()}
+              </p>
+              <div className="flex gap-3">
+                <button
+                  className="px-4 py-2 text-sm border border-gray-300 rounded-lg text-text-secondary hover:bg-gray-50"
+                  onClick={handleConfirmCancel}
+                >
+                  停止
+                </button>
+                <button
+                  className="px-4 py-2 text-sm bg-brand-primary text-white rounded-lg hover:opacity-90"
+                  onClick={handleContinueSave}
+                >
+                  继续保存
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
 
-    // P5 Failed
+    // P5 Failed / Cancelled
     if (previewState === 'P5_Failed') {
+      // Check if this is a cancel state
+      const isCancelled = progress.status === 'cancelled';
+
+      if (isCancelled) {
+        return (
+          <div className="card p-4 mb-3">
+            <h3 className="text-sm font-semibold text-text-primary mb-3">剪藏预览</h3>
+            <div className="text-center py-4">
+              <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-3">
+                <X className="text-gray-500" size={24} />
+              </div>
+              <p className="text-sm font-medium text-text-primary mb-1">已停止</p>
+              <p className="text-xs text-text-secondary mb-4">本次内容未写入墨问。</p>
+              <div className="flex gap-2 justify-center">
+                <button
+                  className="btn-primary text-sm"
+                  onClick={handleRestartAfterCancel}
+                >
+                  重新开始
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // Regular P5_Failed (error state)
       const errorNeedsRefresh = progress.error?.includes('刷新页面');
       const isExtractionFailed = progress.error?.includes('提取失败') || progress.error?.includes('超时') || progress.error?.includes('未加载');
 
@@ -1094,7 +1198,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                 </button>
               )}
 
-              <div className={errorNeedsRefresh ? "flex gap-2" : "flex gap-2"}>
+              <div className="flex gap-2">
                 {isExtractionFailed ? (
                   <button className="btn-primary flex-1" onClick={handleRetryExtraction}>
                     重新获取预览
@@ -1117,16 +1221,8 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                 className="text-xs text-text-secondary hover:text-text-primary"
                 onClick={() => openOptions()}
               >
-                去设置
-              </button>
-              <button
-                className="text-xs text-text-secondary hover:text-text-primary"
-                onClick={() => {
-                  console.log('[墨问] Error details:', progress);
-                  alert(`错误信息: ${progress.error || '未知错误'}\n错误代码: ${progress.errorCode || 'N/A'}`);
-                }}
-              >
-                查看详情
+                <SettingsIcon size={12} className="inline mr-1" />
+                设置
               </button>
             </div>
           </div>
@@ -1134,8 +1230,58 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       );
     }
 
+    // P4 Success
+    if (previewState === 'P4_Success') {
+      const notes = progress.notes || [];
+      const indexNote = notes.find(n => n.isIndex);
+      const partNotes = notes.filter(n => !n.isIndex);
+
+      return (
+        <div className="card p-4 mb-3">
+          <h3 className="text-sm font-semibold text-text-primary mb-3">剪藏预览</h3>
+          <div className="text-center py-4">
+            <div className="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-3">
+              <Check className="text-green-600" size={24} />
+            </div>
+            <p className="text-sm font-medium text-text-primary mb-3">保存成功!</p>
+
+            {indexNote && (
+              <a
+                href={indexNote.noteUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-primary w-full mb-2 inline-flex items-center justify-center gap-2"
+              >
+                打开合集笔记 <ExternalLink size={16} />
+              </a>
+            )}
+
+            {partNotes.length > 0 && (
+              <div className="space-y-2 mt-2">
+                {partNotes.map((note, index) => (
+                  <a
+                    key={index}
+                    href={note.noteUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-between p-2.5 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors text-sm"
+                  >
+                    <span className="text-text-primary">第 {note.partIndex + 1} 篇</span>
+                    <ExternalLink size={14} className="text-brand-primary" />
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     return null;
   };
+
+  // Remove the hard exit if no API key is configured
+  // This allows showing the guide card within the normal layout
 
   return (
     <div className={isSidePanel ? 'sidepanel-container p-4' : 'popup-container p-4'}>
@@ -1171,14 +1317,24 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         </div>
       ) : (
         <>
-          {/* Card 1: Main Preview/Action Card (Contains Status logic used to be in ActionCard) */}
+          {/* Card 1: Main Preview/Action Card */}
           {renderPreviewCard()}
 
           {/* Card 2: Quick Settings */}
           {renderQuickSettings()}
 
-          {/* Card 3: Feature Overview (Moved to bottom) */}
+          {/* Card 3: Feature Overview */}
           {renderFeatureOverview()}
+
+          {/* Tutorial Modal */}
+          <TutorialModal
+            isOpen={showTutorial}
+            onClose={() => setShowTutorial(false)}
+            onConfirm={() => {
+              setShowTutorial(false);
+              openOptions();
+            }}
+          />
         </>
       )}
     </div>
@@ -1186,3 +1342,4 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 };
 
 export default Popup;
+

@@ -15,6 +15,10 @@ const SAFE_LIMIT = 19000;
 const MAX_RETRY_ROUNDS = 3;
 const IMAGE_TIMEOUT = 30000;  // 30 seconds per image (increased for local upload)
 
+// Cancel mechanism for save operation
+let isCancelRequested = false;
+let saveAbortController: AbortController | null = null;
+
 interface SaveNotePayload {
   extractResult: ExtractResult;
   isPublic: boolean;
@@ -40,6 +44,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'PING') {
     console.log('[墨问 Background] 🏓 PING received');
     sendResponse({ success: true, status: 'pong' });
+    return false;
+  }
+
+  if (message.type === 'CANCEL_SAVE') {
+    console.log('[墨问 Background] ❌ CANCEL_SAVE received');
+    isCancelRequested = true;
+    // Abort any in-flight requests
+    if (saveAbortController) {
+      saveAbortController.abort();
+      console.log('[墨问 Background] 🛑 AbortController.abort() called');
+    }
+    sendResponse({ success: true });
     return false;
   }
 
@@ -166,6 +182,10 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
   const { extractResult, isPublic, includeImages, maxImages, createIndexNote } = payload;
 
+  // Reset cancel flag and create new AbortController
+  isCancelRequested = false;
+  saveAbortController = new AbortController();
+
   // Defensive check for extractResult
   if (!extractResult) {
     console.error('[墨问 Background] ❌ extractResult is undefined/null');
@@ -232,7 +252,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
     // Step 4: Create notes
     console.log(`[note] create start title="${extractResult.title.substring(0, 30)}..." partsCount=${parts.length}`);
     logToContentScript(`创建 ${parts.length} 篇笔记...`);
-    const createdNotes: Array<{ partIndex: number; noteUrl: string; noteId: string; isIndex?: boolean }> = [];
+    const createdNotes: Array<{ partIndex: number; noteUrl: string; noteId: string; shareUrl?: string; isIndex?: boolean }> = [];
 
     for (const part of parts) {
       // Send progress update
@@ -276,6 +296,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
             partIndex: part.index,
             noteUrl: result.noteUrl!,
             noteId: result.noteId!,
+            shareUrl: result.shareUrl!,  // For collection links
           });
           break; // Success, exit retry loop
         } else {
@@ -306,7 +327,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
       );
       const indexResult = await createNote(
         settings.apiKey,
-        `${extractResult.title}（索引）`,
+        `${extractResult.title}（合集）`,
         indexContent,
         isPublic,
         undefined,
@@ -423,7 +444,7 @@ async function fetchImageBlobFromCS(imageUrl: string): Promise<{ blob: Blob; mim
   }
 }
 
-// Image processing functions - now using uploadImageWithFallback with Remote→Local→Link strategy
+// Image processing functions - using serial processing to respect API rate limits
 async function processImages(
   apiKey: string,
   images: ImageCandidate[]
@@ -434,31 +455,40 @@ async function processImages(
   const results: ImageProcessResult[] = [];
   const totalImages = images.length;
 
-  // Process images SERIALLY to respect rate limiting (1 req/sec)
+  // Process images serially to respect API rate limiting
   for (let i = 0; i < images.length; i++) {
+    // Check if cancel was requested
+    if (isCancelRequested) {
+      console.log('[img] ⚠️ Cancel requested, stopping image processing');
+      logToContentScript('⚠️ 用户取消，停止图片上传');
+      break;
+    }
+
     const image = images[i];
-    console.log(`[img] processing ${i + 1}/${totalImages}: ${image.url.substring(0, 50)}...`);
-    logToContentScript(`🖼️ 处理图片 ${i + 1}/${totalImages}...`);
+    const imageIndex = i + 1;
+
+    console.log(`[img] processing ${imageIndex}/${totalImages}: ${image.url.substring(0, 50)}...`);
+    logToContentScript(`🖼️ 处理图片 ${imageIndex}/${totalImages}...`);
 
     try {
       const result = await processImage(apiKey, image);
       results.push(result);
 
       if (result.success) {
-        logToContentScript(`✅ 图片 ${i + 1} 上传成功, uid=${result.uid || 'N/A'}`);
+        logToContentScript(`✅ 图片 ${imageIndex} 上传成功, uid=${result.uid || 'N/A'}`);
       } else {
-        logToContentScript(`❌ 图片 ${i + 1} 上传失败: ${result.failureReason || 'unknown'}`);
+        logToContentScript(`❌ 图片 ${imageIndex} 上传失败: ${result.failureReason || 'unknown'}`);
       }
 
       sendProgressUpdate({
         type: 'uploading_images',
-        uploadedImages: i + 1,
+        uploadedImages: imageIndex,
         totalImages,
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Unknown error';
-      console.error(`[img] processImage ${i + 1} exception:`, err);
-      logToContentScript(`❌ 图片 ${i + 1} 处理异常: ${errMsg}`);
+      console.error(`[img] processImage ${imageIndex} exception:`, err);
+      logToContentScript(`❌ 图片 ${imageIndex} 处理异常: ${errMsg}`);
       results.push({
         id: image.id,
         originalUrl: image.url,
@@ -566,7 +596,10 @@ function replaceImageUrls(
   console.log(`[sw] replaceImageUrls: processing ${imageResults.length} results`);
 
   // Replace successfully uploaded images
-  for (const result of imageResults) {
+  for (let i = 0; i < imageResults.length; i++) {
+    const result = imageResults[i];
+    const imageIndex = i + 1; // 1-based index for display
+
     console.log(`[sw] replaceImageUrls: result for ${result.originalUrl.substring(0, 50)}...`, {
       success: result.success,
       assetUrl: result.assetUrl?.substring(0, 50),
@@ -577,53 +610,104 @@ function replaceImageUrls(
     if (result.success && result.assetUrl && result.uid) {
       successCount++;
 
-      // Strategy: Find img tags that contain the original URL (or a similar URL) in any src-like attribute
-      // and inject data-mowen-uid attribute
+      // Strategy: Find img tags that contain the original URL and inject data-mowen-uid attribute
+      // We try multiple matching strategies to handle various URL formats
 
-      // Extract base part of URL for more flexible matching (before query params)
-      const urlParts = result.originalUrl.split('?');
-      const baseUrl = urlParts[0];
+      const originalUrl = result.originalUrl;
+      let matched = false;
 
-      // For WeChat images: https://mmbiz.qpic.cn/mmbiz_jpg/UNIQUE_ID/640
-      // The /640 at end is common to all images (width parameter)
-      // We need to use the UNIQUE_ID part for matching
+      // Strategy 1: Try exact URL match first
+      const exactUrlEscaped = escapeRegExp(originalUrl);
+      const exactRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["']${exactUrlEscaped}["'][^>]*)>`, 'gi');
 
-      // Remove trailing /640 or similar width suffix, then take the last meaningful part
-      const urlWithoutWidthSuffix = baseUrl.replace(/\/\d{1,4}$/, '');
+      if (exactRegex.test(processed)) {
+        exactRegex.lastIndex = 0; // Reset regex state
+        processed = processed.replace(exactRegex, (match, imgTagContent) => {
+          if (imgTagContent.includes('data-mowen-uid')) {
+            return match;
+          }
+          console.log(`[sw] replaceImageUrls: exact match, injecting uid=${result.uid}`);
+          matched = true;
+          return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+        });
+      }
 
-      // Take the last 50 characters as identifier - should be unique for each image
-      // This captures the unique ID without the common prefix or suffix
-      const urlIdentifier = urlWithoutWidthSuffix.slice(-50);
+      // Strategy 2: Try URL without query params
+      if (!matched) {
+        const urlParts = originalUrl.split('?');
+        const baseUrl = urlParts[0];
+        const baseUrlEscaped = escapeRegExp(baseUrl);
+        const baseUrlRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${baseUrlEscaped}[^"']*["'][^>]*)>`, 'gi');
 
-      // Escape for regex
-      const escapedIdentifier = escapeRegExp(urlIdentifier);
-
-      // Find img tags containing this identifier in any attribute
-      const imgTagRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedIdentifier}[^"']*["'][^>]*)>`, 'gi');
-
-      console.log(`[sw] replaceImageUrls: searching for identifier="${urlIdentifier}" in content (length=${processed.length})`);
-
-      let matchCount = 0;
-      processed = processed.replace(imgTagRegex, (match, imgTagContent) => {
-        matchCount++;
-        // Check if already has data-mowen-uid
-        if (imgTagContent.includes('data-mowen-uid')) {
-          console.log(`[sw] replaceImageUrls: already has data-mowen-uid, skipping`);
-          return match;
+        if (baseUrlRegex.test(processed)) {
+          baseUrlRegex.lastIndex = 0;
+          processed = processed.replace(baseUrlRegex, (match, imgTagContent) => {
+            if (imgTagContent.includes('data-mowen-uid')) {
+              return match;
+            }
+            console.log(`[sw] replaceImageUrls: base URL match, injecting uid=${result.uid}`);
+            matched = true;
+            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+          });
         }
-        console.log(`[sw] replaceImageUrls: injecting uid=${result.uid} into img tag`);
-        // Inject data-mowen-uid attribute before the closing >
-        return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-      });
+      }
 
-      console.log(`[sw] replaceImageUrls: matched ${matchCount} img tags for identifier "${urlIdentifier.substring(0, 30)}"`);
-      if (matchCount === 0) {
-        console.warn(`[sw] replaceImageUrls: NO MATCH for url=${result.originalUrl.substring(0, 80)}`);
+      // Strategy 3: Try matching by URL identifier (last 50 chars, removing width suffix)
+      if (!matched) {
+        const urlParts = originalUrl.split('?');
+        const baseUrl = urlParts[0];
+        const urlWithoutWidthSuffix = baseUrl.replace(/\/\d{1,4}$/, '');
+        const urlIdentifier = urlWithoutWidthSuffix.slice(-50);
+        const escapedIdentifier = escapeRegExp(urlIdentifier);
+        const identifierRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedIdentifier}[^"']*["'][^>]*)>`, 'gi');
+
+        if (identifierRegex.test(processed)) {
+          identifierRegex.lastIndex = 0;
+          processed = processed.replace(identifierRegex, (match, imgTagContent) => {
+            if (imgTagContent.includes('data-mowen-uid')) {
+              return match;
+            }
+            console.log(`[sw] replaceImageUrls: identifier match, injecting uid=${result.uid}`);
+            matched = true;
+            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+          });
+        }
+      }
+
+      // Strategy 4: Try matching by filename (last segment of path)
+      if (!matched) {
+        try {
+          const urlObj = new URL(originalUrl);
+          const pathname = urlObj.pathname;
+          const filename = pathname.split('/').pop();
+          if (filename && filename.length > 5) {
+            const filenameEscaped = escapeRegExp(filename);
+            const filenameRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${filenameEscaped}[^"']*["'][^>]*)>`, 'gi');
+
+            if (filenameRegex.test(processed)) {
+              filenameRegex.lastIndex = 0;
+              processed = processed.replace(filenameRegex, (match, imgTagContent) => {
+                if (imgTagContent.includes('data-mowen-uid')) {
+                  return match;
+                }
+                console.log(`[sw] replaceImageUrls: filename match, injecting uid=${result.uid}`);
+                matched = true;
+                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+              });
+            }
+          }
+        } catch (e) {
+          // URL parsing failed, skip this strategy
+        }
+      }
+
+      if (!matched) {
+        console.warn(`[sw] replaceImageUrls: NO MATCH for url=${originalUrl.substring(0, 80)}`);
       }
     } else if (!result.success) {
       failCount++;
-      // Convert failed images to links
-      processed = convertImageToLink(processed, result.originalUrl, 'N/A');
+      // Convert failed images to links with actual image position
+      processed = convertImageToLink(processed, result.originalUrl, String(imageIndex));
     } else {
       // Missing uid or assetUrl but success=true - this shouldn't happen
       console.warn(`[sw] replaceImageUrls: success=true but missing uid or assetUrl`, result);
@@ -780,15 +864,16 @@ function decodeHtmlEntities(text: string): string {
 }
 
 function createIndexNoteContent(
-  title: string,
-  sourceUrl: string,
-  notes: Array<{ partIndex: number; noteUrl: string; isIndex?: boolean }>
+  _title: string,
+  _sourceUrl: string,
+  notes: Array<{ partIndex: number; noteUrl: string; shareUrl?: string; isIndex?: boolean }>
 ): string {
   const partNotes = notes.filter((n) => !n.isIndex).sort((a, b) => a.partIndex - b.partIndex);
 
-  let content = `<h1>${title}（索引）</h1>\n`;
-  content += `<p>原文来源：<a href="${sourceUrl}" target="_blank">${sourceUrl}</a></p>\n`;
-  content += `<p>共拆分为 ${partNotes.length} 篇笔记：</p>\n`;
+  // Note: Title and source link are added automatically by createNote()
+  // So we only generate the list of parts here
+  // Use noteUrl which respects public/private setting (/detail/ for public, /editor/ for private)
+  let content = `<p>共拆分为 ${partNotes.length} 篇笔记：</p>\n`;
   content += '<ul>\n';
 
   partNotes.forEach((note) => {

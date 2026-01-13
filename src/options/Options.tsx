@@ -2,7 +2,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Settings, DEFAULT_SETTINGS, ERROR_MESSAGES } from '../types';
 import { getSettings, saveSettings, clampMaxImages } from '../utils/storage';
 import { testConnection } from '../services/api';
-import { Settings as SettingsIcon, Key, Eye, EyeOff, Check, X, RefreshCw, ExternalLink, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react';
+import { Settings as SettingsIcon, Key, Eye, EyeOff, Check, X, RefreshCw, ExternalLink, ChevronDown, ChevronUp, RotateCcw, Copy, BookOpen, Info } from 'lucide-react';
+import TutorialModal from '../components/TutorialModal';
 
 const Options: React.FC = () => {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -18,6 +19,9 @@ const Options: React.FC = () => {
     error?: string;
   } | null>(null);
   const [hasChanges, setHasChanges] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const apiKeyInputRef = React.useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadSettings();
@@ -142,6 +146,37 @@ const Options: React.FC = () => {
       setIsTesting(false);
     }
   };
+  const handleGoToPaste = () => {
+    setShowTutorial(false);
+    apiKeyInputRef.current?.focus();
+    apiKeyInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  const handleCopyLog = async () => {
+    if (!testResult || testResult.success) return;
+
+    // Mask API Key for safety: ABCD****WXYZ
+    const maskKey = (key: string) => {
+      if (key.length <= 8) return '****';
+      return `${key.substring(0, 4)}****${key.substring(key.length - 4)}`;
+    };
+
+    const logData = {
+      timestamp: new Date().toISOString(),
+      apiKey: maskKey(settings.apiKey),
+      status: 'failed',
+      error: testResult.error,
+      ua: navigator.userAgent
+    };
+
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(logData, null, 2));
+      setCopyStatus('success');
+      setTimeout(() => setCopyStatus('idle'), 2000);
+    } catch (err) {
+      alert('日志复制失败');
+    }
+  };
 
   const handleMaxImagesChange = useCallback((value: string) => {
     const num = parseInt(value, 10);
@@ -188,6 +223,7 @@ const Options: React.FC = () => {
               </label>
               <div className="relative">
                 <input
+                  ref={apiKeyInputRef}
                   type={showApiKey ? 'text' : 'password'}
                   className="input pr-12"
                   placeholder="请输入您的墨问 API Key"
@@ -202,63 +238,113 @@ const Options: React.FC = () => {
                   {showApiKey ? <EyeOff size={20} /> : <Eye size={20} />}
                 </button>
               </div>
-              <p className="text-xs text-text-secondary mt-2">
-                在墨问设置中获取 API Key。
-                <a
-                  href="https://mowen.cn/settings/api"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-brand-primary hover:underline ml-1"
-                >
-                  获取 API Key
-                </a>
-              </p>
             </div>
 
-            {/* Test Connection */}
-            <div className="flex items-center gap-3">
-              <button
-                className="btn-secondary flex items-center gap-2"
-                onClick={handleTestConnection}
-                disabled={isTesting || !settings.apiKey.trim()}
-              >
-                {isTesting ? (
-                  <RefreshCw size={16} className="animate-spin" />
-                ) : (
-                  <Check size={16} />
-                )}
-                {isTesting ? '测试中...' : '测试连接'}
-              </button>
+            {/* API Key Guide Section */}
+            <div className="bg-gray-50 border border-gray-100 rounded-card p-4 space-y-4">
+              <div className="flex items-center gap-2 text-brand-primary">
+                <Key size={18} />
+                <h3 className="text-sm font-semibold">获取 API Key</h3>
+              </div>
+
+              <div className="space-y-2">
+                <p className="text-xs text-text-secondary flex items-start gap-1.5 leading-relaxed">
+                  <Info size={14} className="mt-0.5 shrink-0" />
+                  <span>
+                    API Key 只能在墨问微信小程序<strong>【开发者】</strong>页生成。需要
+                    <a
+                      href="https://note.mowen.cn/vip?inviteCode=V-T5J3NHDO0L"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-brand-primary hover:underline"
+                    >
+                      墨问会员 Pro
+                    </a>
+                    。
+                  </span>
+                </p>
+                <div className="grid grid-cols-1 gap-1.5">
+                  <div className="flex items-center gap-2 text-[11px] text-text-secondary bg-white/60 p-1.5 rounded-sm border border-gray-100/50">
+                    <span className="w-4 h-4 rounded-full bg-gray-200 flex items-center justify-center text-[10px] shrink-0">1</span>
+                    <span>打开微信 → 进入墨问小程序</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[11px] text-text-secondary bg-white/60 p-1.5 rounded-sm border border-gray-100/50">
+                    <span className="w-4 h-4 rounded-full bg-gray-200 flex items-center justify-center text-[10px] shrink-0">2</span>
+                    <span>进入开发者 → 我的 API Key → 获取/重置</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[11px] text-text-secondary bg-white/60 p-1.5 rounded-sm border border-gray-100/50">
+                    <span className="w-4 h-4 rounded-full bg-gray-200 flex items-center justify-center text-[10px] shrink-0">3</span>
+                    <span>复制 Key → 回到此处粘贴并测试</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-3 mt-3">
+                <button
+                  className="flex-1 h-10 px-4 text-sm font-medium rounded-lg bg-brand-primary text-white hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2"
+                  onClick={() => setShowTutorial(true)}
+                >
+                  <BookOpen size={16} />
+                  查看图文教程
+                </button>
+                <button
+                  className="flex-1 h-10 px-4 text-sm font-medium rounded-lg border border-gray-200 text-text-primary hover:bg-gray-50 hover:border-gray-300 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={handleTestConnection}
+                  disabled={isTesting || !settings.apiKey.trim()}
+                >
+                  {isTesting ? (
+                    <RefreshCw size={16} className="animate-spin" />
+                  ) : (
+                    <Check size={16} />
+                  )}
+                  {isTesting ? '测试中...' : '测试连接'}
+                </button>
+              </div>
             </div>
 
             {/* Test Result */}
             {testResult && (
               <div
-                className={`p-4 rounded-button ${testResult.success
-                  ? 'bg-green-50 border border-green-200'
-                  : 'bg-red-50 border border-red-200'
+                className={`p-4 rounded-card border shadow-sm ${testResult.success
+                  ? 'bg-green-50/50 border-green-100'
+                  : 'bg-red-50/50 border-red-100'
                   }`}
               >
-                <div className="flex items-start gap-2">
-                  {testResult.success ? (
-                    <Check className="text-green-600 mt-0.5" size={18} />
-                  ) : (
-                    <X className="text-red-600 mt-0.5" size={18} />
-                  )}
-                  <div>
-                    <p className={`text-sm font-medium ${testResult.success ? 'text-green-800' : 'text-red-800'}`}>
-                      {testResult.success ? '连接成功，已创建测试笔记。' : testResult.error}
-                    </p>
-                    {testResult.success && testResult.noteUrl && (
-                      <a
-                        href={testResult.noteUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-sm text-brand-primary hover:underline mt-1"
-                      >
-                        打开测试笔记 <ExternalLink size={14} />
-                      </a>
-                    )}
+                <div className="flex items-start gap-3">
+                  <div className={`mt-0.5 p-1 rounded-full ${testResult.success ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
+                    {testResult.success ? <Check size={16} /> : <X size={16} />}
+                  </div>
+                  <div className="flex-1 space-y-2">
+                    <div>
+                      <p className={`text-sm font-semibold ${testResult.success ? 'text-green-800' : 'text-red-800'}`}>
+                        {testResult.success ? '连接成功' : '连接失败'}
+                      </p>
+                      <p className={`text-xs mt-0.5 ${testResult.success ? 'text-green-700' : 'text-red-700'}`}>
+                        {testResult.success ? '已成功创建测试笔记，API 已就绪。' : testResult.error}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {testResult.success && testResult.noteUrl && (
+                        <a
+                          href={testResult.noteUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="btn-primary h-8 px-3 text-xs flex items-center gap-1.5"
+                        >
+                          打开测试笔记 <ExternalLink size={12} />
+                        </a>
+                      )}
+                      {!testResult.success && (
+                        <button
+                          className="btn-secondary h-8 px-3 text-xs flex items-center gap-1.5 border-red-200 text-red-600 hover:bg-red-50"
+                          onClick={handleCopyLog}
+                        >
+                          <Copy size={12} />
+                          {copyStatus === 'success' ? '已复制日志' : '复制调试日志'}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -355,8 +441,8 @@ const Options: React.FC = () => {
             {/* Create Index Note */}
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-text-primary">创建索引笔记</p>
-                <p className="text-xs text-text-secondary mt-0.5">长文拆分时创建包含所有分篇链接的索引</p>
+                <p className="text-sm font-medium text-text-primary">创建合集笔记</p>
+                <p className="text-xs text-text-secondary mt-0.5">长文拆分时创建包含所有分篇链接的合集</p>
               </div>
               <button
                 className={`switch ${settings.createIndexNote ? 'switch-on' : 'switch-off'}`}
@@ -428,6 +514,13 @@ const Options: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Tutorial Modal */}
+      <TutorialModal
+        isOpen={showTutorial}
+        onClose={() => setShowTutorial(false)}
+        onConfirm={handleGoToPaste}
+      />
     </div>
   );
 };
