@@ -323,6 +323,11 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
         '[class*="follow"]', '[class*="subscribe"]',
         // iframes
         'iframe:not([src*="mp.weixin"])',
+        // eesel.ai specific - FAQ section, author metadata, breadcrumbs
+        // CAUTION: Do NOT use generic class selectors like [class*="faq"] or [class*="component-margin-bottom"]
+        // because the main article container often has these classes (e.g. via Tailwind modifiers like [&_.faqWrapper]),
+        // causing the ENTIRE ARTICLE to be deleted.
+        // We will handle FAQ removal via text pattern matching in step 3 below.
     ];
 
     for (const selector of junkSelectors) {
@@ -350,6 +355,117 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
             el.remove();
         }
     });
+
+    // 3. Remove elements by text content patterns (for sites with unique text markers)
+    // This handles author bylines, breadcrumbs, dates etc. that can't be targeted by class alone
+    if (aggressive) {
+        const textPatterns = [
+            /^(written by|reviewed by|edited by|posted by)\s*$/i,
+            /^(last edited|last updated|published on)\s*\w+\s+\d+,?\s*\d*$/i,
+            /^expert verified$/i,
+            /^(blogs?|guides?|articles?)\s*[\/|]\s*(blogs?|guides?|articles?)?$/i,
+        ];
+
+        const elementsToRemove: HTMLElement[] = [];
+
+        // General text pattern removal
+        element.querySelectorAll('div, span, p, a').forEach((el) => {
+            const text = (el.textContent || '').trim();
+            // Only match small elements (less than 100 chars) to avoid removing large content blocks
+            if (text.length > 0 && text.length < 100) {
+                for (const pattern of textPatterns) {
+                    if (pattern.test(text)) {
+                        // Remove the closest container that looks like a metadata block
+                        // Use a safer traversal: only go up to .flex or small containers
+                        const container = (el as HTMLElement).closest('.flex') || el.parentElement;
+                        if (container && container !== element && (container as HTMLElement).innerText.length < 300) {
+                            elementsToRemove.push(container as HTMLElement);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Specific eesel.ai targeted removal logic
+
+        // 1. Remove Author/Header Block
+        // Structure: div containing "Written by" and "Reviewed by"
+        // We find the specific element containing BOTH strings
+        element.querySelectorAll('*').forEach((el) => {
+            // Avoid selecting body or main container
+            if (el.tagName === 'BODY' || el === element) return;
+
+            const text = (el.textContent || '').trim();
+            const lowerText = text.toLowerCase();
+
+            // Author Metadata Block (Top)
+            if (text.includes('Written by') && text.includes('Reviewed by') && text.length < 500) {
+                elementsToRemove.push(el as HTMLElement);
+            }
+
+            // Author Card (Bottom): "Article by [Name]" or "Share this post"
+            if ((text.includes('Article by') || text.includes('Share this post')) && text.length < 300) {
+                // Often these are in a wrapper
+                const container = (el as HTMLElement).closest('.flex') || el.parentElement;
+                if (container && container !== element && (container as HTMLElement).innerText.length < 500) {
+                    elementsToRemove.push(container as HTMLElement);
+                } else {
+                    elementsToRemove.push(el as HTMLElement);
+                }
+            }
+
+            // Side CTA / Promo Card: "Try it for free" + "Learn more"
+            if (lowerText.includes('try it for free') && lowerText.includes('learn more') && text.length < 300) {
+                const container = (el as HTMLElement).closest('div') || el;
+                elementsToRemove.push(container as HTMLElement);
+            }
+
+            // Breadcrumbs: "Blogs / Guides"
+            if (lowerText === 'blogs / guides' || (lowerText.includes('blogs / guides') && text.length < 50)) {
+                const container = (el as HTMLElement).closest('.flex') || el.parentElement;
+                if (container && container !== element) {
+                    elementsToRemove.push(container as HTMLElement);
+                }
+            }
+        });
+
+        // 2. Remove FAQ Section Safely
+        // Find the "Frequently asked questions" heading
+        const faqHeaders = Array.from(element.querySelectorAll('h1, h2, h3, h4, h5, h6, p, div'));
+        for (const header of faqHeaders) {
+            if (header.textContent && header.textContent.trim() === 'Frequently asked questions') {
+                // Find the containing section. 
+                // CAUTION: Do not go too high up. 
+                // eesel.ai structure: section > div > h2
+                let faqContainer = header.closest('section');
+
+                // If the section is too large (likely the whole article), fallback to strict parent usage
+                // or try to find the specific wrapper class if known, but safer to assume the section is correct if distinct
+                // On eesel.ai, the FAQ is in its own <section> at the bottom.
+                if (faqContainer && faqContainer !== element) {
+                    // Check if this section contains the main article content (heuristic: very long text)
+                    // If it contains > 5000 chars, it's probably the main wrapper, don't delete.
+                    if (faqContainer.innerText.length < 5000) {
+                        elementsToRemove.push(faqContainer);
+                    } else {
+                        // Fallback: delete the header and its immediate siblings/parent
+                        const parent = header.parentElement;
+                        if (parent && parent.innerText.length < 5000) {
+                            elementsToRemove.push(parent);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove collected elements
+        elementsToRemove.forEach(el => {
+            if (el.parentNode) {
+                el.remove();
+            }
+        });
+    }
 }
 
 /**

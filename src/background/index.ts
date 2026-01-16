@@ -818,6 +818,42 @@ function replaceImageUrls(
         }
       }
 
+      // Strategy 7: Next.js `_next/image` URLs
+      // Format: https://example.com/_next/image?url=https%3A%2F%2Fcdn.example.com%2Fimage.png&w=1680&q=100
+      // We need to decode the `url` param and find the original filename
+      if (!matched && originalUrl.includes('/_next/image')) {
+        try {
+          const urlObj = new URL(originalUrl);
+          const encodedUrl = urlObj.searchParams.get('url');
+          if (encodedUrl) {
+            const decodedUrl = decodeURIComponent(encodedUrl);
+            // Extract filename from the decoded URL
+            const decodedUrlObj = new URL(decodedUrl);
+            const filename = decodedUrlObj.pathname.split('/').pop();
+
+            if (filename && filename.length > 5) {
+              const filenameEscaped = escapeRegExp(filename);
+              // Match any img tag containing this filename (may be in _next/image URL or direct src)
+              const nextImgRegex = new RegExp(`(<img[^>]*(?:src|data-src)=["'][^"']*${filenameEscaped}[^"']*["'][^>]*)>`, 'gi');
+
+              if (nextImgRegex.test(processed)) {
+                nextImgRegex.lastIndex = 0;
+                processed = processed.replace(nextImgRegex, (match, imgTagContent) => {
+                  if (imgTagContent.includes('data-mowen-uid')) {
+                    return match;
+                  }
+                  console.log(`[sw] replaceImageUrls: Next.js image match (${filename}), injecting uid=${result.uid}`);
+                  matched = true;
+                  return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+                });
+              }
+            }
+          }
+        } catch (e) {
+          // URL parsing failed, skip this strategy
+        }
+      }
+
       if (!matched) {
         console.warn(`[sw] replaceImageUrls: NO MATCH for url=${originalUrl.substring(0, 80)}`);
       }
@@ -842,8 +878,13 @@ function replaceImageUrls(
 }
 
 /**
- * Inject successfully uploaded images that weren't matched by replaceImageUrls.
- * This handles cases where contentHtml doesn't contain img tags (e.g., Medium articles).
+ * Check for successfully uploaded images that weren't matched by replaceImageUrls.
+ * Previously this would inject unmatched images, but that caused issues with avatars
+ * and other non-content images being placed at the beginning of articles.
+ * 
+ * Now we just log the unmatched images and return the original content unchanged.
+ * Unmatched images are typically not part of the main article content (e.g., avatars, 
+ * sidebar images, author photos) and should not be force-injected.
  */
 function injectUploadedImages(content: string, imageResults: ImageProcessResult[]): string {
   // Check which images were successfully uploaded but not injected into content
@@ -858,30 +899,22 @@ function injectUploadedImages(content: string, imageResults: ImageProcessResult[
     }).filter(Boolean)
   );
 
-  // Find images that need to be injected
-  const imagesToInject = successfulImages.filter(img => img.uid && !alreadyInjectedUids.has(img.uid));
+  // Find images that weren't matched
+  const unmatchedImages = successfulImages.filter(img => img.uid && !alreadyInjectedUids.has(img.uid));
 
-  if (imagesToInject.length === 0) {
-    console.log(`[sw] injectUploadedImages: all ${successfulImages.length} images already in content`);
-    return content;
-  }
-
-  console.log(`[sw] injectUploadedImages: injecting ${imagesToInject.length} images (${alreadyInjectedUids.size} already matched)`);
-
-  // Create img tags for the images and insert at the beginning of content
-  const imgTags = imagesToInject.map(img => {
-    return `<p><img src="${img.assetUrl || img.originalUrl}" data-mowen-uid="${img.uid}" alt=""></p>`;
-  }).join('\n');
-
-  // Insert after the first paragraph (or at the beginning if no paragraph)
-  const firstParagraphEnd = content.indexOf('</p>');
-  if (firstParagraphEnd !== -1) {
-    // Insert after the first paragraph
-    return content.slice(0, firstParagraphEnd + 4) + '\n' + imgTags + content.slice(firstParagraphEnd + 4);
+  if (unmatchedImages.length === 0) {
+    console.log(`[sw] injectUploadedImages: all ${successfulImages.length} images matched in content`);
   } else {
-    // Insert at the beginning
-    return imgTags + content;
+    // Log unmatched images but do NOT inject them
+    // Unmatched images are likely avatars, sidebar images, or other non-content images
+    console.log(`[sw] injectUploadedImages: ${alreadyInjectedUids.size} matched, ${unmatchedImages.length} unmatched (skipping injection)`);
+    unmatchedImages.forEach(img => {
+      console.log(`[sw] injectUploadedImages: skipping unmatched image: ${img.originalUrl?.substring(0, 60)}...`);
+    });
   }
+
+  // Return original content unchanged - do not inject unmatched images
+  return content;
 }
 
 

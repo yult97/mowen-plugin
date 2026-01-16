@@ -52,6 +52,9 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         // Ads
         '[class*="advertisement"]',
         '[class*="sponsor"]',
+        // CTA sections (often contain decorative backgrounds)
+        '[class*="sidecta"]',
+        '[class*="cta"]',
     ];
 
     // Check if an image should be excluded based on its context
@@ -82,10 +85,59 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
             }
         }
 
-        const avatarKeywords = ['avatar', 'profile', 'author', 'user', 'photo', 'headshot', 'portrait', 'bio'];
+        // Avatar keywords - use word boundary matching to avoid false positives
+        // e.g., "user" should NOT match "users" in alt text like "where users can test..."
+        // Also removed "photo" as it matches "photography", "photoshop" etc.
+        const avatarKeywords = ['avatar', 'profile-pic', 'author-img', 'headshot', 'portrait'];
+
+        // Keywords that need word boundary matching (class only, not alt)
+        // These are too common in normal text to use in alt matching
+        const classOnlyKeywords = ['author', 'bio', 'user-icon', 'profile'];
+
+        // Check class for keywords (exact word match for class names)
         for (const keyword of avatarKeywords) {
-            if (imgClass.includes(keyword) || imgAlt.includes(keyword)) {
-                console.log(`[images] excluding: class/alt contains "${keyword}"`);
+            if (imgClass.includes(keyword)) {
+                console.log(`[images] excluding: class contains "${keyword}"`);
+                return true;
+            }
+        }
+
+        // Check class-only keywords
+        for (const keyword of classOnlyKeywords) {
+            if (imgClass.includes(keyword)) {
+                console.log(`[images] excluding: class contains "${keyword}"`);
+                return true;
+            }
+        }
+
+        // Check alt for very specific avatar patterns (literal words, not substrings)
+        const avatarAltPatterns = [
+            /\bavatar\b/i,
+            /\bheadshot\b/i,
+            /\bportrait\b/i,
+            /\bprofile\s*(pic|photo|image|picture)\b/i,
+            /\bauthor\s*(photo|image|picture)\b/i,
+        ];
+
+        for (const pattern of avatarAltPatterns) {
+            if (pattern.test(imgAlt)) {
+                console.log(`[images] excluding: alt matches avatar pattern "${pattern.source}"`);
+                return true;
+            }
+        }
+
+        // Check alt for decorative/background image patterns
+        const decorativeAltPatterns = [
+            /\bbackground\b/i,
+            /\bsidecta\b/i,
+            /\bdecorative\b/i,
+            /\bbg[-_]?image\b/i,
+            /\bcta[-_]?(bg|background)\b/i,
+        ];
+
+        for (const pattern of decorativeAltPatterns) {
+            if (pattern.test(imgAlt)) {
+                console.log(`[images] excluding: alt matches decorative pattern "${pattern.source}"`);
                 return true;
             }
         }
@@ -112,9 +164,10 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         }
 
         // Check if image or parent is circular (avatar indicator)
+        // Increased depth to 5 for sites like eesel.ai where avatar containers are deeper
         let element: HTMLElement | null = img;
         let depth = 0;
-        while (element && depth < 3) {
+        while (element && depth < 5) {
             const hasRoundedFull = element.classList?.contains('rounded-full') ||
                 element.classList?.contains('rounded-circle') ||
                 element.classList?.contains('circle');
@@ -124,9 +177,23 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
                 return true;
             }
 
-            // Check for small Tailwind size classes
-            const smallWidthClasses = ['w-4', 'w-5', 'w-6', 'w-7', 'w-8', 'w-9', 'w-10', 'w-11', 'w-12'];
-            const smallHeightClasses = ['h-4', 'h-5', 'h-6', 'h-7', 'h-8', 'h-9', 'h-10', 'h-11', 'h-12'];
+            // Check for overflow-hidden with small fixed dimensions (common avatar pattern)
+            // e.g., "relative w-10 h-10 rounded-full overflow-hidden" on eesel.ai
+            const hasOverflowHidden = element.classList?.contains('overflow-hidden');
+            if (hasOverflowHidden) {
+                // Check if this container also has small fixed dimensions
+                const classList = element.className || '';
+                const hasSmallFixedSize = /\bw-(8|9|10|11|12|14|16)\b/.test(classList) &&
+                    /\bh-(8|9|10|11|12|14|16)\b/.test(classList);
+                if (hasSmallFixedSize) {
+                    console.log(`[images] excluding: overflow-hidden with small fixed size at depth ${depth}`);
+                    return true;
+                }
+            }
+
+            // Check for small Tailwind size classes (expanded range to include more avatar sizes)
+            const smallWidthClasses = ['w-4', 'w-5', 'w-6', 'w-7', 'w-8', 'w-9', 'w-10', 'w-11', 'w-12', 'w-14', 'w-16'];
+            const smallHeightClasses = ['h-4', 'h-5', 'h-6', 'h-7', 'h-8', 'h-9', 'h-10', 'h-11', 'h-12', 'h-14', 'h-16'];
             const hasSmallTailwindClass = smallWidthClasses.some(c => element!.classList?.contains(c)) ||
                 smallHeightClasses.some(c => element!.classList?.contains(c));
             if (hasSmallTailwindClass) {
@@ -140,6 +207,34 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
             if (borderRadius === '50%' || borderRadius === '9999px' || borderRadius === '100%') {
                 console.log(`[images] excluding: circular via border-radius at depth ${depth}`);
                 return true;
+            }
+
+            // Check for square images with rounded corners in author sections
+            // Common pattern: author bio photo with rounded-md, size 150-300px square
+            // Check both the image itself AND parent elements for rounded classes
+            const hasRoundedMd = element.classList?.contains('rounded-md') ||
+                element.classList?.contains('rounded-lg') ||
+                element.classList?.contains('rounded-xl');
+
+            if (hasRoundedMd && depth <= 3) {
+                // Check if it's a square image in typical author photo size range
+                const w = img.naturalWidth || img.width || 0;
+                const h = img.naturalHeight || img.height || 0;
+                const isSquare = w > 0 && h > 0 && Math.abs(w - h) < 20; // Allow 20px tolerance
+                const isAuthorPhotoSize = w >= 100 && w <= 300;
+
+                if (isSquare && isAuthorPhotoSize) {
+                    // Additional check: is the alt text author-like?
+                    const altLower = (img.alt || '').toLowerCase();
+                    const isAuthorAlt = altLower.includes('undefined') || // Common pattern: "Stevia undefined"
+                        /^[a-z]+\s*$/.test(altLower.trim()) || // Just a name
+                        /^[a-z]+\s+[a-z]+\s*$/i.test(altLower.trim()); // First Last name pattern
+
+                    if (isAuthorAlt) {
+                        console.log(`[images] excluding: square rounded author photo (${w}x${h}, alt="${img.alt}", depth=${depth})`);
+                        return true;
+                    }
+                }
             }
 
             element = element.parentElement;
@@ -162,11 +257,19 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
             }
 
             // Check parent's text content for author-related keywords
+            // Only match in SMALL containers (typical author bylines are 50-300 chars)
             const parentText = (parent.textContent || '').toLowerCase();
-            const authorTextPatterns = ['written by', 'reviewed by', 'article by', 'posted by', 'author:', 'by author'];
+
+            // Conservative author patterns - only very specific phrases
+            const authorTextPatterns = [
+                'written by', 'reviewed by', 'article by', 'posted by',
+                'author:', 'by author', 'about the author'
+            ];
+
             for (const pattern of authorTextPatterns) {
-                if (parentText.includes(pattern) && parentText.length < 200) {
-                    console.log(`[images] excluding: near author byline text "${pattern}"`);
+                // Only match if container is small (50-300 chars) - typical byline size
+                if (parentText.includes(pattern) && parentText.length > 50 && parentText.length < 300) {
+                    console.log(`[images] excluding: near author byline text "${pattern}" (len=${parentText.length})`);
                     return true;
                 }
             }
