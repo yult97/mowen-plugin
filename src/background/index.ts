@@ -10,10 +10,11 @@ import {
 import { getSettings } from '../utils/storage';
 import { formatDate, debugLog, sleep } from '../utils/helpers';
 import { createNote, uploadImageWithFallback, ImageUploadResult } from '../services/api';
+import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 
-const SAFE_LIMIT = 19000;
-const MAX_RETRY_ROUNDS = 3;
-const IMAGE_TIMEOUT = 30000;  // 30 seconds per image (increased for local upload)
+const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
+const MAX_RETRY_ROUNDS = LIMITS.MAX_RETRY_ROUNDS;
+const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 
 // Cancel mechanism for save operation
 let isCancelRequested = false;
@@ -28,21 +29,31 @@ interface SaveNotePayload {
 }
 
 // Helper to proxy logs to Content Script console for debugging
-async function logToContentScript(msg: string) {
+async function logToContentScript(msg: string): Promise<void> {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id) {
-      chrome.tabs.sendMessage(tab.id, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch(() => { });
+      await chrome.tabs.sendMessage(tab.id, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch((error) => {
+        // Silently ignore - content script may not be available
+        if (chrome.runtime.lastError) {
+          // Clear the error to prevent "unchecked lastError" warnings
+          void chrome.runtime.lastError;
+        }
+        logger.debug('Log proxy to content script failed:', error instanceof Error ? error.message : 'Unknown');
+      });
     }
-  } catch { }
+  } catch (error) {
+    // Tab query failed - popup may have closed
+    logger.debug('logToContentScript failed:', error instanceof Error ? error.message : 'Unknown');
+  }
 }
 
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  console.log('[墨问 Background] Received message:', message.type);
+  logger.log('Received message:', message.type);
 
   if (message.type === 'PING') {
-    console.log('[墨问 Background] 🏓 PING received');
+    logger.log('🏓 PING received');
     sendResponse({ success: true, status: 'pong' });
     return false;
   }
@@ -217,8 +228,11 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
       // Upload images with concurrency control
       imageResults = await processImages(settings.apiKey, imagesToProcess);
 
-      // Replace image URLs in content
+      // Replace image URLs in content (for images that exist in contentHtml)
       processedContent = replaceImageUrls(processedContent, imageResults, imagesToLink);
+
+      // Inject uploaded images that weren't matched (e.g., when contentHtml doesn't have img tags)
+      processedContent = injectUploadedImages(processedContent, imageResults);
 
       // Debug: Log processed content to verify img tags have data-mowen-uid
       const imgTagsWithUid = processedContent.match(/<img[^>]*data-mowen-uid[^>]*>/gi);
@@ -514,16 +528,24 @@ async function processImage(
   const imageIndex = image.order + 1;
 
   try {
-    // Create blob fetch function for this image
+    // Create blob fetch function for this image (use normalizedUrl for highest quality)
     const fetchBlobFn = async (): Promise<{ blob: Blob; mimeType: string } | null> => {
-      return fetchImageBlobFromCS(image.url);
+      // Try normalized URL first for best quality, fallback to original
+      const result = await fetchImageBlobFromCS(image.normalizedUrl);
+      if (result) return result;
+      // Fallback to original URL if normalized fails
+      if (image.normalizedUrl !== image.url) {
+        return fetchImageBlobFromCS(image.url);
+      }
+      return null;
     };
 
     // Use uploadImageWithFallback with timeout
+    // Use normalizedUrl for upload (best quality), url for HTML matching (originalUrl in result)
     let result: ImageUploadResult;
     try {
       result = await Promise.race([
-        uploadImageWithFallback(apiKey, image.url, imageIndex, fetchBlobFn),
+        uploadImageWithFallback(apiKey, image.normalizedUrl, imageIndex, fetchBlobFn),
         new Promise<ImageUploadResult>((resolve) =>
           setTimeout(() => resolve({
             success: false,
@@ -536,7 +558,7 @@ async function processImage(
       console.log(`[img] idx=${imageIndex} race error:`, raceError);
       return {
         id: image.id,
-        originalUrl: image.url,
+        originalUrl: image.url,  // Use original URL for matching
         success: false,
         failureReason: 'TIMEOUT_OR_NET',
       };
@@ -616,20 +638,52 @@ function replaceImageUrls(
       const originalUrl = result.originalUrl;
       let matched = false;
 
-      // Strategy 1: Try exact URL match first
-      const exactUrlEscaped = escapeRegExp(originalUrl);
-      const exactRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["']${exactUrlEscaped}["'][^>]*)>`, 'gi');
+      // Strategy 0: For WeChat images, use the unique path segment as identifier
+      // WeChat URLs: https://mmbiz.qpic.cn/mmbiz_jpg/UNIQUE_ID/640?wx_fmt=jpeg
+      // The UNIQUE_ID is the key identifier that's consistent across src and data-src
+      if (originalUrl.includes('mmbiz.qpic.cn') || originalUrl.includes('mmbiz.qlogo.cn')) {
+        try {
+          const urlObj = new URL(originalUrl);
+          const pathParts = urlObj.pathname.split('/').filter(p => p.length > 10);
+          if (pathParts.length > 0) {
+            // Use the longest path segment as identifier (usually the unique ID)
+            const uniqueId = pathParts.reduce((a, b) => a.length > b.length ? a : b);
+            const escapedId = escapeRegExp(uniqueId);
+            const weixinRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedId}[^"']*["'][^>]*)>`, 'gi');
 
-      if (exactRegex.test(processed)) {
-        exactRegex.lastIndex = 0; // Reset regex state
-        processed = processed.replace(exactRegex, (match, imgTagContent) => {
-          if (imgTagContent.includes('data-mowen-uid')) {
-            return match;
+            if (weixinRegex.test(processed)) {
+              weixinRegex.lastIndex = 0;
+              processed = processed.replace(weixinRegex, (match, imgTagContent) => {
+                if (imgTagContent.includes('data-mowen-uid')) {
+                  return match;
+                }
+                console.log(`[sw] replaceImageUrls: WeChat ID match (${uniqueId.substring(0, 20)}...), injecting uid=${result.uid}`);
+                matched = true;
+                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+              });
+            }
           }
-          console.log(`[sw] replaceImageUrls: exact match, injecting uid=${result.uid}`);
-          matched = true;
-          return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-        });
+        } catch (e) {
+          // URL parsing failed, continue to other strategies
+        }
+      }
+
+      // Strategy 1: Try exact URL match first
+      if (!matched) {
+        const exactUrlEscaped = escapeRegExp(originalUrl);
+        const exactRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["']${exactUrlEscaped}["'][^>]*)>`, 'gi');
+
+        if (exactRegex.test(processed)) {
+          exactRegex.lastIndex = 0; // Reset regex state
+          processed = processed.replace(exactRegex, (match, imgTagContent) => {
+            if (imgTagContent.includes('data-mowen-uid')) {
+              return match;
+            }
+            console.log(`[sw] replaceImageUrls: exact match, injecting uid=${result.uid}`);
+            matched = true;
+            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+          });
+        }
       }
 
       // Strategy 2: Try URL without query params
@@ -701,6 +755,69 @@ function replaceImageUrls(
         }
       }
 
+      // Strategy 5: Medium/CDN specific - match by unique image ID in path
+      // Medium URLs like: https://miro.medium.com/v2/resize:fit:1400/1*ZIcUbGyIASJ3iXrD5oTeoA.jpeg
+      // After normalization: https://miro.medium.com/v2/1*ZIcUbGyIASJ3iXrD5oTeoA.jpeg
+      // We need to extract the image ID (1*...) and match it in the HTML
+      if (!matched && originalUrl.includes('miro.medium.com')) {
+        try {
+          const urlObj = new URL(originalUrl);
+          const pathname = urlObj.pathname;
+          // Extract the image ID: usually looks like "1*XXXX" or just a hash
+          const imageIdMatch = pathname.match(/(\d\*[A-Za-z0-9_-]+)/);
+          if (imageIdMatch && imageIdMatch[1]) {
+            const imageId = imageIdMatch[1];
+            const escapedId = escapeRegExp(imageId);
+            // Match any img src containing this image ID
+            const mediumRegex = new RegExp(`(<img[^>]*(?:src|data-src|srcset)=["'][^"']*${escapedId}[^"']*["'][^>]*)>`, 'gi');
+
+            if (mediumRegex.test(processed)) {
+              mediumRegex.lastIndex = 0;
+              processed = processed.replace(mediumRegex, (match, imgTagContent) => {
+                if (imgTagContent.includes('data-mowen-uid')) {
+                  return match;
+                }
+                console.log(`[sw] replaceImageUrls: Medium ID match (${imageId}), injecting uid=${result.uid}`);
+                matched = true;
+                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+              });
+            }
+          }
+        } catch (e) {
+          // URL parsing failed, skip this strategy
+        }
+      }
+
+      // Strategy 6: Generic CDN - match by any unique path segment
+      // For Substack, Twitter, and other CDNs with unique image identifiers
+      if (!matched) {
+        try {
+          const urlObj = new URL(originalUrl);
+          const pathname = urlObj.pathname;
+          // Find the longest alphanumeric segment that looks like an ID (at least 15 chars)
+          const segments = pathname.split('/').filter(s => s.length >= 15 && /^[A-Za-z0-9_-]+$/.test(s));
+          if (segments.length > 0) {
+            const longestId = segments.reduce((a, b) => a.length > b.length ? a : b);
+            const escapedId = escapeRegExp(longestId);
+            const cdnRegex = new RegExp(`(<img[^>]*(?:src|data-src|srcset)=["'][^"']*${escapedId}[^"']*["'][^>]*)>`, 'gi');
+
+            if (cdnRegex.test(processed)) {
+              cdnRegex.lastIndex = 0;
+              processed = processed.replace(cdnRegex, (match, imgTagContent) => {
+                if (imgTagContent.includes('data-mowen-uid')) {
+                  return match;
+                }
+                console.log(`[sw] replaceImageUrls: CDN ID match (${longestId.substring(0, 20)}...), injecting uid=${result.uid}`);
+                matched = true;
+                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
+              });
+            }
+          }
+        } catch (e) {
+          // URL parsing failed, skip this strategy
+        }
+      }
+
       if (!matched) {
         console.warn(`[sw] replaceImageUrls: NO MATCH for url=${originalUrl.substring(0, 80)}`);
       }
@@ -724,15 +841,92 @@ function replaceImageUrls(
   return processed;
 }
 
+/**
+ * Inject successfully uploaded images that weren't matched by replaceImageUrls.
+ * This handles cases where contentHtml doesn't contain img tags (e.g., Medium articles).
+ */
+function injectUploadedImages(content: string, imageResults: ImageProcessResult[]): string {
+  // Check which images were successfully uploaded but not injected into content
+  const successfulImages = imageResults.filter(r => r.success && r.uid);
+
+  // Check how many already have data-mowen-uid (were matched by replaceImageUrls)
+  const imgTagsWithUid = content.match(/<img[^>]*data-mowen-uid[^>]*>/gi) || [];
+  const alreadyInjectedUids = new Set(
+    imgTagsWithUid.map(tag => {
+      const match = tag.match(/data-mowen-uid=["']([^"']*)["']/i);
+      return match ? match[1] : null;
+    }).filter(Boolean)
+  );
+
+  // Find images that need to be injected
+  const imagesToInject = successfulImages.filter(img => img.uid && !alreadyInjectedUids.has(img.uid));
+
+  if (imagesToInject.length === 0) {
+    console.log(`[sw] injectUploadedImages: all ${successfulImages.length} images already in content`);
+    return content;
+  }
+
+  console.log(`[sw] injectUploadedImages: injecting ${imagesToInject.length} images (${alreadyInjectedUids.size} already matched)`);
+
+  // Create img tags for the images and insert at the beginning of content
+  const imgTags = imagesToInject.map(img => {
+    return `<p><img src="${img.assetUrl || img.originalUrl}" data-mowen-uid="${img.uid}" alt=""></p>`;
+  }).join('\n');
+
+  // Insert after the first paragraph (or at the beginning if no paragraph)
+  const firstParagraphEnd = content.indexOf('</p>');
+  if (firstParagraphEnd !== -1) {
+    // Insert after the first paragraph
+    return content.slice(0, firstParagraphEnd + 4) + '\n' + imgTags + content.slice(firstParagraphEnd + 4);
+  } else {
+    // Insert at the beginning
+    return imgTags + content;
+  }
+}
+
 
 function convertImageToLink(content: string, imageUrl: string, index: string): string {
-  const escapedUrl = escapeRegExp(imageUrl);
   const linkHtml = `<p><a href="${imageUrl}" target="_blank" rel="noopener noreferrer">📷 图片链接（原文第 ${index} 张）：打开图片</a></p>`;
 
-  // Try to replace the img tag
+  // Strategy 1: For WeChat images, use unique ID matching
+  if (imageUrl.includes('mmbiz.qpic.cn') || imageUrl.includes('mmbiz.qlogo.cn')) {
+    try {
+      const urlObj = new URL(imageUrl);
+      const pathParts = urlObj.pathname.split('/').filter(p => p.length > 10);
+      if (pathParts.length > 0) {
+        const uniqueId = pathParts.reduce((a, b) => a.length > b.length ? a : b);
+        const escapedId = escapeRegExp(uniqueId);
+        const weixinRegex = new RegExp(`<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedId}[^"']*["'][^>]*>`, 'gi');
+        if (weixinRegex.test(content)) {
+          return content.replace(weixinRegex, linkHtml);
+        }
+      }
+    } catch (e) {
+      // Continue to other strategies
+    }
+  }
+
+  // Strategy 2: Try exact URL match on src
+  const escapedUrl = escapeRegExp(imageUrl);
   const imgRegex = new RegExp(`<img[^>]*src=["']${escapedUrl}["'][^>]*>`, 'gi');
   if (imgRegex.test(content)) {
     return content.replace(imgRegex, linkHtml);
+  }
+
+  // Strategy 3: Try matching data-src attribute
+  const dataSrcRegex = new RegExp(`<img[^>]*data-src=["']${escapedUrl}["'][^>]*>`, 'gi');
+  if (dataSrcRegex.test(content)) {
+    return content.replace(dataSrcRegex, linkHtml);
+  }
+
+  // Strategy 4: Try URL base (without query params)
+  const baseUrl = imageUrl.split('?')[0];
+  if (baseUrl !== imageUrl) {
+    const escapedBase = escapeRegExp(baseUrl);
+    const baseRegex = new RegExp(`<img[^>]*(?:src|data-src)=["'][^"']*${escapedBase}[^"']*["'][^>]*>`, 'gi');
+    if (baseRegex.test(content)) {
+      return content.replace(baseRegex, linkHtml);
+    }
   }
 
   return content;

@@ -40,11 +40,8 @@ interface UploadViaUrlResponse {
   file: UploadedFile;
 }
 
-// Official API response for /upload/prepare per https://mowen.apifox.cn/304801589e0
-interface UploadPrepareResponse {
-  endpoint: string;
-  form: Record<string, string>;
-}
+// Note: /upload/prepare API returns { form: { endpoint, callback, key, ... } }
+// The endpoint is INSIDE form, not at root level
 
 // Image upload result with full tracking
 export interface ImageUploadResult {
@@ -554,12 +551,74 @@ async function waitForRateLimit(): Promise<void> {
 }
 
 /**
+ * Fetch WeChat image using no-referrer policy to bypass anti-hotlinking
+ * This works in Service Worker context where we can control the referrer policy
+ * 
+ * WeChat CDN (mmbiz.qpic.cn) blocks requests with non-WeChat referrers,
+ * but allows requests with no referrer at all.
+ */
+async function fetchWeixinImageNoReferrer(imageUrl: string): Promise<Blob | null> {
+  console.log(`[img] weixin fetch no-referrer: ${imageUrl.substring(0, 60)}...`);
+
+  try {
+    // Strategy 1: Use no-referrer policy
+    const response = await fetch(imageUrl, {
+      method: 'GET',
+      referrerPolicy: 'no-referrer',
+      mode: 'cors',
+      credentials: 'omit',
+      headers: {
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    });
+
+    if (response.ok) {
+      const blob = await response.blob();
+      if (blob.size > 0) {
+        console.log(`[img] weixin fetch ok: size=${blob.size}, type=${blob.type}`);
+        return blob;
+      }
+    }
+
+    console.log(`[img] weixin fetch fail: status=${response.status}`);
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : 'Unknown error';
+    console.log(`[img] weixin fetch exception: ${errMsg}`);
+  }
+
+  // Strategy 2: Try with different Accept header (some CDNs behave differently)
+  try {
+    const response2 = await fetch(imageUrl, {
+      method: 'GET',
+      referrerPolicy: 'no-referrer',
+      mode: 'no-cors', // Try no-cors as last resort
+      credentials: 'omit',
+    });
+
+    // With no-cors, we get an opaque response, but blob() still works
+    const blob = await response2.blob();
+    if (blob.size > 0) {
+      console.log(`[img] weixin no-cors fetch ok: size=${blob.size}`);
+      return blob;
+    }
+  } catch (error) {
+    console.log(`[img] weixin no-cors fetch also failed`);
+  }
+
+  return null;
+}
+
+/**
  * Local upload step 1: Get upload authorization info
  * Per official docs: https://mowen.apifox.cn/304801589e0
  * 
  * Request: POST /upload/prepare
  * Body: { fileType: 0, fileName: "string" }
- * Response: { endpoint: "string", form: { key, policy, callback, ... } }
+ * 
+ * ACTUAL Response structure from API:
+ * { form: { endpoint, callback, key, policy, ... } }
+ * 
+ * Note: endpoint is INSIDE form object, not at root level
  */
 export async function uploadPrepare(
   apiKey: string,
@@ -571,28 +630,39 @@ export async function uploadPrepare(
     // Acquire rate limit before API call
     await waitForRateLimit();
 
-    const data = await apiRequest<UploadPrepareResponse>('/upload/prepare', apiKey, {
+    const data = await apiRequest<{ form: Record<string, string> }>('/upload/prepare', apiKey, {
       fileType: 1,  // API expects 1 for image
       fileName: fileName,
     });
 
-    // Log the response structure (masked for sensitive info)
-    const formKeys = data?.form ? Object.keys(data.form) : [];
-    console.log(`[img] local prepare response endpoint=${data?.endpoint ? data.endpoint.substring(0, 50) + '...' : 'N/A'} formKeys=[${formKeys.join(',')}]`);
+    // Log the response structure
+    const form = data?.form;
+    const formKeys = form ? Object.keys(form) : [];
+    console.log(`[img] local prepare response formKeys=[${formKeys.join(',')}]`);
 
-    if (!data?.endpoint || !data?.form) {
-      console.log(`[img] local prepare fail: missing endpoint or form`, data);
+    if (!form) {
+      console.log(`[img] local prepare fail: missing form object`, data);
       return {
         success: false,
-        error: 'Missing endpoint or form in response',
+        error: 'Missing form in response',
       };
     }
 
-    console.log(`[img] local prepare ok endpoint=${data.endpoint.substring(0, 50)}... formKeys=[${formKeys.join(',')}]`);
+    // Extract endpoint from form object (API puts it inside form, not at root)
+    const endpoint = form.endpoint;
+    if (!endpoint) {
+      console.log(`[img] local prepare fail: missing endpoint in form`, form);
+      return {
+        success: false,
+        error: 'Missing endpoint in form',
+      };
+    }
+
+    console.log(`[img] local prepare ok endpoint=${endpoint.substring(0, 50)}... formKeys=[${formKeys.join(',')}]`);
     return {
       success: true,
-      endpoint: data.endpoint,
-      form: data.form,
+      endpoint: endpoint,
+      form: form,
     };
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Prepare failed';
@@ -711,15 +781,15 @@ export async function uploadLocalFile(
 }
 
 /**
- * Complete image upload with fallback strategy:
- * 1. Remote First (upload/url)
- * 2. Local Fallback (upload/prepare + file delivery)
- * 3. Link Degrade (return original URL as fallback)
+ * Upload image using local upload method only.
+ * Flow: browser downloads image -> /upload/prepare -> upload to OSS
  * 
+ * Special handling for WeChat images using Service Worker no-referrer fetch.
+ *
  * @param apiKey - Mowen API key
  * @param imageUrl - Original image URL
  * @param imageIndex - 1-based index for logging
- * @param fetchBlobFn - Function to fetch image blob from Content Script
+ * @param fetchBlobFn - Function to fetch image blob from Content Script (required)
  */
 export async function uploadImageWithFallback(
   apiKey: string,
@@ -742,33 +812,68 @@ export async function uploadImageWithFallback(
     }
   }
 
-  // ===== Step 1: Try Remote Upload =====
-  if (!imageUrl.startsWith('data:') && !imageUrl.startsWith('blob:')) {
-    console.log(`[img] idx=${imageIndex} remote start`);
-    await waitForRateLimit();
+  // Check if fetchBlobFn is provided (required for local upload)
+  if (!fetchBlobFn) {
+    console.log(`[img] idx=${imageIndex} fail: no blob fetch function provided`);
+    return {
+      success: false,
+      uploadMethod: 'degraded',
+      degradeReason: 'no_blob_fetch_function',
+    };
+  }
 
+  // ===== Step 1.5: For WeChat images, try direct fetch with no-referrer =====
+  // WeChat images have strict Referer checking, but Service Worker can bypass it
+  const isWeixinImage = imageUrl.includes('mmbiz.qpic.cn') || imageUrl.includes('mmbiz.qlogo.cn');
+  if (isWeixinImage && !imageUrl.startsWith('data:') && !imageUrl.startsWith('blob:')) {
+    console.log(`[img] idx=${imageIndex} weixin no-referrer start`);
     try {
-      const remoteResult = await uploadImageViaUrl(apiKey, imageUrl);
+      const weixinBlob = await fetchWeixinImageNoReferrer(imageUrl);
+      if (weixinBlob && weixinBlob.size > 0) {
+        console.log(`[img] idx=${imageIndex} weixin no-referrer fetch ok, size=${weixinBlob.size}`);
 
-      if (remoteResult.success && remoteResult.assetUrl) {
-        console.log(`[img] idx=${imageIndex} remote success`);
-        // IMPORTANT: Use fileId as uuid, NOT uid
-        // uid is the user folder ID (same for all images)
-        // fileId is the actual file ID (ends with -TMP like official API example)
-        return {
-          success: true,
-          uploadMethod: 'remote',
-          uuid: remoteResult.fileId, // Use fileId, not uid!
-          url: remoteResult.assetUrl,
-          fileId: remoteResult.fileId,
-          uid: remoteResult.uid,
-        };
+        // Check size limit
+        const MAX_LOCAL_SIZE = 50 * 1024 * 1024;
+        if (weixinBlob.size > MAX_LOCAL_SIZE) {
+          console.log(`[img] idx=${imageIndex} weixin skip: size ${weixinBlob.size} exceeds 50MB`);
+        } else {
+          // Generate filename and upload
+          const fileName = generateFileName(imageUrl, weixinBlob.type);
+          await waitForRateLimit();
+          const prepareResult = await uploadPrepare(apiKey, fileName);
+
+          if (prepareResult.success && prepareResult.endpoint && prepareResult.form) {
+            const deliverResult = await uploadLocalFile(
+              prepareResult.endpoint,
+              prepareResult.form,
+              weixinBlob,
+              fileName
+            );
+
+            if (deliverResult.success) {
+              const uploadedFile = deliverResult.uploadedFile;
+              const uuid = uploadedFile?.fileId || uploadedFile?.uid;
+              console.log(`[img] idx=${imageIndex} weixin no-referrer upload success uuid=${uuid}`);
+              return {
+                success: true,
+                uploadMethod: 'local',
+                uuid: uuid,
+                url: uploadedFile?.url,
+                fileId: uploadedFile?.fileId,
+                uid: uploadedFile?.uid,
+              };
+            }
+            console.log(`[img] idx=${imageIndex} weixin deliver fail: ${deliverResult.error}`);
+          } else {
+            console.log(`[img] idx=${imageIndex} weixin prepare fail: ${prepareResult.error}`);
+          }
+        }
+      } else {
+        console.log(`[img] idx=${imageIndex} weixin no-referrer fetch returned empty`);
       }
-
-      console.log(`[img] idx=${imageIndex} remote fail: ${remoteResult.error}`);
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      console.log(`[img] idx=${imageIndex} remote exception: ${errMsg}`);
+      console.log(`[img] idx=${imageIndex} weixin no-referrer exception: ${errMsg}`);
     }
   }
 

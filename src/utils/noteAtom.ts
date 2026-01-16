@@ -204,11 +204,40 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
       const quoteIndex = parseInt(quoteMatch[1]);
       const quoteData = quoteBlocks[quoteIndex];
       if (quoteData) {
-        // Parse quote content as inline
-        const quoteInline = parseInlineContent(quoteData.content);
-        if (quoteInline.length > 0) {
-          blocks.push({ type: 'quote', content: quoteInline });
-          stats.quote++;
+        // Preserve line breaks inside blockquote content
+        // Split by <br>, <p>, and newlines to maintain structure
+        let quoteContent = quoteData.content;
+
+        // Normalize various line break patterns to a consistent marker
+        quoteContent = quoteContent
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
+          .replace(/<\/div>\s*<div[^>]*>/gi, '\n')
+          .replace(/<\/?(?:p|div)[^>]*>/gi, '\n')
+          .replace(/\n\s*\n/g, '\n'); // Collapse multiple newlines
+
+        // Split into lines and process each
+        const lines = quoteContent.split('\n').filter(line => line.trim());
+
+        if (lines.length > 0) {
+          // Build content array with text nodes and explicit newlines
+          const quoteContentNodes: NoteAtom[] = [];
+
+          for (let i = 0; i < lines.length; i++) {
+            const lineContent = parseInlineContent(lines[i].trim());
+            if (lineContent.length > 0) {
+              quoteContentNodes.push(...lineContent);
+              // Add newline after each line except the last
+              if (i < lines.length - 1) {
+                quoteContentNodes.push({ type: 'text', text: '\n' });
+              }
+            }
+          }
+
+          if (quoteContentNodes.length > 0) {
+            blocks.push({ type: 'quote', content: quoteContentNodes });
+            stats.quote++;
+          }
         }
       }
       continue;
@@ -221,7 +250,21 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
       const codeData = codeBlocks[codeIndex];
       if (codeData) {
         // Create code block as quote for better visual presentation
-        const codeText = stripHtmlAndDecode(codeData.content).trim();
+        // Preserve line breaks by only decoding HTML entities, not stripping newlines
+        let codeText = codeData.content;
+
+        // Remove HTML tags but preserve newlines
+        codeText = codeText
+          .replace(/<br\s*\/?>/gi, '\n')  // Convert <br> to newline
+          .replace(/<[^>]+>/g, '')         // Remove other HTML tags
+          .replace(/&lt;/g, '<')           // Decode common entities
+          .replace(/&gt;/g, '>')
+          .replace(/&amp;/g, '&')
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/&nbsp;/g, ' ')
+          .trim();
+
         if (codeText) {
           blocks.push({
             type: 'quote',

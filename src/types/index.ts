@@ -16,7 +16,7 @@ export const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   defaultPublic: false,
   defaultIncludeImages: true,
-  maxImages: 10,
+  maxImages: 50,
   createIndexNote: true,
   debugMode: false,
   lastTestStatus: null,
@@ -48,7 +48,8 @@ export interface ContentBlock {
 
 export interface ImageCandidate {
   id: string;
-  url: string;
+  url: string;              // Original URL from DOM (used for HTML matching)
+  normalizedUrl: string;    // Normalized URL (used for upload, highest quality)
   kind: 'img' | 'srcset' | 'lazy' | 'background' | 'data' | 'blob' | 'og' | 'preload';
   order: number;
   inMainContent: boolean;

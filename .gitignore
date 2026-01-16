@@ -32,6 +32,7 @@ lerna-debug.log*
 # Temporary files
 *.tmp
 *.temp
+temp_*.html
 
 # TypeScript
 *.tsbuildinfo
@@ -60,28 +61,14 @@ coverage/
 ehthumbs.db
 ehthumbs_vista.db
 *.stackdump
-.claude/skills/mowen-apifox/SKILL.md
-.claude/skills/mowen-apifox/references/index.md
-.claude/skills/mowen-apifox/references/llms.md
-.claude/skills/mowen-apifox/references/overview.md
-.claude/skills/ui-ux-pro-max/SKILL.md
-.claude/skills/ui-ux-pro-max/data/charts.csv
-.claude/skills/ui-ux-pro-max/data/colors.csv
-.claude/skills/ui-ux-pro-max/data/landing.csv
-.claude/skills/ui-ux-pro-max/data/products.csv
-.claude/skills/ui-ux-pro-max/data/prompts.csv
-.claude/skills/ui-ux-pro-max/data/styles.csv
-.claude/skills/ui-ux-pro-max/data/typography.csv
-.claude/skills/ui-ux-pro-max/data/ux-guidelines.csv
-.claude/skills/ui-ux-pro-max/data/stacks/flutter.csv
-.claude/skills/ui-ux-pro-max/data/stacks/html-tailwind.csv
-.claude/skills/ui-ux-pro-max/data/stacks/nextjs.csv
-.claude/skills/ui-ux-pro-max/data/stacks/nuxt-ui.csv
-.claude/skills/ui-ux-pro-max/data/stacks/nuxtjs.csv
-.claude/skills/ui-ux-pro-max/data/stacks/react-native.csv
-.claude/skills/ui-ux-pro-max/data/stacks/react.csv
-.claude/skills/ui-ux-pro-max/data/stacks/svelte.csv
-.claude/skills/ui-ux-pro-max/data/stacks/swiftui.csv
-.claude/skills/ui-ux-pro-max/data/stacks/vue.csv
-.claude/skills/ui-ux-pro-max/scripts/core.py
-.claude/skills/ui-ux-pro-max/scripts/search.py
+
+# AI Agent Directories (local development artifacts)
+.agent/
+.planning/
+.claude/
+
+# Release packages (generated artifacts)
+release_package/
+
+# Temporary development files
+reproduce_layout.ts
