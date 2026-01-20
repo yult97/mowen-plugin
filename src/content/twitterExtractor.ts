@@ -245,9 +245,13 @@ export async function extractTwitterContent(url: string, domain: string): Promis
         const mainImageHtmlParts: string[] = [];
         const mainImageBlocks: ContentBlock[] = [];
 
-        mainImages.forEach((img, imgIndex) => {
-            const totalImages = mainImages.length;
-            const altText = totalImages > 1 ? `图片 ${imgIndex + 1}/${totalImages}` : '图片';
+        mainImages.forEach((img) => {
+            // Use real alt text if available and meaningful, otherwise empty string
+            const rawAlt = (img.alt || '').trim();
+            // Filter out generic placeholders
+            const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+                rawAlt === 'null' || rawAlt === 'undefined';
+            const altText = (rawAlt && !isGeneric) ? rawAlt : '';
 
             const imgBlock: ContentBlock = {
                 id: generateId(),
@@ -965,9 +969,13 @@ async function extractTweetContent(container: HTMLElement, contentStart?: string
         textParts.push(qt.text);
 
         // (3) 引用图片（独立节点，在 quote 之后）
-        qt.images.forEach((img, imgIndex) => {
-            const totalImages = qt.images.length;
-            const altText = totalImages > 1 ? `引用图 ${imgIndex + 1}/${totalImages}` : '引用图';
+        qt.images.forEach((img) => {
+            // Use real alt text if available and meaningful, otherwise empty string
+            const rawAlt = (img.alt || '').trim();
+            // Filter out generic placeholders
+            const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+                rawAlt === 'null' || rawAlt === 'undefined';
+            const altText = (rawAlt && !isGeneric) ? rawAlt : '';
 
             const imgBlock: ContentBlock = {
                 id: generateId(),
@@ -1246,9 +1254,13 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                     textParts.push(quoteTweet.text);
 
                     // (3) 引用图片
-                    quoteTweet.images.forEach((img: ImageCandidate, imgIndex: number) => {
-                        const totalImages = quoteTweet.images.length;
-                        const altText = totalImages > 1 ? `引用图 ${imgIndex + 1}/${totalImages}` : '引用图';
+                    quoteTweet.images.forEach((img: ImageCandidate) => {
+                        // Use real alt text if available and meaningful, otherwise empty string
+                        const rawAlt = (img.alt || '').trim();
+                        // Filter out generic placeholders
+                        const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+                            rawAlt === 'null' || rawAlt === 'undefined';
+                        const altText = (rawAlt && !isGeneric) ? rawAlt : '';
 
                         const imgBlock: ContentBlock = {
                             id: generateId(),
@@ -1349,13 +1361,18 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                         kind: 'img',
                         order: images.length,
                         inMainContent: true,
-                        alt: img.alt || '图片',
+                        alt: img.alt || '',
                         width: imgWidth,
                         height: imgHeight,
                     };
                     images.push(imgCandidate);
 
-                    const altText = `图片 ${images.length}`;
+                    // Use real alt text if available and meaningful, otherwise empty string
+                    const rawAlt = (img.alt || '').trim();
+                    // Filter out generic placeholders
+                    const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+                        rawAlt === 'null' || rawAlt === 'undefined';
+                    const altText = (rawAlt && !isGeneric) ? rawAlt : '';
                     blocks.push({
                         id: generateId(),
                         type: 'image',
@@ -1388,7 +1405,7 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                                 kind: 'img',
                                 order: images.length,
                                 inMainContent: true,
-                                alt: img.alt || '图片',
+                                alt: img.alt || '',
                                 width: img.naturalWidth || img.width,
                                 height: img.naturalHeight || img.height,
                             };

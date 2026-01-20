@@ -98,11 +98,18 @@ export const STRUCTURAL_SELECTORS = [
 ];
 
 // Text patterns to identify metadata blocks for removal
+// 这些是通用规则，用于过滤常见的日期、作者等元数据
 export const METADATA_TEXT_PATTERNS = [
+    // 英文元数据
     /^(written by|reviewed by|edited by|posted by)\s*$/i,
     /^(last edited|last updated|published on)\s*\w+\s+\d+,?\s*\d*$/i,
     /^expert verified$/i,
     /^(blogs?|guides?|articles?)\s*[\/|]\s*(blogs?|guides?|articles?)?$/i,
+    // 通用日期格式：支持 ISO 格式 "Published on 2026-01-11"
+    /^published\s+(on\s+)?\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/i,
+    // 中文作者格式："作者：xxx" 或 "作者/公众号：xxx"
+    /^作者[：:]/,
+    /^作者\/公众号[：:]/,
 ];
 
 // Selectors for non-content image containers (avatars, author bios, social, etc.)

@@ -183,7 +183,7 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
   normalized = normalized
     .replace(/(<!--QUOTE:\d+-->)/g, '\n$1\n')
     .replace(/(<!--CODE:\d+-->)/g, '\n$1\n')
-    .replace(/(<!--IMG:\d+-->)/g, '\n$1\n');
+    .replace(/(<!--IMG:\d+-->)/g, '$1');
 
   // 7. Split by block boundaries
   // Note: EMPTY_LINE is NOT in the split regex, so it is preserved inside segments
@@ -338,9 +338,10 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
               }
             }
           } else {
-            // Process text part (recurse logic for empty lines?)
-            // For simplicity, treat mixed text as regular paragraphs (no BR logic inside mixed lines yet, or apply same logic)
-            // Let's apply simple inline parsing here to avoid deep complexity in mixed nodes
+            // Process text part
+            // Check if this text looks like a continuation or a new paragraph
+            // For now, we add it as a paragraph, but we should make sure we don't add empty ones
+            // if the text is just a spacer.
             const inline = parseInlineContent(partTrimmed);
             if (inline.length > 0 && hasRealContent(inline)) {
               blocks.push({ type: 'paragraph', content: inline });
@@ -513,6 +514,28 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
       continue; // Skip duplicate empty paragraph
     }
 
+    // Remove empty paragraph if adjacent to IMAGE blocks
+    // But preserve empty paragraphs between text paragraphs (normal spacing)
+    if (isEmptyParagraph(block)) {
+      // Check if previous block is an image
+      const isAfterImage = lastBlock && lastBlock.type === 'image';
+
+      // Check if next NON-EMPTY block is an image (look-ahead)
+      // We need to find the next block that will actually be in the output
+      let nextRealBlock: NoteAtom | undefined;
+      for (let j = i + 1; j < blocks.length; j++) {
+        if (!isEmptyParagraph(blocks[j])) {
+          nextRealBlock = blocks[j];
+          break;
+        }
+      }
+      const isBeforeImage = nextRealBlock && nextRealBlock.type === 'image';
+
+      if (isAfterImage || isBeforeImage) {
+        continue; // Skip empty spacer adjacent to images
+      }
+    }
+
     filtered.push(block);
   }
 
@@ -533,15 +556,6 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
  * Process a single block and apply formatting/empty line rules
  */
 function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
-  // Rule: Add empty paragraph BEFORE quote blocks (if there's content before)
-  if (block.type === 'quote' && result.length > 0) {
-    const lastBlock = result[result.length - 1];
-    // Only add empty paragraph if last block is not already empty
-    if (!isEmptyParagraph(lastBlock)) {
-      result.push({ type: 'paragraph' });
-    }
-  }
-
   // Apply formatting (Heading detection)
   if (block.type === 'paragraph') {
     const text = getTextFromAtom(block).trim();
@@ -589,11 +603,6 @@ function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
   }
 
   result.push(block);
-
-  // Rule: Add empty paragraph AFTER quote blocks
-  if (block.type === 'quote') {
-    result.push({ type: 'paragraph' });
-  }
 }
 
 /**
@@ -915,9 +924,14 @@ function createTextNode(text: string, marks: NoteAtomMark[]): NoteAtom {
   return node;
 }
 
+
+
 /**
  * Create image block from image data
  * Returns null if image cannot be properly displayed (no UUID)
+ * 
+ * 注意：imgData.alt 现在传递的是可见的图片说明（如 figcaption），
+ * 而非不可见的 HTML alt 属性。只有用户在网页上能看到的说明才会被传递过来。
  */
 function createImageBlock(imgData: ImageData): NoteAtom | null {
   if (imgData.uuid) {
@@ -926,7 +940,8 @@ function createImageBlock(imgData: ImageData): NoteAtom | null {
       attrs: {
         uuid: imgData.uuid,
         align: 'center',
-        alt: imgData.alt || ''
+        // 使用可见的图片说明（如 figcaption）
+        ...(imgData.alt ? { alt: imgData.alt } : {})
       }
     };
   } else {

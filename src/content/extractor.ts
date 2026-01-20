@@ -296,7 +296,8 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
         const elementsToRemove: HTMLElement[] = [];
 
         // General text pattern removal
-        element.querySelectorAll('div, span, p, a').forEach((el) => {
+        // 添加 time 元素，因为日期信息通常在 time 标签内
+        element.querySelectorAll('div, span, p, a, time').forEach((el) => {
             const text = (el.textContent || '').trim();
             // Only match small elements (less than 100 chars) to avoid removing large content blocks
             if (text.length > 0 && text.length < 100) {

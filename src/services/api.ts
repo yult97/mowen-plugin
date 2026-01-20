@@ -276,7 +276,7 @@ const ORIGINAL_LINK_ICON = '📄';
  */
 function createOriginalLinkHtml(sourceUrl?: string): string {
   if (!sourceUrl) return '';
-  return `<p></p><p>${ORIGINAL_LINK_ICON} 来源：<a href="${sourceUrl}" target="_blank" rel="noopener noreferrer">查看原文</a></p><p></p>`;
+  return `<p>${ORIGINAL_LINK_ICON} 来源：<a href="${sourceUrl}" target="_blank" rel="noopener noreferrer">查看原文</a></p>`;
 }
 
 export async function createNote(
@@ -603,6 +603,69 @@ async function fetchWeixinImageNoReferrer(imageUrl: string): Promise<Blob | null
     }
   } catch (error) {
     console.log(`[img] weixin no-cors fetch also failed`);
+  }
+
+  return null;
+}
+
+/**
+ * Fetch image directly from Service Worker using no-referrer policy
+ * This bypasses CORS restrictions that Content Script cannot circumvent
+ * 
+ * Works for domains like s.baoyu.io that block cross-origin requests
+ * but allow requests with no referrer from Chrome extension Service Workers.
+ */
+async function fetchImageDirectFromSW(imageUrl: string): Promise<Blob | null> {
+  console.log(`[img] SW direct fetch: ${imageUrl.substring(0, 60)}...`);
+
+  // Skip data/blob URLs - they need special handling
+  if (imageUrl.startsWith('data:') || imageUrl.startsWith('blob:')) {
+    console.log(`[img] SW direct fetch: skipping data/blob URL`);
+    return null;
+  }
+
+  try {
+    // Strategy 1: Use no-referrer policy with CORS mode
+    const response = await fetch(imageUrl, {
+      method: 'GET',
+      referrerPolicy: 'no-referrer',
+      mode: 'cors',
+      credentials: 'omit',
+      headers: {
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    });
+
+    if (response.ok) {
+      const blob = await response.blob();
+      if (blob.size > 0) {
+        console.log(`[img] SW direct fetch ok: size=${blob.size}, type=${blob.type}`);
+        return blob;
+      }
+    }
+
+    console.log(`[img] SW direct fetch fail: status=${response.status}`);
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : 'Unknown error';
+    console.log(`[img] SW direct fetch cors exception: ${errMsg}`);
+  }
+
+  // Strategy 2: Try no-cors mode (opaque response, but blob() still works)
+  try {
+    const response2 = await fetch(imageUrl, {
+      method: 'GET',
+      referrerPolicy: 'no-referrer',
+      mode: 'no-cors',
+      credentials: 'omit',
+    });
+
+    const blob = await response2.blob();
+    if (blob.size > 0) {
+      console.log(`[img] SW direct no-cors fetch ok: size=${blob.size}`);
+      return blob;
+    }
+  } catch (error) {
+    console.log(`[img] SW direct no-cors fetch also failed`);
   }
 
   return null;
@@ -940,6 +1003,59 @@ export async function uploadImageWithFallback(
     }
   } else {
     console.log(`[img] idx=${imageIndex} local skip: no blob fetch function provided`);
+  }
+
+  // ===== Step 2.5: Try Service Worker Direct Fetch (bypasses CORS) =====
+  // This is a fallback for domains like s.baoyu.io that block Content Script fetches
+  // but allow Service Worker fetches with no-referrer policy
+  console.log(`[img] idx=${imageIndex} SW direct fetch start`);
+  try {
+    const swBlob = await fetchImageDirectFromSW(imageUrl);
+    if (swBlob && swBlob.size > 0) {
+      console.log(`[img] idx=${imageIndex} SW direct fetch ok, size=${swBlob.size}`);
+
+      // Check size limit
+      const MAX_LOCAL_SIZE = 50 * 1024 * 1024;
+      if (swBlob.size > MAX_LOCAL_SIZE) {
+        console.log(`[img] idx=${imageIndex} SW direct skip: size ${swBlob.size} exceeds 50MB`);
+      } else {
+        // Generate filename and upload
+        const fileName = generateFileName(imageUrl, swBlob.type);
+        await waitForRateLimit();
+        const prepareResult = await uploadPrepare(apiKey, fileName);
+
+        if (prepareResult.success && prepareResult.endpoint && prepareResult.form) {
+          const deliverResult = await uploadLocalFile(
+            prepareResult.endpoint,
+            prepareResult.form,
+            swBlob,
+            fileName
+          );
+
+          if (deliverResult.success) {
+            const uploadedFile = deliverResult.uploadedFile;
+            const uuid = uploadedFile?.fileId || uploadedFile?.uid;
+            console.log(`[img] idx=${imageIndex} SW direct upload success uuid=${uuid}`);
+            return {
+              success: true,
+              uploadMethod: 'local',
+              uuid: uuid,
+              url: uploadedFile?.url,
+              fileId: uploadedFile?.fileId,
+              uid: uploadedFile?.uid,
+            };
+          }
+          console.log(`[img] idx=${imageIndex} SW direct deliver fail: ${deliverResult.error}`);
+        } else {
+          console.log(`[img] idx=${imageIndex} SW direct prepare fail: ${prepareResult.error}`);
+        }
+      }
+    } else {
+      console.log(`[img] idx=${imageIndex} SW direct fetch returned empty`);
+    }
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : 'Unknown error';
+    console.log(`[img] idx=${imageIndex} SW direct exception: ${errMsg}`);
   }
 
   // ===== Step 3: Degrade to Link =====

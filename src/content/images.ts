@@ -17,6 +17,33 @@ import {
 } from '../config/site-selectors';
 
 /**
+ * 获取图片的可见说明文字（用户在网页上能看到的）
+ * 只提取 figcaption 等可见元素，不使用 alt 属性（alt 在页面上不可见）
+ * 
+ * @param img 图片元素
+ * @returns 可见的图片说明，如果没有则返回空字符串
+ */
+function getVisibleCaption(img: HTMLImageElement): string {
+    // 1. 检查是否在 <figure> 中，并查找 <figcaption>
+    const figure = img.closest('figure');
+    if (figure) {
+        const figcaption = figure.querySelector('figcaption');
+        if (figcaption) {
+            const text = figcaption.textContent?.trim();
+            if (text) {
+                console.log(`[images] found visible caption (figcaption): "${text.substring(0, 50)}..."`);
+                return text;
+            }
+        }
+    }
+
+    // 2. 不使用 alt 属性，因为它在页面上不可见
+    // alt 属性只有在图片加载失败时才会显示给用户
+
+    return '';
+}
+
+/**
  * Extract images from a container element, filtering out non-content images.
  */
 export function extractImages(container: HTMLElement): ImageCandidate[] {
@@ -248,6 +275,11 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
             // This ensures same image with different resize params isn't duplicated
             if (!seen.has(urlInfo.normalizedUrl)) {
                 seen.add(urlInfo.normalizedUrl);
+
+                // 提取可见的图片说明（figcaption），而不是不可见的 alt 属性
+                // figcaption 是用户在网页上可以看到的图片说明
+                const visibleCaption = getVisibleCaption(img);
+
                 images.push({
                     id: generateId(),
                     url: urlInfo.originalUrl,           // Original URL for HTML matching
@@ -257,7 +289,8 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
                     inMainContent: true,
                     width: img.naturalWidth || img.width || undefined,
                     height: img.naturalHeight || img.height || undefined,
-                    alt: img.alt || undefined,
+                    // 使用可见说明（figcaption）而非 alt 属性
+                    alt: visibleCaption || undefined,
                 });
             }
         });
