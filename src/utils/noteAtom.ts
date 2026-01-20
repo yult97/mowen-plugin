@@ -65,6 +65,16 @@ export function htmlToNoteAtom(html: string): NoteAtom {
   try {
     console.log('[noteAtom] Starting block-aware conversion, input length:', html.length);
 
+    // 检查输入 HTML 是否包含 blockquote
+    const blockquoteCount = (html.match(/<blockquote/gi) || []).length;
+    console.log(`[noteAtom] 🔍 输入 HTML 包含 ${blockquoteCount} 个 <blockquote> 标签`);
+    if (blockquoteCount > 0) {
+      const blockquoteMatch = html.match(/<blockquote[^>]*>[\s\S]*?<\/blockquote>/i);
+      if (blockquoteMatch) {
+        console.log(`[noteAtom] 📋 第一个 blockquote 内容预览: "${blockquoteMatch[0].substring(0, 200)}..."`);
+      }
+    }
+
     // 1. Clean script/style/comments
     let processed = html
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, '')
@@ -135,6 +145,14 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
     return `\n${placeholder}\n`;
   });
 
+  // 调试日志：打印识别到的 blockquote 数量
+  if (quoteBlocks.length > 0) {
+    console.log(`[noteAtom] 🔍 识别到 ${quoteBlocks.length} 个 blockquote 块`);
+    quoteBlocks.forEach((q, i) => {
+      console.log(`[noteAtom] 📋 blockquote #${i + 1} 内容预览: ${q.content.substring(0, 100)}...`);
+    });
+  }
+
   // 3. Handle code blocks (pre/code)
   const codeBlocks: Array<{ placeholder: string; content: string }> = [];
   normalized = normalized.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_m, content) => {
@@ -161,179 +179,204 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
     .replace(/<br\s*\/?>/gi, '\n<!--EMPTY_LINE-->\n')
     .replace(/<hr\s*\/?>/gi, '\n<!--HR-->\n');
 
-  // 6. Split by block boundaries
+  // 6. 确保 QUOTE、CODE、IMG 占位符独立成行，便于后续匹配
+  normalized = normalized
+    .replace(/(<!--QUOTE:\d+-->)/g, '\n$1\n')
+    .replace(/(<!--CODE:\d+-->)/g, '\n$1\n')
+    .replace(/(<!--IMG:\d+-->)/g, '\n$1\n');
+
+  // 7. Split by block boundaries
   // Note: EMPTY_LINE is NOT in the split regex, so it is preserved inside segments
   const segments = normalized.split(/<!--(?:BLOCK_START|BLOCK_END|HR)-->/);
 
 
   for (const segment of segments) {
-    const trimmed = segment.trim();
+    // 将每个 segment 按换行符分割成多行，逐行处理
+    // 这样可以正确识别 QUOTE、CODE、IMG 占位符
+    const lines = segment.split('\n');
 
-    // Check if this segment represents an intentionally empty block (e.g., from empty <p></p>)
-    // We look for segments that are just whitespace with block markers but no real content
-    const isEmptyBlock = !trimmed || /^[\s\n]*$/.test(trimmed);
+    for (const line of lines) {
+      const trimmed = line.trim();
 
-    // Handle empty block - create empty paragraph for spacing
-    if (isEmptyBlock) {
-      // Only add empty paragraph if we already have content (avoid leading empty lines)
-      if (blocks.length > 0) {
-        blocks.push({ type: 'paragraph' }); // No content field for empty paragraph per API spec
-        stats.paragraph++;
-      }
-      continue;
-    }
+      // Check if this segment represents an intentionally empty block (e.g., from empty <p></p>)
+      // We look for segments that are just whitespace with block markers but no real content
+      const isEmptyBlock = !trimmed || /^[\s\n]*$/.test(trimmed);
 
-    // Check for image placeholder
-    const imgMatch = trimmed.match(/^<!--IMG:(\d+)-->$/);
-    if (imgMatch) {
-      const imgIndex = parseInt(imgMatch[1]);
-      const imgData = images[imgIndex];
-      if (imgData) {
-        const imageBlock = createImageBlock(imgData);
-        if (imageBlock) {
-          blocks.push(imageBlock);
-          stats.image++;
+      // Handle empty block - create empty paragraph for spacing
+      if (isEmptyBlock) {
+        // Only add empty paragraph if we already have content (avoid leading empty lines)
+        if (blocks.length > 0) {
+          blocks.push({ type: 'paragraph' }); // No content field for empty paragraph per API spec
+          stats.paragraph++;
         }
+        continue;
       }
-      continue;
-    }
 
-    // Check for quote placeholder
-    const quoteMatch = trimmed.match(/^<!--QUOTE:(\d+)-->$/);
-    if (quoteMatch) {
-      const quoteIndex = parseInt(quoteMatch[1]);
-      const quoteData = quoteBlocks[quoteIndex];
-      if (quoteData) {
-        // Preserve line breaks inside blockquote content
-        // Split by <br>, <p>, and newlines to maintain structure
-        let quoteContent = quoteData.content;
+      // Check for image placeholder
+      const imgMatch = trimmed.match(/^<!--IMG:(\d+)-->$/);
+      if (imgMatch) {
+        const imgIndex = parseInt(imgMatch[1]);
+        const imgData = images[imgIndex];
+        if (imgData) {
+          const imageBlock = createImageBlock(imgData);
+          if (imageBlock) {
+            blocks.push(imageBlock);
+            stats.image++;
+          }
+        }
+        continue;
+      }
 
-        // Normalize various line break patterns to a consistent marker
-        quoteContent = quoteContent
-          .replace(/<br\s*\/?>/gi, '\n')
-          .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
-          .replace(/<\/div>\s*<div[^>]*>/gi, '\n')
-          .replace(/<\/?(?:p|div)[^>]*>/gi, '\n')
-          .replace(/\n\s*\n/g, '\n'); // Collapse multiple newlines
+      // Check for quote placeholder
+      const quoteMatch = trimmed.match(/^<!--QUOTE:(\d+)-->$/);
+      if (quoteMatch) {
+        const quoteIndex = parseInt(quoteMatch[1]);
+        const quoteData = quoteBlocks[quoteIndex];
+        if (quoteData) {
+          // Preserve line breaks inside blockquote content
+          // Split by <br>, <p>, and newlines to maintain structure
+          let quoteContent = quoteData.content;
 
-        // Split into lines and process each
-        const lines = quoteContent.split('\n').filter(line => line.trim());
+          console.log(`[noteAtom] 🔍 处理引用块原始内容: "${quoteContent.substring(0, 200)}..."`);
 
-        if (lines.length > 0) {
-          // Build content array with text nodes and explicit newlines
-          const quoteContentNodes: NoteAtom[] = [];
+          // Normalize various line break patterns to a consistent marker
+          quoteContent = quoteContent
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
+            .replace(/<\/div>\s*<div[^>]*>/gi, '\n')
+            .replace(/<\/?(?:p|div)[^>]*>/gi, '\n')
+            .replace(/\n\s*\n/g, '\n'); // Collapse multiple newlines
 
-          for (let i = 0; i < lines.length; i++) {
-            const lineContent = parseInlineContent(lines[i].trim());
-            if (lineContent.length > 0) {
-              quoteContentNodes.push(...lineContent);
-              // Add newline after each line except the last
-              if (i < lines.length - 1) {
-                quoteContentNodes.push({ type: 'text', text: '\n' });
+          console.log(`[noteAtom] 🔍 引用块换行处理后: "${quoteContent.substring(0, 200)}..."`);
+
+          // Split into lines and process each
+          const lines = quoteContent.split('\n').filter(line => line.trim());
+
+          console.log(`[noteAtom] 🔍 引用块分割后行数: ${lines.length}, 行内容: ${JSON.stringify(lines.slice(0, 3))}`);
+
+          if (lines.length > 0) {
+            // Build content array with text nodes and explicit newlines
+            const quoteContentNodes: NoteAtom[] = [];
+
+            for (let i = 0; i < lines.length; i++) {
+              const lineContent = parseInlineContent(lines[i].trim());
+              console.log(`[noteAtom] 🔍 引用块第 ${i + 1} 行 parseInlineContent 结果: ${JSON.stringify(lineContent).substring(0, 150)}`);
+              if (lineContent.length > 0) {
+                quoteContentNodes.push(...lineContent);
+                // Add newline after each line except the last
+                if (i < lines.length - 1) {
+                  quoteContentNodes.push({ type: 'text', text: '\n' });
+                }
               }
             }
-          }
 
-          if (quoteContentNodes.length > 0) {
-            blocks.push({ type: 'quote', content: quoteContentNodes });
-            stats.quote++;
+            console.log(`[noteAtom] 🔍 引用块最终节点数: ${quoteContentNodes.length}`);
+
+            if (quoteContentNodes.length > 0) {
+              blocks.push({ type: 'quote', content: quoteContentNodes });
+              stats.quote++;
+            } else {
+              console.log(`[noteAtom] ⚠️ 引用块内容为空，跳过创建 quote 节点`);
+            }
+          } else {
+            console.log(`[noteAtom] ⚠️ 引用块分割后无有效行，跳过创建 quote 节点`);
           }
         }
+        continue;
       }
-      continue;
-    }
 
-    // Check for code placeholder
-    const codeMatch = trimmed.match(/^<!--CODE:(\d+)-->$/);
-    if (codeMatch) {
-      const codeIndex = parseInt(codeMatch[1]);
-      const codeData = codeBlocks[codeIndex];
-      if (codeData) {
-        // Create code block as quote for better visual presentation
-        // Preserve line breaks by only decoding HTML entities, not stripping newlines
-        let codeText = codeData.content;
+      // Check for code placeholder
+      const codeMatch = trimmed.match(/^<!--CODE:(\d+)-->$/);
+      if (codeMatch) {
+        const codeIndex = parseInt(codeMatch[1]);
+        const codeData = codeBlocks[codeIndex];
+        if (codeData) {
+          // Create code block as quote for better visual presentation
+          // Preserve line breaks by only decoding HTML entities, not stripping newlines
+          let codeText = codeData.content;
 
-        // Remove HTML tags but preserve newlines
-        codeText = codeText
-          .replace(/<br\s*\/?>/gi, '\n')  // Convert <br> to newline
-          .replace(/<[^>]+>/g, '')         // Remove other HTML tags
-          .replace(/&lt;/g, '<')           // Decode common entities
-          .replace(/&gt;/g, '>')
-          .replace(/&amp;/g, '&')
-          .replace(/&quot;/g, '"')
-          .replace(/&#39;/g, "'")
-          .replace(/&nbsp;/g, ' ')
-          .trim();
+          // Remove HTML tags but preserve newlines
+          codeText = codeText
+            .replace(/<br\s*\/?>/gi, '\n')  // Convert <br> to newline
+            .replace(/<[^>]+>/g, '')         // Remove other HTML tags
+            .replace(/&lt;/g, '<')           // Decode common entities
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&nbsp;/g, ' ')
+            .trim();
 
-        if (codeText) {
-          blocks.push({
-            type: 'quote',
-            content: [{ type: 'text', text: codeText }]
-          });
-          stats.code++;
+          if (codeText) {
+            blocks.push({
+              type: 'quote',
+              content: [{ type: 'text', text: codeText }]
+            });
+            stats.code++;
+          }
         }
+        continue;
       }
-      continue;
-    }
 
-    // Check if segment contains image placeholder mixed with text
-    // Handle image + text split logic
-    if (trimmed.includes('<!--IMG:')) {
-      const parts = trimmed.split(/(<!--IMG:\d+-->)/);
-      for (const part of parts) {
-        const partTrimmed = part.trim();
-        if (!partTrimmed) continue;
+      // Check if segment contains image placeholder mixed with text
+      // Handle image + text split logic
+      if (trimmed.includes('<!--IMG:')) {
+        const parts = trimmed.split(/(<!--IMG:\d+-->)/);
+        for (const part of parts) {
+          const partTrimmed = part.trim();
+          if (!partTrimmed) continue;
 
-        const pImgMatch = partTrimmed.match(/^<!--IMG:(\d+)-->$/);
-        if (pImgMatch) {
-          const imgIndex = parseInt(pImgMatch[1]);
-          const imgData = images[imgIndex];
-          if (imgData) {
-            const imageBlock = createImageBlock(imgData);
-            if (imageBlock) {
-              blocks.push(imageBlock);
-              stats.image++;
+          const pImgMatch = partTrimmed.match(/^<!--IMG:(\d+)-->$/);
+          if (pImgMatch) {
+            const imgIndex = parseInt(pImgMatch[1]);
+            const imgData = images[imgIndex];
+            if (imgData) {
+              const imageBlock = createImageBlock(imgData);
+              if (imageBlock) {
+                blocks.push(imageBlock);
+                stats.image++;
+              }
+            }
+          } else {
+            // Process text part (recurse logic for empty lines?)
+            // For simplicity, treat mixed text as regular paragraphs (no BR logic inside mixed lines yet, or apply same logic)
+            // Let's apply simple inline parsing here to avoid deep complexity in mixed nodes
+            const inline = parseInlineContent(partTrimmed);
+            if (inline.length > 0 && hasRealContent(inline)) {
+              blocks.push({ type: 'paragraph', content: inline });
+              stats.paragraph++;
             }
           }
+        }
+        continue;
+      }
+
+      // Regular paragraph (potentially containing EMPTY_LINE)
+      const parts = trimmed.split('<!--EMPTY_LINE-->');
+
+      // Process all parts, including empty ones to preserve empty lines
+      for (let index = 0; index < parts.length; index++) {
+        const part = parts[index];
+        const partTrimmed = part.trim();
+
+        if (!partTrimmed) {
+          // Empty part -> Create Empty Paragraph (preserves blank lines)
+          // Only create empty paragraph if this is between content (not at end unless there was content before)
+          if (index < parts.length - 1 || (index > 0 && parts.slice(0, index).some(p => p.trim()))) {
+            blocks.push({ type: 'paragraph' }); // No content field for empty paragraph per API spec
+            stats.paragraph++;
+          }
         } else {
-          // Process text part (recurse logic for empty lines?)
-          // For simplicity, treat mixed text as regular paragraphs (no BR logic inside mixed lines yet, or apply same logic)
-          // Let's apply simple inline parsing here to avoid deep complexity in mixed nodes
+          // Non-empty part -> Parse Content
           const inline = parseInlineContent(partTrimmed);
-          if (inline.length > 0 && hasRealContent(inline)) {
+          if (inline.length > 0) {
             blocks.push({ type: 'paragraph', content: inline });
             stats.paragraph++;
           }
         }
       }
-      continue;
     }
-
-    // Regular paragraph (potentially containing EMPTY_LINE)
-    const parts = trimmed.split('<!--EMPTY_LINE-->');
-
-    // Process all parts, including empty ones to preserve empty lines
-    for (let index = 0; index < parts.length; index++) {
-      const part = parts[index];
-      const partTrimmed = part.trim();
-
-      if (!partTrimmed) {
-        // Empty part -> Create Empty Paragraph (preserves blank lines)
-        // Only create empty paragraph if this is between content (not at end unless there was content before)
-        if (index < parts.length - 1 || (index > 0 && parts.slice(0, index).some(p => p.trim()))) {
-          blocks.push({ type: 'paragraph' }); // No content field for empty paragraph per API spec
-          stats.paragraph++;
-        }
-      } else {
-        // Non-empty part -> Parse Content
-        const inline = parseInlineContent(partTrimmed);
-        if (inline.length > 0) {
-          blocks.push({ type: 'paragraph', content: inline });
-          stats.paragraph++;
-        }
-      }
-    }
-  }
+  } // 结束 for (const segment of segments)
 
   // 7. Post-process blocks for better layout (styles, splitting, empty lines)
   return postProcessBlocks(blocks);

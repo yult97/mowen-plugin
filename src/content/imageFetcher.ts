@@ -14,11 +14,27 @@
 export async function fetchImageAsBase64(url: string): Promise<{ base64: string; mimeType: string } | null> {
     console.log('[imageFetcher] fetchImageAsBase64 start:', url.substring(0, 80));
 
-    // Check if this is a WeChat image
+    // Check image type
     const isWeixinImage = url.includes('mmbiz.qpic.cn') || url.includes('mmbiz.qlogo.cn');
+    const isTwitterImage = url.includes('pbs.twimg.com') || url.includes('twimg.com');
 
     try {
         let blob: Blob | null = null;
+
+        // Strategy 0: For Twitter images, try to find loaded image first (avoids CORS issues)
+        if (isTwitterImage) {
+            console.log('[imageFetcher] Twitter image detected, trying loaded image first');
+            try {
+                blob = await fetchFromLoadedImage(url);
+                if (blob && blob.size > 0) {
+                    console.log('[imageFetcher] Twitter loaded image fetch ok, size:', blob.size);
+                } else {
+                    blob = null;
+                }
+            } catch (e) {
+                console.log('[imageFetcher] Twitter loaded image fetch failed:', e);
+            }
+        }
 
         // Strategy 1: For WeChat images, try canvas approach first (it can capture loaded images)
         if (isWeixinImage) {
@@ -156,18 +172,47 @@ async function fetchViaXHR(url: string): Promise<Blob | null> {
 
 /**
  * Try to find and capture an already-loaded image from the page
+ * Enhanced with fuzzy URL matching for Twitter/X images
  */
 async function fetchFromLoadedImage(url: string): Promise<Blob | null> {
+    // Extract base URL path for fuzzy matching (remove query params for Twitter)
+    const getBaseUrl = (u: string): string => {
+        try {
+            const urlObj = new URL(u);
+            // For Twitter images, use pathname as base
+            if (urlObj.host.includes('twimg.com')) {
+                return urlObj.pathname;
+            }
+            // For other URLs, use full URL without query
+            return urlObj.origin + urlObj.pathname;
+        } catch {
+            return u;
+        }
+    };
+
+    const targetBase = getBaseUrl(url);
+    console.log('[imageFetcher] fetchFromLoadedImage: looking for base:', targetBase.substring(0, 60));
+
     // Find all images that match this URL
     const images = document.querySelectorAll('img');
     for (const img of images) {
-        // Check if this image matches our URL (src, data-src, currentSrc, etc.)
-        const matchesUrl =
-            img.src === url ||
-            img.currentSrc === url ||
-            img.getAttribute('data-src') === url ||
-            img.getAttribute('data-original') === url ||
-            img.getAttribute('data-actualsrc') === url;
+        // Get all possible source URLs for this image
+        const candidateUrls = [
+            img.src,
+            img.currentSrc,
+            img.getAttribute('data-src'),
+            img.getAttribute('data-original'),
+            img.getAttribute('data-actualsrc'),
+        ].filter(Boolean) as string[];
+
+        // Check if any candidate matches our target
+        const matchesUrl = candidateUrls.some(candidateUrl => {
+            // Exact match
+            if (candidateUrl === url) return true;
+            // Fuzzy match (same base path)
+            const candidateBase = getBaseUrl(candidateUrl);
+            return candidateBase === targetBase;
+        });
 
         if (matchesUrl && img.complete && img.naturalWidth > 0) {
             // Image is loaded, draw to canvas
@@ -180,6 +225,9 @@ async function fetchFromLoadedImage(url: string): Promise<Blob | null> {
                     ctx.drawImage(img, 0, 0);
                     return new Promise((resolve) => {
                         canvas.toBlob((blob) => {
+                            if (blob && blob.size > 0) {
+                                console.log('[imageFetcher] fetchFromLoadedImage: success via canvas, size:', blob.size);
+                            }
                             resolve(blob);
                         }, 'image/png');
                     });

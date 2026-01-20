@@ -8,6 +8,13 @@
 import { ImageCandidate } from '../types';
 import { generateId } from '../utils/helpers';
 import { normalizeImageUrl } from './imageNormalizer';
+import {
+    IMAGE_EXCLUDE_PARENT_SELECTORS,
+    AVATAR_CLASS_KEYWORDS,
+    AVATAR_CLASS_ONLY_KEYWORDS,
+    AVATAR_ALT_PATTERNS,
+    DECORATIVE_ALT_PATTERNS
+} from '../config/site-selectors';
 
 /**
  * Extract images from a container element, filtering out non-content images.
@@ -18,44 +25,7 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
     let order = 0;
 
     // Selectors for non-content image containers (avatars, author bios, social, etc.)
-    const excludeParentSelectors = [
-        // Author/profile related
-        '[class*="author"]',
-        '[class*="avatar"]',
-        '[class*="profile"]',
-        '[class*="bio"]',
-        '[class*="byline"]',
-        '[class*="writer"]',
-        '[class*="contributor"]',
-        '[class*="reviewer"]',
-        // Social sharing
-        '[class*="social"]',
-        '[class*="share"]',
-        '[class*="sharing"]',
-        // Substack specific interaction bars
-        '[class*="post-ufi"]',
-        '[class*="like-button"]',
-        '[class*="subscription-widget"]',
-        // Header metadata
-        '[class*="meta"]',
-        '[class*="info-bar"]',
-        '[class*="post-header"]',
-        '[class*="article-header"]',
-        // Footer/related sections
-        '[class*="related"]',
-        '[class*="recommended"]',
-        '[class*="footer"]',
-        // Navigation
-        '[class*="sidebar"]',
-        '[class*="navigation"]',
-        '[class*="nav"]',
-        // Ads
-        '[class*="advertisement"]',
-        '[class*="sponsor"]',
-        // CTA sections (often contain decorative backgrounds)
-        '[class*="sidecta"]',
-        '[class*="cta"]',
-    ];
+    const excludeParentSelectors = IMAGE_EXCLUDE_PARENT_SELECTORS;
 
     // Check if an image should be excluded based on its context
     function shouldExcludeImage(img: HTMLImageElement): boolean {
@@ -85,17 +55,8 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
             }
         }
 
-        // Avatar keywords - use word boundary matching to avoid false positives
-        // e.g., "user" should NOT match "users" in alt text like "where users can test..."
-        // Also removed "photo" as it matches "photography", "photoshop" etc.
-        const avatarKeywords = ['avatar', 'profile-pic', 'author-img', 'headshot', 'portrait'];
-
-        // Keywords that need word boundary matching (class only, not alt)
-        // These are too common in normal text to use in alt matching
-        const classOnlyKeywords = ['author', 'bio', 'user-icon', 'profile'];
-
         // Check class for keywords (exact word match for class names)
-        for (const keyword of avatarKeywords) {
+        for (const keyword of AVATAR_CLASS_KEYWORDS) {
             if (imgClass.includes(keyword)) {
                 console.log(`[images] excluding: class contains "${keyword}"`);
                 return true;
@@ -103,7 +64,7 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         }
 
         // Check class-only keywords
-        for (const keyword of classOnlyKeywords) {
+        for (const keyword of AVATAR_CLASS_ONLY_KEYWORDS) {
             if (imgClass.includes(keyword)) {
                 console.log(`[images] excluding: class contains "${keyword}"`);
                 return true;
@@ -111,15 +72,7 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         }
 
         // Check alt for very specific avatar patterns (literal words, not substrings)
-        const avatarAltPatterns = [
-            /\bavatar\b/i,
-            /\bheadshot\b/i,
-            /\bportrait\b/i,
-            /\bprofile\s*(pic|photo|image|picture)\b/i,
-            /\bauthor\s*(photo|image|picture)\b/i,
-        ];
-
-        for (const pattern of avatarAltPatterns) {
+        for (const pattern of AVATAR_ALT_PATTERNS) {
             if (pattern.test(imgAlt)) {
                 console.log(`[images] excluding: alt matches avatar pattern "${pattern.source}"`);
                 return true;
@@ -127,15 +80,7 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         }
 
         // Check alt for decorative/background image patterns
-        const decorativeAltPatterns = [
-            /\bbackground\b/i,
-            /\bsidecta\b/i,
-            /\bdecorative\b/i,
-            /\bbg[-_]?image\b/i,
-            /\bcta[-_]?(bg|background)\b/i,
-        ];
-
-        for (const pattern of decorativeAltPatterns) {
+        for (const pattern of DECORATIVE_ALT_PATTERNS) {
             if (pattern.test(imgAlt)) {
                 console.log(`[images] excluding: alt matches decorative pattern "${pattern.source}"`);
                 return true;

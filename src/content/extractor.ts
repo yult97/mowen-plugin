@@ -8,6 +8,16 @@
 import { ExtractResult, ContentBlock } from '../types';
 import { generateId, isWeixinArticle, getDomain, stripHtml } from '../utils/helpers';
 import { extractImages } from './images';
+import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
+import {
+    ARTICLE_SELECTORS,
+    AUTHOR_SELECTORS,
+    TIME_SELECTORS,
+    JUNK_SELECTORS,
+    STRUCTURAL_SELECTORS,
+    METADATA_TEXT_PATTERNS
+} from '../config/site-selectors';
+
 
 // Cache for extracted content
 let cachedExtractResult: ExtractResult | null = null;
@@ -49,11 +59,15 @@ export async function extractContent(): Promise<ExtractResult> {
     try {
         let result: ExtractResult;
 
-        // Use specific extractor for WeChat articles
+        // Use specific extractor for different page types
         if (isWeixinArticle(url)) {
             console.log('[extractor] 📱 Detected WeChat article');
             result = extractWeixinContent(url, domain);
+        } else if (isTwitterPage(url)) {
+            console.log('[extractor] 🐦 Detected X/Twitter page');
+            result = await extractTwitterContent(url, domain);
         } else {
+            // 其他页面使用通用提取器
             console.log('[extractor] 📄 Using general page extractor');
             result = extractWithReadability(url, domain);
         }
@@ -173,24 +187,9 @@ function extractArticle(doc: Document): {
     contentElement?: HTMLElement;
     imageElement?: HTMLElement;
 } {
-    const articleSelectors = [
-        '.available-content',
-        '.newsletter-post',
-        'article',
-        '[role="main"]',
-        '.post-content',
-        '.article-content',
-        '.entry-content',
-        '.content',
-        'main',
-        '#content',
-        '.post',
-        '.article',
-    ];
-
     let contentElement: HTMLElement | null = null;
 
-    for (const selector of articleSelectors) {
+    for (const selector of ARTICLE_SELECTORS) {
         contentElement = doc.querySelector(selector) as HTMLElement;
         if (contentElement && contentElement.innerText.length > 200) {
             break;
@@ -227,9 +226,8 @@ function extractArticle(doc: Document): {
     });
 
     // Extract author
-    const authorSelectors = ['[rel="author"]', '.author', '.byline', '[itemprop="author"]', '.post-author'];
     let author: string | undefined;
-    for (const selector of authorSelectors) {
+    for (const selector of AUTHOR_SELECTORS) {
         const el = doc.querySelector(selector) as HTMLElement;
         if (el?.innerText) {
             author = el.innerText.trim();
@@ -238,9 +236,8 @@ function extractArticle(doc: Document): {
     }
 
     // Extract publish time
-    const timeSelectors = ['time[datetime]', '[itemprop="datePublished"]', '.published', '.post-date', '.date'];
     let publishTime: string | undefined;
-    for (const selector of timeSelectors) {
+    for (const selector of TIME_SELECTORS) {
         const el = doc.querySelector(selector) as HTMLElement;
         if (el) {
             publishTime = el.getAttribute('datetime') || el.innerText?.trim();
@@ -270,77 +267,14 @@ function extractArticle(doc: Document): {
  */
 export function cleanContent(element: HTMLElement, aggressive: boolean = true): void {
     // 1. Remove Junk (Ads, Social, Comments, Interaction Bars) - Always Safe
-    const junkSelectors = [
-        '.advertisement', '.ads', '.social-share', '.comments', '.related-posts',
-        '[aria-hidden="true"]', 'iframe[src*="ads"]',
-        // Substack specific
-        '.post-ufi', '.like-button-container', '.share-dialog',
-        '.subscription-widget-wrap', '.substack-post-footer',
-        '.post-header', '.post-ufi-button', '.pencraft.style-button',
-        '.portable-archive-header', '.banner', '.post-footer',
-        '.profile-hover-card', '.user-hover-card', '.pencraft',
-        // Comment sections
-        '.vssue', '.vssue-container', '.gitalk-container', '.gitalk',
-        '.giscus', '.giscus-frame', '.utterances', '.disqus_thread', '#disqus_thread',
-        '.comment-section', '#comments', '[class*="comment"]',
-        // VuePress/VitePress
-        '.page-edit', '.page-nav', '.page-meta', '.last-updated',
-        // Header anchors
-        'a.header-anchor', 'a.heading-anchor', 'a.anchor', '.header-anchor',
-        // Twitter/X
-        '[data-testid="User-Name"]', '[data-testid="UserName"]', '[data-testid="User-Names"]',
-        '[data-testid="subscribe"]', '[data-testid="reply"]', '[data-testid="retweet"]',
-        '[data-testid="like"]', '[data-testid="bookmark"]', '[data-testid="share"]',
-        '[data-testid="analyticsButton"]', '[data-testid="app-text-transition-container"]',
-        '[class*="engagement-bar"]', '[class*="reactions-bar"]',
-        '[class*="like-count"]', '[class*="retweet-count"]', '[class*="reply-count"]',
-        '[class*="share-count"]', '[class*="view-count"]',
-        '[class*="subscribe-button"]', '[class*="follow-button"]',
-        // Medium specific - Author info, engagement, reading time
-        '[data-testid="authorPhoto"]',           // Author avatar
-        'img[data-testid="authorPhoto"]',        // Author avatar img
-        '[data-testid="storyPublishDate"]',      // Publish date
-        'button[aria-label="responses"]',        // Comments button
-        'button[data-testid="headerClapButton"]', // Clap button
-        'svg[aria-label="clap"]',                // Clap icon
-        '[data-testid="headerSocialShareButton"]', // Share buttons
-        '[data-testid="audioPlayButton"]',       // Listen to article button
-        '.speechify-ignore',                       // Medium audio wrapper
-        // Medium author byline patterns (div containing author link + read time)
-        'a[href*="/@"][rel="noopener follow"]', // Author link in byline
-        // Video players
-        'video', '.video-player', '.video-container', '.video_iframe', '.video_card',
-        '[class*="video-player"]', '[class*="video-controls"]', '[class*="video-bar"]',
-        // WeChat video
-        '.js_tx_video_container', '.js_video_channel_video', '.video_channel_card_container',
-        '.video_card_container', '.mpvideosnap_container', '.video_info_wrap',
-        '.video_desc', '.video_channel', '.video_player_container', '.js_video_container',
-        '.wx-video', '[class*="video_channel"]', '[class*="mpvideo"]', '[class*="wxvideo"]',
-        '.video_play_btn', '.video_progress', '.video_time', '.video_fullscreen',
-        '.video_speed', '.video_share', '.video_replay', '.video_attention',
-        // WeChat author follow
-        '.profile_info_area', '.profile_meta', '.wx_follow_btn', '.js_share_content',
-        '[class*="follow"]', '[class*="subscribe"]',
-        // iframes
-        'iframe:not([src*="mp.weixin"])',
-        // eesel.ai specific - FAQ section, author metadata, breadcrumbs
-        // CAUTION: Do NOT use generic class selectors like [class*="faq"] or [class*="component-margin-bottom"]
-        // because the main article container often has these classes (e.g. via Tailwind modifiers like [&_.faqWrapper]),
-        // causing the ENTIRE ARTICLE to be deleted.
-        // We will handle FAQ removal via text pattern matching in step 3 below.
-    ];
-
-    for (const selector of junkSelectors) {
+    for (const selector of JUNK_SELECTORS) {
         element.querySelectorAll(selector).forEach((el) => el.remove());
     }
 
     // 2. Remove Structural Elements (Headers, Footers, Nav) - Only if aggressive
     // These might contain main images, so be careful when extracting images.
     if (aggressive) {
-        const structuralSelectors = [
-            'script', 'style', 'nav', 'header', 'footer', 'aside'
-        ];
-        for (const selector of structuralSelectors) {
+        for (const selector of STRUCTURAL_SELECTORS) {
             element.querySelectorAll(selector).forEach((el) => el.remove());
         }
     } else {
@@ -359,13 +293,6 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
     // 3. Remove elements by text content patterns (for sites with unique text markers)
     // This handles author bylines, breadcrumbs, dates etc. that can't be targeted by class alone
     if (aggressive) {
-        const textPatterns = [
-            /^(written by|reviewed by|edited by|posted by)\s*$/i,
-            /^(last edited|last updated|published on)\s*\w+\s+\d+,?\s*\d*$/i,
-            /^expert verified$/i,
-            /^(blogs?|guides?|articles?)\s*[\/|]\s*(blogs?|guides?|articles?)?$/i,
-        ];
-
         const elementsToRemove: HTMLElement[] = [];
 
         // General text pattern removal
@@ -373,7 +300,7 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
             const text = (el.textContent || '').trim();
             // Only match small elements (less than 100 chars) to avoid removing large content blocks
             if (text.length > 0 && text.length < 100) {
-                for (const pattern of textPatterns) {
+                for (const pattern of METADATA_TEXT_PATTERNS) {
                     if (pattern.test(text)) {
                         // Remove the closest container that looks like a metadata block
                         // Use a safer traversal: only go up to .flex or small containers

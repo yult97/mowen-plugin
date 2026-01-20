@@ -15,12 +15,33 @@ import {
   extractContent,
   getCachedResult,
   isExtractingContent,
-  clearCache,
+  clearCache
 } from './extractor';
+import { clearQuoteUrlCache } from './twitterExtractor';
 import { fetchImageAsBase64 } from './imageFetcher';
+import { ExtractResult } from '../types';
 
-// State to prevent duplicate scheduled extractions
+// State for auto-extraction
+let observer: MutationObserver | null = null;
+let isObserving = false;
 let extractScheduled = false;
+
+// URL 变化检测（用于 SPA 路由）
+let lastKnownUrl = window.location.href;
+
+// 定期检测 URL 变化（用于 Twitter 等 SPA）
+setInterval(() => {
+  if (window.location.href !== lastKnownUrl) {
+    console.log(`[content] 🔄 URL changed: ${lastKnownUrl} -> ${window.location.href}`);
+    lastKnownUrl = window.location.href;
+    clearCache();
+    clearQuoteUrlCache(); // 同时清理 Quote URL 缓存
+    // 如果正在观察，触发新的提取
+    if (isObserving) {
+      scheduleExtraction();
+    }
+  }
+}, 500);
 
 // Listen for messages from popup/background
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -29,6 +50,72 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // PING: Health check
   if (message.type === 'PING') {
     sendResponse({ success: true, status: 'ready' });
+    return false;
+  }
+
+  // START_EXTRACTION: Enable observer and trigger extraction
+  if (message.type === 'START_EXTRACTION') {
+    console.log('[content] 🚀 START_EXTRACTION received');
+    startAutoExtraction();
+
+    // 内容稳定性检测：连续两次提取结果字数差异 < 5% 时认为内容已稳定
+    const extractWithStability = async (maxAttempts: number, interval: number, stabilityThreshold: number = 0.05) => {
+      let lastResult: ExtractResult | null = null;
+      let lastWordCount = 0;
+
+      for (let i = 0; i < maxAttempts; i++) {
+        try {
+          const result = await extractContent();
+          const currentWordCount = result.wordCount;
+
+          // 计算与上次提取的字数差异比例
+          const diff = lastWordCount > 0
+            ? Math.abs(currentWordCount - lastWordCount) / lastWordCount
+            : 1; // 首次提取，差异设为 100%
+
+          console.log(`[content] 提取 #${i + 1}: ${currentWordCount} 字, 变化: ${(diff * 100).toFixed(1)}%`);
+
+          // 稳定性判定：字数变化 < 阈值 且 字数 > 50 且 有标题
+          if (diff < stabilityThreshold && currentWordCount > 50 && result.title) {
+            console.log(`[content] ✅ 内容已稳定，返回结果`);
+            return result;
+          }
+
+          lastResult = result;
+          lastWordCount = currentWordCount;
+        } catch (error) {
+          console.log(`[content] ⚠️ 提取 #${i + 1} 失败:`, error);
+        }
+
+        if (i < maxAttempts - 1) {
+          await new Promise(r => setTimeout(r, interval));
+        }
+      }
+
+      if (lastResult) {
+        console.log(`[content] ⏱️ 达到最大尝试次数，返回最后结果 (${lastResult.wordCount} 字)`);
+        return lastResult;
+      }
+      throw new Error('All extraction attempts failed');
+    };
+
+    // 使用稳定性检测提取内容
+    // 最多尝试 6 次，每次间隔 500ms，稳定阈值 1%（更严格）
+    extractWithStability(6, 500, 0.01)
+      .then((result) => {
+        sendResponse({ success: true, data: result });
+      })
+      .catch((error) => {
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  // STOP_EXTRACTION: Disable observer
+  if (message.type === 'STOP_EXTRACTION') {
+    console.log('[content] 🛑 STOP_EXTRACTION received');
+    stopAutoExtraction();
+    sendResponse({ success: true });
     return false;
   }
 
@@ -42,6 +129,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       hasCache: !!cached,
       isExtracting,
       extractScheduled,
+      isObserving,
     });
 
     if (cached) {
@@ -62,7 +150,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return false;
     }
 
-    // No cache, trigger extraction
+    // If we are not observing, we might need to start it, or just do a one-off extraction
+    // But usually GET_CACHED_CONTENT implies we want something fast.
+    // If no cache, trigger extraction (same as before)
     extractContent()
       .then((result) => {
         sendResponse({ success: true, data: result, fromCache: false });
@@ -76,6 +166,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   // EXTRACT_CONTENT: Force fresh extraction
   if (message.type === 'EXTRACT_CONTENT') {
+    // If we receive this, we should also ensure observer is running if the user expects auto-updates
+    if (!isObserving) {
+      startAutoExtraction();
+    }
+
     extractContent()
       .then((result) => {
         console.log('[content] Extraction successful, word count:', result.wordCount);
@@ -131,40 +226,41 @@ function scheduleExtraction(): void {
   setTimeout(() => {
     extractScheduled = false;
     console.log('[content] ⏰ Scheduled extraction triggered');
-    extractContent().catch((err) => {
-      console.error('[content] ❌ Auto-extraction failed:', err);
-    });
+    extractContent()
+      .then((result) => {
+        // Notify popup/sidepanel about the update
+        chrome.runtime.sendMessage({
+          type: 'CONTENT_UPDATED',
+          data: result
+        }).catch(() => {
+          // Ignore error if popup is closed
+        });
+      })
+      .catch((err) => {
+        console.error('[content] ❌ Auto-extraction failed:', err);
+      });
   }, 1500);
 }
 
 /**
- * Initialize auto-extraction on page load.
+ * Start auto-extraction (MutationObserver)
  */
-function initializeAutoExtraction(): void {
-  console.log('[content] 🎯 Initializing auto-extraction, readyState:', document.readyState);
-
-  const triggerExtraction = (): void => {
-    setTimeout(() => {
-      extractContent().catch((err) => {
-        console.error('[content] ❌ Initial extraction failed:', err);
-      });
-    }, 2000);
-  };
-
-  if (document.readyState === 'complete') {
-    console.log('[content] ✅ Page already loaded');
-    triggerExtraction();
-  } else {
-    console.log('[content] ⏳ Waiting for page load...');
-    window.addEventListener('load', () => {
-      console.log('[content] ✅ Page load event fired');
-      triggerExtraction();
-    });
+function startAutoExtraction(): void {
+  if (isObserving) {
+    console.log('[content] ✅ Already observing');
+    return;
   }
+
+  console.log('[content] 🎯 Starting auto-extraction observer');
 
   // Watch for dynamic content changes
   console.log('[content] 👁️ Setting up MutationObserver');
-  const observer = new MutationObserver((mutations) => {
+
+  if (observer) {
+    observer.disconnect();
+  }
+
+  observer = new MutationObserver((mutations) => {
     const hasSignificantChanges = mutations.some((mutation) => {
       if (mutation.type !== 'childList') return false;
 
@@ -191,10 +287,34 @@ function initializeAutoExtraction(): void {
     subtree: true,
   });
 
-  console.log('[content] ✅ Auto-extraction initialized');
+  isObserving = true;
+}
+
+/**
+ * Stop auto-extraction
+ */
+function stopAutoExtraction(): void {
+  if (!isObserving) return;
+
+  console.log('[content] 🛑 Stopping auto-extraction observer');
+  if (observer) {
+    observer.disconnect();
+    observer = null;
+  }
+  isObserving = false;
 }
 
 // Initialize
-console.log('[墨问笔记助手] Content script loaded');
+console.log('[墨问笔记助手] Content script loaded (Lazy Mode)');
 console.log('[content] Page URL:', window.location.href);
-initializeAutoExtraction();
+
+// Note: We NO LONGER automatically call startAutoExtraction()
+// It will be triggered by the sidepanel/popup sending 'START_EXTRACTION'
+
+// Notify popup/sidepanel that content script is ready
+// This enables event-driven communication instead of polling
+setTimeout(() => {
+  chrome.runtime.sendMessage({ type: 'CONTENT_SCRIPT_READY' }).catch(() => {
+    // Ignore error if popup is not open
+  });
+}, 100);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Settings, ExtractResult, SaveProgress, DEFAULT_SETTINGS } from '../types';
 import { getSettings } from '../utils/storage';
 import {
@@ -42,6 +42,13 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
   // State to trigger auto-fetch preview
   const [autoFetchTrigger, setAutoFetchTrigger] = useState(0);
+
+  // Use ref to track preview state inside event listeners
+  const previewStateRef = useRef<PreviewState>('P0_Idle');
+
+  useEffect(() => {
+    previewStateRef.current = previewState;
+  }, [previewState]);
 
   useEffect(() => {
     initializePopup();
@@ -95,7 +102,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         setExtractResult(null);
         setProgress({ status: 'idle' });
         await updateCurrentTab();
-        // Small delay to ensure content script is ready
+        // Minimal initial delay, rely on PING retries for reliability
         setTimeout(() => {
           setAutoFetchTrigger(prev => prev + 1);
         }, 500);
@@ -125,27 +132,61 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     // Listen for save progress messages from background
     const handleSaveProgress = (message: { type: string; progress?: any }) => {
       if (message.type === 'SAVE_NOTE_PROGRESS' && message.progress) {
-        setProgress(() => ({
+        setProgress((prev) => ({
+          ...prev,
           status: 'creating',
           ...message.progress,
         }));
       }
     };
 
+    // Listen for content updates from lazy execution observer
+    const handleContentUpdate = (message: { type: string; data?: ExtractResult }) => {
+      if (message.type === 'CONTENT_UPDATED' && message.data) {
+        // Guard: Don't interrupt saving or success state
+        if (previewStateRef.current === 'P3_Saving' || previewStateRef.current === 'P4_Success') {
+          console.log('[墨问 Popup] 🛑 Ignoring content update during save/success state');
+          return;
+        }
+        console.log('[墨问 Popup] 🔄 Received live content update:', message.data.title, 'images:', message.data.images?.length || 0);
+        setExtractResult(message.data);
+        setPreviewState('P2_PreviewReady');
+      }
+    };
+
+    // Listen for content script ready notification (after page refresh)
+    const handleContentScriptReady = (message: { type: string }) => {
+      if (message.type === 'CONTENT_SCRIPT_READY') {
+        console.log('[墨问 Popup] 🚀 Content script ready, triggering extraction...');
+        // Immediately trigger fetch - no need to wait or poll
+        setPreviewState('P1_PreviewLoading');
+        setAutoFetchTrigger(prev => prev + 1);
+      }
+    };
+
+    // UNIFIED message handler - prevents conflicts between multiple listeners
+    const handleRuntimeMessage = (message: { type: string; result?: any; progress?: any; data?: ExtractResult }) => {
+      console.log('[墨问 Popup] Received message:', message.type);
+
+      // Handle all message types in one listener
+      handleSaveComplete(message);
+      handleSaveProgress(message);
+      handleContentUpdate(message);
+      handleContentScriptReady(message);
+    };
+
     // Add listeners
     chrome.storage.onChanged.addListener(handleStorageChange);
     chrome.tabs.onActivated.addListener(handleTabChange);
     chrome.tabs.onUpdated.addListener(handleTabUpdate);
-    chrome.runtime.onMessage.addListener(handleSaveComplete);
-    chrome.runtime.onMessage.addListener(handleSaveProgress);
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
 
     // Cleanup listeners on unmount
     return () => {
       chrome.storage.onChanged.removeListener(handleStorageChange);
       chrome.tabs.onActivated.removeListener(handleTabChange);
       chrome.tabs.onUpdated.removeListener(handleTabUpdate);
-      chrome.runtime.onMessage.removeListener(handleSaveComplete);
-      chrome.runtime.onMessage.removeListener(handleSaveProgress);
+      chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
     };
   }, []);
 
@@ -199,45 +240,53 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           }
         };
 
-        // Check if content script is ready
-        let isReady = false;
-        try {
-          const pingRes = await Promise.race([
-            chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
-          ]) as { success: boolean };
-          isReady = pingRes?.success === true;
-        } catch {
-          // Content script not ready, try to inject
-          console.log('[墨问 Popup] Content script not ready, injecting...');
-          const injected = await injectContentScript(tab.id);
-          if (injected) {
+        // Retry helper for PING (now just a backup, primary is event-driven)
+        const waitForContentScript = async (tabId: number, maxAttempts = 3): Promise<boolean> => {
+          for (let i = 0; i < maxAttempts; i++) {
             try {
-              const retryPing = await Promise.race([
-                chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
-                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
+              const pingRes = await Promise.race([
+                chrome.tabs.sendMessage(tabId, { type: 'PING' }),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 500))
               ]) as { success: boolean };
-              isReady = retryPing?.success === true;
-            } catch {
-              isReady = false;
+
+              if (pingRes?.success) {
+                return true;
+              }
+            } catch (e) {
+              // Ignore error, wait and retry
             }
+            // Short wait between retries
+            await new Promise(resolve => setTimeout(resolve, 200));
           }
+          return false;
+        };
+
+        // Quick PING check (event-driven CONTENT_SCRIPT_READY is primary)
+        let isReady = await waitForContentScript(tab.id, 2);
+
+        // If not ready, try inject as last resort
+        if (!isReady) {
+          console.log('[墨问 Popup] Content script not responding, attempting injection...');
+          await injectContentScript(tab.id);
+          isReady = await waitForContentScript(tab.id, 2);
         }
 
         if (!isReady) {
-          console.log('[墨问 Popup] Content script still not ready after injection');
+          console.log('[墨问 Popup] Content script still not ready after injection and retries');
           setPreviewState('P0_Idle');
           return;
         }
 
         // Try to get content from content script
+        // OPTIMIZATION: Use START_EXTRACTION instead of EXTRACT_CONTENT to wake up the script if needed
         try {
           const response = await Promise.race([
-            chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_CONTENT' }),
+            chrome.tabs.sendMessage(tab.id, { type: 'START_EXTRACTION' }),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
           ]) as { success: boolean; data?: any; error?: string };
 
           if (response?.success && response?.data) {
+            console.log('[墨问 Popup] Auto-fetch success, images:', response.data.images?.length || 0);
             setExtractResult(response.data);
             setPreviewState('P2_PreviewReady');
           } else {
@@ -248,6 +297,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           console.log('[墨问 Popup] Auto-fetch error:', error);
           setPreviewState('P0_Idle');
         }
+
       } catch (error) {
         console.error('[墨问 Popup] Auto-fetch exception:', error);
         setPreviewState('P0_Idle');
@@ -385,18 +435,26 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                     console.log('[墨问 Popup] ✅ Got content after waiting');
                     setExtractResult(retryResponse.data);
                     setPreviewState('P2_PreviewReady');
+                  } else {
+                    // Still nothing? Trigger active fetch
+                    console.log('[墨问 Popup] ⚠️ Still no content, triggering active fetch');
+                    setAutoFetchTrigger(prev => prev + 1);
                   }
                 } catch (err) {
                   console.log('[墨问 Popup] ⚠️ Could not get cached content after retry');
                 }
               }, 2000);
             } else {
-              console.log('[墨问 Popup] ℹ️ No cached content available yet');
+              console.log('[墨问 Popup] ℹ️ No cached content available, triggering active fetch');
+              // OPTIMIZATION: Manual trigger since we removed auto-extraction
+              setAutoFetchTrigger(prev => prev + 1);
             }
           }
         } catch (error) {
           console.log('[墨问 Popup] ⚠️ Could not load cached content:', error);
           // Not a critical error, user can still manually trigger extraction
+          // Trigger auto fetch just in case
+          setAutoFetchTrigger(prev => prev + 1);
         }
       } else {
         console.log('[墨问 Popup] ⚠️ Page not clippable or no tab ID, skipping auto-load');
@@ -534,7 +592,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // No cache available, do full extraction (fallback)
       console.log('[墨问] No cache available, doing full extraction');
       const response = await Promise.race([
-        chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_CONTENT' }),
+        chrome.tabs.sendMessage(tab.id, { type: 'START_EXTRACTION' }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('请求超时')), 15000))
       ]);
 
@@ -596,6 +654,17 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     }
 
     console.log('[墨问 Popup] 💾 Starting save process...');
+
+    // Stop auto-extraction to prevent state reset
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        chrome.tabs.sendMessage(tab.id, { type: 'STOP_EXTRACTION' }).catch(() => { });
+      }
+    } catch (e) {
+      // Ignore
+    }
+
     console.log('[墨问 Popup] Save payload:', {
       title: extractResult.title,
       wordCount: extractResult.wordCount,
@@ -606,7 +675,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     });
 
     setPreviewState('P3_Saving');
-    setProgress({ status: 'creating' });
+    // 设置初始进度，包含图片数量以便进度条立即显示
+    const imagesToProcess = includeImages ? Math.min(extractResult.images.length, settings.maxImages) : 0;
+    const estimatedParts = Math.ceil(extractResult.wordCount / 19000) || 1;
+    setProgress({
+      status: 'creating',
+      totalImages: imagesToProcess,
+      uploadedImages: 0,
+      totalParts: estimatedParts,
+      currentPart: 0,
+    });
 
     // Helper to proxy log
     const logProxy = async (msg: string) => {

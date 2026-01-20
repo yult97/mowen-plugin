@@ -20,6 +20,9 @@ const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 let isCancelRequested = false;
 let saveAbortController: AbortController | null = null;
 
+// 缓存活动标签页 ID，避免处理图片时标签页失去焦点
+let cachedActiveTabId: number | null = null;
+
 interface SaveNotePayload {
   extractResult: ExtractResult;
   isPublic: boolean;
@@ -197,6 +200,16 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
   isCancelRequested = false;
   saveAbortController = new AbortController();
 
+  // 在处理开始时缓存活动标签页 ID，避免后续图片处理时标签页失去焦点
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    cachedActiveTabId = activeTab?.id ?? null;
+    console.log(`[墨问 Background] 📌 缓存活动标签页 ID: ${cachedActiveTabId}`);
+  } catch (e) {
+    cachedActiveTabId = null;
+    console.log(`[墨问 Background] ⚠️ 无法获取活动标签页 ID`);
+  }
+
   // Defensive check for extractResult
   if (!extractResult) {
     console.error('[墨问 Background] ❌ extractResult is undefined/null');
@@ -248,8 +261,9 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
         }
       }
     } else if (images.length > 0) {
-      // Convert all images to links
-      processedContent = convertAllImagesToLinks(processedContent, images);
+      // 包含图片开关关闭：移除所有 img 标签（不转换为链接）
+      processedContent = removeAllImageTags(processedContent);
+      console.log(`[墨问 Background] 🚫 包含图片已关闭，移除 ${images.length} 张图片`);
     }
 
     // Step 2: Add metadata header
@@ -413,14 +427,19 @@ function sendProgressUpdate(progress: {
  */
 async function fetchImageBlobFromCS(imageUrl: string): Promise<{ blob: Blob; mimeType: string } | null> {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      console.log(`[img] fetchBlob: no active tab`);
+    // 优先使用缓存的标签页 ID，避免处理过程中标签页失去焦点
+    let tabId = cachedActiveTabId;
+    if (!tabId) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      tabId = tab?.id ?? null;
+    }
+    if (!tabId) {
+      console.log(`[img] fetchBlob: no active tab (cached=${cachedActiveTabId})`);
       return null;
     }
 
     const response = await Promise.race([
-      chrome.tabs.sendMessage(tab.id, { type: 'FETCH_IMAGE', payload: { url: imageUrl } }),
+      chrome.tabs.sendMessage(tabId, { type: 'FETCH_IMAGE', payload: { url: imageUrl } }),
       new Promise<{ success: false; error: string }>((resolve) =>
         setTimeout(() => resolve({ success: false, error: 'Timeout' }), 15000)
       ),
@@ -468,6 +487,13 @@ async function processImages(
 
   const results: ImageProcessResult[] = [];
   const totalImages = images.length;
+
+  // Send initial progress immediately so popup shows the progress bar
+  sendProgressUpdate({
+    type: 'uploading_images',
+    uploadedImages: 0,
+    totalImages,
+  });
 
   // Process images serially to respect API rate limiting
   for (let i = 0; i < images.length; i++) {
@@ -965,12 +991,12 @@ function convertImageToLink(content: string, imageUrl: string, index: string): s
   return content;
 }
 
-function convertAllImagesToLinks(content: string, images: ImageCandidate[]): string {
-  let processed = content;
-  images.forEach((img, index) => {
-    processed = convertImageToLink(processed, img.url, String(index + 1));
-  });
-  return processed;
+/**
+ * 移除所有 img 标签（包含图片开关关闭时使用）
+ */
+function removeAllImageTags(content: string): string {
+  // 移除所有 <img> 标签（自闭合和非自闭合）
+  return content.replace(/<img[^>]*\/?>/gi, '');
 }
 
 function createMetaHeader(_extractResult: ExtractResult): string {
