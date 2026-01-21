@@ -1,6 +1,6 @@
 {
   "name": "mowen-note-assistant",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "墨问笔记助手 - 一键剪藏网页到墨问笔记",
   "type": "module",
   "scripts": {
