@@ -942,7 +942,7 @@ function injectUploadedImages(
   content: string,
   imageResults: ImageProcessResult[]
 ): string {
-  let processed = content;
+  const processed = content;
   // Check if content already has all uploaded images
   // Logic: Iterate results, if result.success and we can't find its uid in processed, append it
   // This is a safety net for images that were extracted but not found in the final HTML (e.g. background images or removed by cleanup)

@@ -45,7 +45,7 @@ setInterval(() => {
 
 // Listen for messages from popup/background
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  console.log('[content] Received message:', message.type);
+  // console.log('[content] Received message:', message.type);
 
   // PING: Health check
   if (message.type === 'PING') {
@@ -84,7 +84,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           lastResult = result;
           lastWordCount = currentWordCount;
         } catch (error) {
-          console.log(`[content] ⚠️ 提取 #${i + 1} 失败:`, error);
+          console.error(`[content] ⚠️ 提取 #${i + 1} 失败:`, error);
         }
 
         if (i < maxAttempts - 1) {
@@ -194,7 +194,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
       })
       .catch((error) => {
-        console.log('[content] ❌ FETCH_IMAGE error:', error.message);
+        console.error('[content] ❌ FETCH_IMAGE error:', error.message);
         sendResponse({ success: false, error: error.message });
       });
     return true;

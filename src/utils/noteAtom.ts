@@ -536,6 +536,29 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
       }
     }
 
+    // 【新增】Caption 去重逻辑
+    // 如果上一块是图片且带有 Alt，当前块是文本段落且内容与 Alt 相同，说明该段落是 Caption 的来源，应删除避免重复显示。
+    if (block.type === 'paragraph' && lastBlock && lastBlock.type === 'image') {
+      const altText = String(lastBlock.attrs?.alt || '').trim();
+      if (altText) {
+        // Normalize: remove punctuation and whitespace for loose comparison
+        const normalize = (s: string) => s.replace(/[.,;!。，；！\s]/g, '').toLowerCase();
+        const currentText = getTextFromAtom(block).trim();
+
+        if (currentText) {
+          const normAlt = normalize(altText);
+          const normCurr = normalize(currentText);
+
+          // Keep if not similar. Filter if similar.
+          // Allow containment (e.g. caption extracted is substring of paragraph)
+          if (normAlt === normCurr || normCurr.includes(normAlt) || normAlt.includes(normCurr)) {
+            // console.log('[noteAtom] Removing duplicate caption paragraph:', currentText);
+            continue;
+          }
+        }
+      }
+    }
+
     filtered.push(block);
   }
 
@@ -992,9 +1015,18 @@ function extractImageData(imgTag: string): ImageData | null {
     }
   }
 
+  // 优先使用提取到的 Caption 作为 alt
+  // 如果有 data-mowen-caption，说明是算法提取的可见注释，优先级高于原始 alt
+  let finalAlt = altMatch?.[1] || '';
+  const dataCaptionMatch = imgTag.match(/data-mowen-caption=["']([^"']*)["']/i);
+  if (dataCaptionMatch?.[1]) {
+    // Decode HTML entities just in case
+    finalAlt = decodeHtmlEntities(dataCaptionMatch[1]);
+  }
+
   return {
     src: srcMatch[1],
-    alt: altMatch?.[1] || '',
+    alt: finalAlt,
     uuid: uuid || undefined
   };
 }

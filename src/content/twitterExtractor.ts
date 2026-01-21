@@ -298,7 +298,6 @@ export async function extractTwitterContent(url: string, domain: string): Promis
     const wordCount = textContent.length;
 
     // 如果标题使用了正文前30字，从正文中去除这部分避免重复
-    // 如果标题使用了正文前30字，从正文中去除这部分避免重复
     if (contentStart && finalBlocks.length > 0) {
         const firstBlock = finalBlocks[0];
         if (firstBlock.text.startsWith(contentStart)) {
@@ -644,6 +643,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
             }
         } catch (e) {
             // React 提取失败，继续
+            void e;
         }
     }
 
@@ -657,6 +657,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
             }
         } catch (e) {
             // pageContextHelper 提取失败，继续
+            void e;
         }
     }
 
@@ -676,7 +677,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
     }
 
     // 提取文本
-    let textEl = quoteContainer.querySelector('[data-testid="tweetText"]');
+    const textEl = quoteContainer.querySelector('[data-testid="tweetText"]');
     let text = '';
     let html = '';
 

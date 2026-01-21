@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Settings, ExtractResult, SaveProgress, DEFAULT_SETTINGS } from '../types';
 import { getSettings } from '../utils/storage';
+import { injectContentScript } from '../utils/contentScriptHelper';
 import {
   Settings as SettingsIcon,
   X,
@@ -219,26 +220,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           }
         }
 
-        // Helper to inject content script
-        const injectContentScript = async (tabId: number): Promise<boolean> => {
-          try {
-            const manifest = chrome.runtime.getManifest();
-            const contentScriptFile = manifest.content_scripts?.[0]?.js?.[0];
-            if (!contentScriptFile) {
-              return false;
-            }
-            console.log('[墨问 Popup] Injecting content script for auto-fetch...');
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              files: [contentScriptFile],
-            });
-            await new Promise(resolve => setTimeout(resolve, 500));
-            return true;
-          } catch (err) {
-            console.log('[墨问 Popup] Content script injection failed:', err);
-            return false;
-          }
-        };
+        // Helper to inject content script (Removed: imported from utils)
 
         // Retry helper for PING (now just a backup, primary is event-driven)
         const waitForContentScript = async (tabId: number, maxAttempts = 3): Promise<boolean> => {
@@ -362,28 +344,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       if (canClip && tab?.id) {
         // Immediately try to get cached content without showing loading UI
         try {
-          // Helper to inject content script
-          const injectContentScript = async (tabId: number): Promise<boolean> => {
-            try {
-              const manifest = chrome.runtime.getManifest();
-              const contentScriptFile = manifest.content_scripts?.[0]?.js?.[0];
-              if (!contentScriptFile) {
-                console.error('[墨问 Popup] ❌ No content script file found in manifest');
-                return false;
-              }
-              console.log('[墨问 Popup] 🔧 Injecting content script:', contentScriptFile);
-              await chrome.scripting.executeScript({
-                target: { tabId },
-                files: [contentScriptFile],
-              });
-              // Wait for script to initialize
-              await new Promise(resolve => setTimeout(resolve, 500));
-              return true;
-            } catch (err) {
-              console.error('[墨问 Popup] ❌ Failed to inject content script:', err);
-              return false;
-            }
-          };
+          // Helper to inject content script (Removed: imported from utils)
 
           // Check if content script is ready first
           let pingResponse: { success: boolean; status: string } | undefined;
@@ -483,28 +444,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         throw new Error('No active tab');
       }
 
-      // Helper to inject content script
-      const injectContentScript = async (tabId: number): Promise<boolean> => {
-        try {
-          const manifest = chrome.runtime.getManifest();
-          const contentScriptFile = manifest.content_scripts?.[0]?.js?.[0];
-          if (!contentScriptFile) {
-            console.error('[墨问 Popup] ❌ No content script file found in manifest');
-            return false;
-          }
-          console.log('[墨问 Popup] 🔧 Injecting content script:', contentScriptFile);
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            files: [contentScriptFile],
-          });
-          // Wait for script to initialize
-          await new Promise(resolve => setTimeout(resolve, 500));
-          return true;
-        } catch (err) {
-          console.error('[墨问 Popup] ❌ Failed to inject content script:', err);
-          return false;
-        }
-      };
+      // Helper to inject content script (Removed: imported from utils)
 
       // Check if content script is ready by sending a ping
       let isContentScriptReady = false;
@@ -691,7 +631,9 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       try {
         const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (t?.id) chrome.tabs.sendMessage(t.id, { type: 'LOG_DEBUG', payload: msg }).catch(() => { });
-      } catch { }
+      } catch {
+        void 0;
+      }
     };
 
     try {
@@ -770,7 +712,9 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             payload: `Popup: ❌ Save failed: ${errMsg}`
           }).catch(() => { });
         }
-      } catch (e) { }
+      } catch (e) {
+        void e;
+      }
 
       let errorMessage = '保存失败，请重试';
       if (error instanceof Error) {

@@ -30,7 +30,7 @@ const result = htmlToNoteAtom(testHtml);
 function analyzeStructure(atom: any) {
     let emptyCount = 0;
     let boldParamCount = 0;
-    let types: string[] = [];
+    const types: string[] = [];
 
     const traverse = (node: any) => {
         if (node.type === 'doc' && node.content) {

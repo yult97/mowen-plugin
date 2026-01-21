@@ -87,7 +87,7 @@ async function apiRequest<T>(
 
   let responseStatus = 0;
   let responseBody = '';
-  let responseHeaders: Record<string, string> = {};
+  const responseHeaders: Record<string, string> = {};
 
   try {
     const response = await fetch(fullUrl, {
@@ -274,12 +274,7 @@ export async function createNote(
 
     log('createNote: calling /note/create API...');
 
-    let data: NoteCreateData | undefined;
-    try {
-      data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
-    } catch (apiErr) {
-      throw apiErr; // Re-throw to be caught by outer catch
-    }
+    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
 
     log('createNote: API response received');
 

@@ -36,7 +36,7 @@ function parseHtmlToBlocks(html: string): NoteAtom[] {
   const blocks: NoteAtom[] = [];
 
   // Remove wrapper tags and get content
-  let content = html
+  const content = html
     .replace(/^<body[^>]*>/i, '')
     .replace(/<\/body>$/i, '')
     .replace(/^<html[^>]*>/i, '')

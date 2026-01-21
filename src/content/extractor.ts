@@ -12,6 +12,7 @@ import { extractImages } from './images';
 import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
 // import { normalizeReadabilityHtml } from './extractor-utils'; // Defined internally
 
+import { extractCaptionForImage } from './captionExtractor';
 import {
     ARTICLE_SELECTORS,
     AUTHOR_SELECTORS,
@@ -166,19 +167,71 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
     const title = article.title || document.title;
     const author = article.byline || undefined;
 
+    // 辅助函数：提取 URL 路径用于对比（忽略协议和域名）
+    // 例如 "http://www.latepost.com/uploads/cover/abc.png" -> "/uploads/cover/abc.png"
+    const getUrlPath = (url: string): string => {
+        try {
+            return new URL(url).pathname.toLowerCase();
+        } catch {
+            // 如果 URL 解析失败，使用简单的正则提取
+            return url.replace(/^https?:\/\/[^/]+/i, '').toLowerCase();
+        }
+    };
+
     // 5. 智能注入首图 (Smart Hero Image Injection)
     // 不再使用 Meta 标签注入 (a16z 痛点)，改为探测标题附近的 DOM 图片 (baoyu.io 需求)。
     // 仅当 Readability 漏掉且图片确实在标题附近时注入。
     const nearbyImage = extractImageNearTitle(document, title);
 
-    if (nearbyImage && !contentHtml.includes(nearbyImage.src)) {
-        console.log(`[extractor] 🖼️ Injecting detected header image: ${nearbyImage.src}`);
-        const imgHtml = `<figure class="hero-image"><img src="${nearbyImage.src}" alt="${nearbyImage.alt || 'Header Image'}" /></figure>`;
-        contentHtml = imgHtml + contentHtml;
+    if (nearbyImage) {
+        // 使用 URL 路径检查，忽略协议和域名差异
+        const imgPath = getUrlPath(nearbyImage.src);
+
+        if (!contentHtml.toLowerCase().includes(imgPath)) {
+            console.log(`[extractor] 🖼️ Injecting detected header image: ${nearbyImage.src}`);
+            // 封面图不使用 alt，避免显示不相关的图片说明
+            const imgHtml = `<figure class="hero-image"><img src="${nearbyImage.src}" alt="" /></figure>`;
+            contentHtml = imgHtml + contentHtml;
+        } else {
+            console.log(`[extractor] ℹ️ Header image already in content, skipping: ${nearbyImage.src}`);
+        }
     }
 
+    // 5.5 【新增】从原始 DOM 的特殊容器中提取遗漏的正文图片
+    // Latepost 等网站的 .article-body 可能未被 Readability 正确识别
+    const specialBodyContainers = [
+        '.article-body',    // Latepost 正文
+        '.ql-editor',       // Quill 富文本编辑器
+    ];
 
+    // 用于比较的 contentHtml（小写）
+    const contentHtmlLower = contentHtml.toLowerCase();
 
+    for (const selector of specialBodyContainers) {
+        const container = document.querySelector(selector);
+        if (container) {
+            const containerImages = container.querySelectorAll('img');
+            containerImages.forEach(img => {
+                // 检查该图片是否已在 contentHtml 中（使用 URL 路径比较）
+                const imgPath = getUrlPath(img.src);
+                if (img.src && !img.src.startsWith('data:') && !contentHtmlLower.includes(imgPath)) {
+                    // 过滤头像等小图
+                    const className = (img.className || '').toLowerCase();
+                    if (className.includes('avatar') || className.includes('icon') || className.includes('author')) {
+                        return;
+                    }
+                    const width = img.naturalWidth || img.width || 0;
+                    const height = img.naturalHeight || img.height || 0;
+                    // 只注入较大的图片
+                    if ((width > 200 && height > 100) || (!width && !height)) {
+                        console.log(`[extractor] 🖼️ Injecting missed body image from ${selector}: ${img.src}`);
+                        const imgHtml = `<figure><img src="${img.src}" alt="${img.alt || ''}" /></figure>`;
+                        contentHtml += imgHtml;
+                    }
+                }
+            });
+        }
+    }
 
     // 6. HTML 规范化 (Post-processing)
     // 清理嵌套 div，修复列表，确保适合 noteAtom 转换
@@ -298,6 +351,30 @@ function preprocessDom(doc: Document, baseUrl: string) {
     doc.querySelectorAll('a').forEach(a => {
         if (a.href) a.href = makeAbsolute(a.getAttribute('href') || a.href);
     });
+
+    // 4. 【新增】将 font-weight: bold 样式的 span 转换为语义化的 <strong> 标签
+    // 在 Readability 解析之前进行，因为 Readability 会移除 style 属性
+    doc.querySelectorAll('span[style]').forEach(span => {
+        const style = span.getAttribute('style') || '';
+        // 检测 font-weight: bold 或 font-weight: 700+ 的样式
+        if (/font-weight\s*:\s*(bold|[7-9]\d{2})/i.test(style)) {
+            const strong = doc.createElement('strong');
+            while (span.firstChild) {
+                strong.appendChild(span.firstChild);
+            }
+            span.replaceWith(strong);
+        }
+    });
+
+    // 5. 【新增】智能提取图片注释 (Image Caption Extraction)
+    // 计算并暂存注释到 data-mowen-caption，以便稍后 Readability 清洗后保留
+    doc.querySelectorAll('img').forEach(img => {
+        const caption = extractCaptionForImage(img);
+        if (caption) {
+            // console.log(`[extractor] 📝 Found caption for image: "${caption}"`);
+            img.setAttribute('data-mowen-caption', caption);
+        }
+    });
 }
 
 // function extractHeroImage removed
@@ -308,9 +385,28 @@ function preprocessDom(doc: Document, baseUrl: string) {
  * 1. 找到文章标题 (H1)
  * 2. 在标题紧邻的兄弟节点或子节点中寻找显著大图
  * 3. 这种图通常是文章的“封面”或“首图”，如果 Readability 漏掉了，值得补回
+ * 4. 特别检测：Latepost (.abstract-pic-right) 等特殊封面图容器
  */
 function extractImageNearTitle(doc: Document, articleTitle: string): { src: string, alt?: string } | null {
     if (!articleTitle) return null;
+
+    // 0. 优先检测特殊封面图容器（Latepost 等网站）
+    // 这些容器通常包含明确的封面图，不依赖标题定位
+    const specialCoverSelectors = [
+        '.abstract-pic-right img',  // Latepost 封面图
+        '.cover-image img',         // 通用封面图
+        '.hero-image img',          // Hero 图
+        '.post-cover img',          // 文章封面
+    ];
+
+    for (const selector of specialCoverSelectors) {
+        const coverImg = doc.querySelector(selector) as HTMLImageElement;
+        if (coverImg?.src && !coverImg.src.startsWith('data:')) {
+            console.log(`[extractor] 🎯 Found cover image via special selector "${selector}": ${coverImg.src}`);
+            // 不返回 alt，避免封面图显示不相关的图片说明
+            return { src: coverImg.src };
+        }
+    }
 
     // 1. 定位标题元素
     // 优先找 H1，且内容包含标题文字
@@ -328,9 +424,14 @@ function extractImageNearTitle(doc: Document, articleTitle: string): { src: stri
     console.log('[extractor] 📍 Located title element, searching for nearby images...');
 
     // 2. 向下搜寻图片 (Look ahead in the whole document or main content area)
-    // 不再局限于 parent，而是从全文（或主要区域）中寻找 Title 之后的图片
-    // 这样可以应对 Title 和 Image 分属不同容器的情况
-    const rootContext = document.querySelector('article') || document.querySelector('main') || document.body;
+    // 扩展 rootContext 选择器以支持更多网站结构
+    const rootContext =
+        document.querySelector('article') ||
+        document.querySelector('main') ||
+        document.querySelector('.article-body') ||  // Latepost 正文
+        document.querySelector('.ql-editor') ||     // Quill 编辑器
+        document.querySelector('.content') ||       // 通用内容区
+        document.body;
     const images = Array.from(rootContext.querySelectorAll('img'));
 
     // 找到第一张在其后的图片
@@ -381,15 +482,11 @@ function normalizeReadabilityHtml(html: string): string {
     // Actually Readability output is usually cleanish, but might have nested divs.
     // Let's strip classes 'page', 'content', 'entry-content' etc wrapper divs if they exist inside.
 
-    const divWrapperSelectors = ['div#page', 'div#content', 'div.entry-content', 'div.article-content'];
-    divWrapperSelectors.forEach(sel => {
-        const el = body.querySelector(sel);
-        if (el) {
-            // If the wrapper is the only child or main wrapper, replace parent with children
-            // Hard to do strictly without breaking layout.
-            // Let's rely on stripHtml-like logic or simpler cleaning.
-        }
-    });
+    // 1. Unwrap layout divs (divs that just contain other block elements or text)
+    // simple logic: if a div has no attributes (cleaned by Readability?) or just class,
+    // and contains block elements, maybe unwrap?
+    // Actually Readability output is usually cleanish, but might have nested divs.
+    // Let's strip classes 'page', 'content', 'entry-content' etc wrapper divs if they exist inside.
 
     // Strategy: Remove all <div> tags but keep their children. 
     // noteAtom parses <p>, <ul>, etc. Divs usually just add spacing/grouping.
@@ -398,7 +495,7 @@ function normalizeReadabilityHtml(html: string): string {
     body.querySelectorAll('div').forEach(div => {
         // If div behaves like a text paragraph (no block children) -> turn to p
         const hasBlockChildren = div.querySelector('div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, table, pre, figure');
-        if (!hasBlockChildren && div.textContent?.trim().length! > 0) {
+        if (!hasBlockChildren && (div.textContent?.trim() || '').length > 0) {
             const p = doc.createElement('p');
             p.innerHTML = div.innerHTML;
             div.replaceWith(p);
@@ -423,10 +520,29 @@ function normalizeReadabilityHtml(html: string): string {
         // Insert a br if there were multiple Ps?
     });
 
+    // 2.5【新增】将 font-weight: bold 样式的 span 转换为语义化的 <strong> 标签
+    // Latepost 等网站使用 <span style="font-weight: bold;"> 而非 <strong>
+    // 在清理 style 属性之前进行转换，确保加粗样式被保留
+    body.querySelectorAll('span[style]').forEach(span => {
+        const style = span.getAttribute('style') || '';
+        // 检测 font-weight: bold 或 font-weight: 700+ 的样式
+        if (/font-weight\s*:\s*(bold|[7-9]\d{2})/i.test(style)) {
+            // 创建 <strong> 元素替换 span
+            const strong = doc.createElement('strong');
+            // 保留 span 的所有子节点
+            while (span.firstChild) {
+                strong.appendChild(span.firstChild);
+            }
+            span.replaceWith(strong);
+        }
+    });
+
     // 3. 【新增】清理冗余 HTML 属性，大幅减少 HTML 体积
-    // 保留必要属性：href, src, alt, data-mowen-uid, width, height, target, rel
-    // 移除：class, id, style, data-* (除 data-mowen-uid), contenteditable 等
-    const KEEP_ATTRS = new Set(['href', 'src', 'alt', 'data-mowen-uid', 'width', 'height', 'target', 'rel', 'srcset', 'data-src', 'data-original']);
+    // 保留必要属性：href, src, alt, data-mowen-uid, width, height, target, rel, style
+    // 注意：保留 style 属性以便 noteAtom 处理其他样式（如斜体）
+    // 注意：保留 data-mowen-caption 以传递提取到的图片注释
+    // 移除：class, id, data-* (除白名单外), contenteditable 等
+    const KEEP_ATTRS = new Set(['href', 'src', 'alt', 'data-mowen-uid', 'data-mowen-caption', 'width', 'height', 'target', 'rel', 'srcset', 'data-src', 'data-original', 'style']);
 
     body.querySelectorAll('*').forEach(el => {
         const attrsToRemove: string[] = [];
@@ -530,9 +646,7 @@ function extractArticle(doc: Document): {
     };
 }
 
-/**
- * Clean content by removing unwanted elements.
- */
+
 /**
  * Clean content by removing unwanted elements.
  * 
@@ -641,7 +755,7 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
                 // Find the containing section. 
                 // CAUTION: Do not go too high up. 
                 // eesel.ai structure: section > div > h2
-                let faqContainer = header.closest('section');
+                const faqContainer = header.closest('section');
 
                 // If the section is too large (likely the whole article), fallback to strict parent usage
                 // or try to find the specific wrapper class if known, but safer to assume the section is correct if distinct
