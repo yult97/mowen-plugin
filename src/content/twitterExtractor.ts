@@ -1411,7 +1411,12 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                             };
                             images.push(imgCandidate);
 
-                            const altText = `图片 ${images.length}`;
+                            // Use real alt text if available and meaningful, otherwise empty string
+                            const rawAlt = (img.alt || '').trim();
+                            // Filter out generic placeholders
+                            const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+                                rawAlt === 'null' || rawAlt === 'undefined';
+                            const altText = (rawAlt && !isGeneric) ? rawAlt : '';
                             blocks.push({
                                 id: generateId(),
                                 type: 'image',

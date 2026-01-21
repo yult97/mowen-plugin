@@ -191,3 +191,6 @@ export const TWITTER_SELECTORS = {
     // 主推文区域（排除引用）
     primaryColumn: '[data-testid="primaryColumn"]',
 };
+
+// 封面图自动注入黑名单已移除，采用更通用的 DOM 位置探测策略
+
