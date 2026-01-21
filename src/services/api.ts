@@ -83,24 +83,7 @@ async function apiRequest<T>(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-  // === [mowen-debug] PREPARE DEBUG RECORD ===
   const fullUrl = `${API_BASE_URL}${endpoint}`;
-  const maskedApiKey = apiKey.length > 10 ? `${apiKey.slice(0, 6)}****${apiKey.slice(-4)}` : '***MASKED***';
-  const bodyText = body ? JSON.stringify(body) : '';
-  const bodyPretty = body ? JSON.stringify(body, null, 2) : '';
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${maskedApiKey}`,
-  };
-
-  // Log request BEFORE sending
-  console.log(`[mowen-debug] ========== API REQUEST ==========`);
-  console.log(`[mowen-debug] request.url=${fullUrl}`);
-  console.log(`[mowen-debug] request.method=POST`);
-  console.log(`[mowen-debug] request.headers=${JSON.stringify(requestHeaders)}`);
-  console.log(`[mowen-debug] request.body=${bodyText}`);
-  console.log(`[mowen-debug] request.body.pretty=\n${bodyPretty}`);
-  console.log(`[mowen-debug] ================================`);
 
   let responseStatus = 0;
   let responseBody = '';
@@ -131,35 +114,6 @@ async function apiRequest<T>(
     } catch (readErr) {
       responseBody = `[ERROR reading body: ${readErr instanceof Error ? readErr.message : String(readErr)}]`;
     }
-
-    // Log response AFTER receiving
-    console.log(`[mowen-debug] ========== API RESPONSE ==========`);
-    console.log(`[mowen-debug] response.status=${responseStatus}`);
-    console.log(`[mowen-debug] response.headers=${JSON.stringify(responseHeaders)}`);
-    console.log(`[mowen-debug] response.body=${responseBody}`);
-    try {
-      const prettyBody = JSON.parse(responseBody);
-      console.log(`[mowen-debug] response.body.pretty=\n${JSON.stringify(prettyBody, null, 2)}`);
-    } catch {
-      console.log(`[mowen-debug] response.body.pretty=[not valid JSON]`);
-    }
-    console.log(`[mowen-debug] =================================`);
-
-    // Send debug info to popup via message (if popup is open)
-    try {
-      chrome.runtime.sendMessage({
-        type: 'MOWEN_DEBUG_LOG',
-        payload: {
-          url: fullUrl,
-          method: 'POST',
-          requestHeaders,
-          requestBody: bodyText,
-          responseStatus,
-          responseHeaders,
-          responseBody,
-        }
-      }).catch(() => { /* popup may be closed */ });
-    } catch { /* ignore */ }
 
     if (!response.ok) {
       if (response.status === 401) {
@@ -252,13 +206,6 @@ async function apiRequest<T>(
   } catch (error) {
     clearTimeout(timeoutId);
 
-    // === [mowen-debug] EXCEPTION LOGGING ===
-    console.error(`[mowen-debug] ========== API EXCEPTION ==========`);
-    console.error(`[mowen-debug] exception.name=${error instanceof Error ? error.name : 'unknown'}`);
-    console.error(`[mowen-debug] exception.message=${error instanceof Error ? error.message : String(error)}`);
-    console.error(`[mowen-debug] exception.stack=${error instanceof Error ? error.stack : 'N/A'}`);
-    console.error(`[mowen-debug] ====================================`);
-
     // Handle abort error (timeout)
     if (error instanceof Error && error.name === 'AbortError') {
       throw new ApiRequestError('TIMEOUT: 请求超时，请检查网络连接', { status: 0 });
@@ -325,36 +272,12 @@ export async function createNote(
       },
     };
 
-    // === [mowen-debug] CREATENOTE 完整请求日志 ===
-    const maskedKey = apiKey.length > 10 ? `${apiKey.slice(0, 6)}****${apiKey.slice(-4)}` : '***';
-    console.log(`[mowen-debug] ============ createNote 请求 ============`);
-    console.log(`[mowen-debug] API_URL=https://open.mowen.cn/api/open/api/v1/note/create`);
-    console.log(`[mowen-debug] API_KEY=${maskedKey}`);
-    console.log(`[mowen-debug] REQUEST_BODY_RAW=${JSON.stringify(requestData)}`);
-    console.log(`[mowen-debug] REQUEST_BODY_PRETTY=`);
-    console.log(JSON.stringify(requestData, null, 2));
-    console.log(`[mowen-debug] ==========================================`);
-
-    const requestBodyStr = JSON.stringify(requestData);
-    log(`createNote Payload Preview: ${requestBodyStr.substring(0, 500)}...`);
     log('createNote: calling /note/create API...');
 
     let data: NoteCreateData | undefined;
     try {
       data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
-      console.log(`[mowen-debug] ============ createNote 响应 ============`);
-      console.log(`[mowen-debug] RESPONSE_DATA=${JSON.stringify(data)}`);
-      console.log(`[mowen-debug] ==========================================`);
     } catch (apiErr) {
-      console.error(`[mowen-debug] ============ createNote 异常 ============`);
-      console.error(`[mowen-debug] ERROR_NAME=${apiErr instanceof Error ? apiErr.name : 'unknown'}`);
-      console.error(`[mowen-debug] ERROR_MESSAGE=${apiErr instanceof Error ? apiErr.message : String(apiErr)}`);
-      if (apiErr instanceof ApiRequestError) {
-        console.error(`[mowen-debug] ERROR_STATUS=${apiErr.status}`);
-        console.error(`[mowen-debug] ERROR_CODE=${apiErr.code}`);
-        console.error(`[mowen-debug] ERROR_RAW_BODY=${apiErr.rawBody}`);
-      }
-      console.error(`[mowen-debug] ==========================================`);
       throw apiErr; // Re-throw to be caught by outer catch
     }
 
@@ -424,6 +347,78 @@ export async function createNote(
     }
 
     // No noteId in error response - this is a real failure
+    const errorCode = getErrorCode(error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      errorCode,
+    };
+  }
+}
+
+/**
+ * 直接使用 NoteAtom body 创建笔记（跳过 HTML 转换）
+ * 适用于合集笔记等需要使用内链笔记（note block）格式的场景
+ */
+export async function createNoteWithBody(
+  apiKey: string,
+  body: Record<string, unknown>,
+  isPublic: boolean = false
+): Promise<NoteCreateResult> {
+  console.log(`[sw] createNoteWithBody: starting with body type=${body?.type}`);
+
+  try {
+    const requestData = {
+      body,
+      settings: {
+        autoPublish: isPublic,
+      },
+    };
+
+    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
+
+    const noteId = data?.noteId;
+    if (!noteId) {
+      console.error('[sw] createNoteWithBody: Missing noteId in response:', data);
+      return {
+        success: false,
+        error: 'API 返回数据格式异常，缺少 noteId',
+        errorCode: 'UNKNOWN',
+      };
+    }
+
+    const shareUrl = `https://note.mowen.cn/detail/${noteId}`;
+    const noteUrl = isPublic ? shareUrl : `https://note.mowen.cn/editor/${noteId}`;
+
+    console.log(`[sw] createNoteWithBody: success noteId=${noteId}`);
+    return {
+      success: true,
+      noteId,
+      noteUrl,
+      shareUrl,
+    };
+  } catch (error) {
+    // 与 createNote 保持一致的 fallback 逻辑：
+    // 即使 API 返回错误，也检查 error.data 中是否有 noteId
+    if (error instanceof ApiRequestError) {
+      const errorData = error.data as { noteId?: string } | undefined;
+      const fallbackNoteId = errorData?.noteId;
+
+      if (fallbackNoteId) {
+        // 笔记实际已创建成功
+        const shareUrl = `https://note.mowen.cn/detail/${fallbackNoteId}`;
+        const noteUrl = isPublic ? shareUrl : `https://note.mowen.cn/editor/${fallbackNoteId}`;
+        console.log(`[sw] createNoteWithBody: success via fallback noteId=${fallbackNoteId}`);
+        return {
+          success: true,
+          noteId: fallbackNoteId,
+          noteUrl,
+          shareUrl,
+        };
+      }
+    }
+
+    console.error('[sw] createNoteWithBody: error', error);
     const errorCode = getErrorCode(error);
     return {
       success: false,

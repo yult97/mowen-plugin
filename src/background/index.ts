@@ -10,7 +10,7 @@ import {
 import { getSettings } from '../utils/storage';
 import { debugLog, sleep } from '../utils/helpers';
 
-import { createNote, uploadImageWithFallback, ImageUploadResult } from '../services/api';
+import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 
 const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
@@ -373,27 +373,27 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
     logToContentScript(`🔍 合集检查: 开关=${createIndexNote}, 分块=${parts.length}, 成功=${createdNotes.length}`);
 
     if (createIndexNote && parts.length > 1 && createdNotes.length > 1) {
-      console.log('[墨问 Background] Creating index note...');
-      logToContentScript('📚 正在创建合集笔记...');
+      console.log('[墨问 Background] Creating index note with internal links...');
+      logToContentScript('📚 正在创建合集笔记（内链格式）...');
 
       // 智能等待：确保遵守 API 速率限制
       await waitForNoteApiRateLimit();
 
-      const indexContent = createIndexNoteContent(
+      // 使用内链笔记格式构建合集 body
+      const indexBody = createIndexNoteAtom(
         extractResult.title,
         extractResult.sourceUrl,
         createdNotes
       );
-      const indexResult = await createNote(
+
+      const indexResult = await createNoteWithBody(
         settings.apiKey,
-        `${extractResult.title}（合集）`,
-        indexContent,
-        isPublic,
-        undefined,
-        extractResult.sourceUrl
+        indexBody,
+        isPublic
       );
 
       if (indexResult.success) {
+        markNoteApiCall(); // 记录 API 调用时间，用于速率限制
         createdNotes.unshift({
           partIndex: -1,
           noteUrl: indexResult.noteUrl!,
@@ -1038,28 +1038,77 @@ function splitContent(title: string, content: string, limit: number): NotePart[]
 }
 
 
-function createIndexNoteContent(
-  _title: string,
+/**
+ * 创建合集笔记的 NoteAtom body（使用内链笔记格式）
+ * 
+ * 格式：
+ * - 标题：{title}（合集）
+ * - 来源引用块
+ * - 说明段落
+ * - 每个子笔记作为独立的内链笔记 block（type: 'note'）
+ */
+function createIndexNoteAtom(
+  title: string,
   sourceUrl: string,
   notes: Array<{ partIndex: number; noteUrl: string; noteId: string }>
-): string {
-  let content = `<blockquote>\n`;
-  content += `<p><strong>来源</strong>：<a href="${sourceUrl}">${sourceUrl}</a></p>\n`;
-  content += `</blockquote>\n\n`;
-
-  content += `<p>由于文章过长，已自动拆分为 ${notes.length} 个部分：</p>\n\n`;
-  content += `<ul>\n`;
-
-  // Sort by index
+): Record<string, unknown> {
+  // 按 partIndex 排序
   const sortedNotes = [...notes].sort((a, b) => a.partIndex - b.partIndex);
 
-  for (const note of sortedNotes) {
-    content += `<li><a href="${note.noteUrl}">第 ${note.partIndex + 1} 部分</a></li>\n`;
-  }
+  // 构建 NoteAtom body
+  const content: Record<string, unknown>[] = [
+    // 1. 标题
+    {
+      type: 'paragraph',
+      content: [
+        {
+          type: 'text',
+          text: `${title}（合集）`,
+          marks: [{ type: 'bold' }]
+        }
+      ]
+    },
+    // 空行
+    { type: 'paragraph' },
+    // 2. 来源引用块
+    {
+      type: 'quote',
+      content: [
+        { type: 'text', text: '📄 来源：' },
+        {
+          type: 'text',
+          text: sourceUrl,
+          marks: [{ type: 'link', attrs: { href: sourceUrl } }]
+        }
+      ]
+    },
+    // 空行
+    { type: 'paragraph' },
+    // 3. 说明段落
+    {
+      type: 'paragraph',
+      content: [
+        {
+          type: 'text',
+          text: `由于文章过长，已自动拆分为 ${sortedNotes.length} 个部分：`
+        }
+      ]
+    },
+    // 空行
+    { type: 'paragraph' },
+    // 4. 每个子笔记作为内链笔记 block
+    ...sortedNotes.map(note => ({
+      type: 'note',
+      attrs: {
+        uuid: note.noteId
+      }
+    }))
+  ];
 
-  content += `</ul>`;
-
-  return content;
+  return {
+    type: 'doc',
+    content
+  };
 }
 
 function escapeRegExp(string: string): string {
