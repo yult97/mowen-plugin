@@ -6,6 +6,7 @@ export interface Settings {
   maxImages: number;
   createIndexNote: boolean;
   debugMode: boolean;
+  enableAutoTag: boolean;  // 是否自动添加「墨问剪藏」标签
   lastTestStatus?: 'success' | 'failed' | null;
   lastTestAt?: string | null;
   lastTestNoteUrl?: string | null;
@@ -19,6 +20,7 @@ export const DEFAULT_SETTINGS: Settings = {
   maxImages: 50,
   createIndexNote: true,
   debugMode: false,
+  enableAutoTag: false,   // 默认关闭自动添加标签
   lastTestStatus: null,
   lastTestAt: null,
   lastTestNoteUrl: null,

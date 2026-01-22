@@ -232,7 +232,8 @@ export async function createNote(
   content: string,
   isPublic: boolean = false,
   logger?: (msg: string) => Promise<void>,
-  sourceUrl?: string
+  sourceUrl?: string,
+  enableAutoTag?: boolean
 ): Promise<NoteCreateResult> {
   const log = (msg: string) => {
     console.log(`[sw] ${msg}`);
@@ -269,6 +270,7 @@ export async function createNote(
       body,
       settings: {
         autoPublish: isPublic,
+        ...(enableAutoTag ? { tags: ["墨问剪藏"] } : {}),
       },
     };
 
@@ -358,7 +360,8 @@ export async function createNote(
 export async function createNoteWithBody(
   apiKey: string,
   body: Record<string, unknown>,
-  isPublic: boolean = false
+  isPublic: boolean = false,
+  enableAutoTag?: boolean
 ): Promise<NoteCreateResult> {
   console.log(`[sw] createNoteWithBody: starting with body type=${body?.type}`);
 
@@ -367,6 +370,7 @@ export async function createNoteWithBody(
       body,
       settings: {
         autoPublish: isPublic,
+        ...(enableAutoTag ? { tags: ["墨问剪藏"] } : {}),
       },
     };
 

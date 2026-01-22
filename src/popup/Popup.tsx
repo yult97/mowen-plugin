@@ -17,6 +17,7 @@ import {
   AlertCircle,
   Key,
   BookOpen,
+  Tag,
 } from 'lucide-react';
 import TutorialModal from '../components/TutorialModal';
 
@@ -32,6 +33,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [extractResult, setExtractResult] = useState<ExtractResult | null>(null);
   const [isPublic, setIsPublic] = useState(false);
   const [includeImages, setIncludeImages] = useState(true);
+  const [enableAutoTag, setEnableAutoTag] = useState(false);
   const [progress, setProgress] = useState<SaveProgress>({ status: 'idle' });
   const [currentUrl, setCurrentUrl] = useState('');
   const [currentDomain, setCurrentDomain] = useState('');
@@ -58,12 +60,27 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     const handleStorageChange = async (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => {
       if (areaName === 'sync' || areaName === 'local') {
         if (changes['mowen_settings']) {
-          console.log('[墨问 Popup] Settings changed, reloading...');
-          const newSettings = changes['mowen_settings'].newValue;
-          if (newSettings) {
-            setSettings({ ...DEFAULT_SETTINGS, ...newSettings });
-            setIsPublic(newSettings.defaultPublic ?? DEFAULT_SETTINGS.defaultPublic);
-            setIncludeImages(newSettings.defaultIncludeImages ?? DEFAULT_SETTINGS.defaultIncludeImages);
+          const { oldValue, newValue } = changes['mowen_settings'];
+
+          if (newValue) {
+            console.log('[墨问 Popup] Settings changed, checking for updates...');
+
+            // Always update global settings object to keep it fresh
+            setSettings((prev) => ({ ...prev, ...newValue }));
+
+            // Conditionally update UI states only if they changed
+            // This prevents resetting user's temporary toggle state if other unrelated settings change
+            if (newValue.defaultPublic !== oldValue?.defaultPublic) {
+              setIsPublic(newValue.defaultPublic ?? DEFAULT_SETTINGS.defaultPublic);
+            }
+
+            if (newValue.defaultIncludeImages !== oldValue?.defaultIncludeImages) {
+              setIncludeImages(newValue.defaultIncludeImages ?? DEFAULT_SETTINGS.defaultIncludeImages);
+            }
+
+            if (newValue.enableAutoTag !== oldValue?.enableAutoTag) {
+              setEnableAutoTag(newValue.enableAutoTag ?? DEFAULT_SETTINGS.enableAutoTag);
+            }
           }
         }
       }
@@ -319,6 +336,8 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       setSettings(loadedSettings);
       setIsPublic(loadedSettings.defaultPublic);
       setIncludeImages(loadedSettings.defaultIncludeImages);
+      setEnableAutoTag(loadedSettings.enableAutoTag);
+      console.log('[墨问 Popup] enableAutoTag loaded:', loadedSettings.enableAutoTag);
 
       // Get current tab info and determine clippability
       await updateCurrentTab();
@@ -673,6 +692,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             includeImages,
             maxImages: settings.maxImages,
             createIndexNote: settings.createIndexNote,
+            enableAutoTag,
           },
         }),
         new Promise<never>((_, reject) =>
@@ -854,6 +874,32 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           </button>
         </div>
         <p className="text-xs text-text-secondary ml-6 -mt-2">开启后会尽量抓取并上传网页图片</p>
+
+        {/* Auto Tag Toggle */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Tag size={16} className="text-text-secondary" />
+            <span className="text-sm text-text-primary">添加标签</span>
+          </div>
+          <button
+            className={`switch ${enableAutoTag ? 'switch-on' : 'switch-off'}`}
+            onClick={() => {
+              const newValue = !enableAutoTag;
+              setEnableAutoTag(newValue);
+              console.log('[墨问 Popup] Saving enableAutoTag:', newValue);
+              // 通过 Background Script 保存，确保 Popup 关闭后设置仍能持久化
+              chrome.runtime.sendMessage({
+                type: 'SAVE_SETTING',
+                payload: { enableAutoTag: newValue }
+              }).catch((err) => {
+                console.error('[墨问 Popup] Failed to save enableAutoTag:', err);
+              });
+            }}
+          >
+            <span className={`switch-thumb ${enableAutoTag ? 'translate-x-5' : 'translate-x-1'}`} />
+          </button>
+        </div>
+        <p className="text-xs text-text-secondary ml-6 -mt-2">开启后自动为剪藏笔记添加「墨问剪藏」标签</p>
 
         {/* Public Toggle */}
         <div className="flex items-center justify-between">

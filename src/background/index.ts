@@ -7,7 +7,7 @@ import {
   NoteCreateResult,
   ImageFailureReason,
 } from '../types';
-import { getSettings } from '../utils/storage';
+import { getSettings, saveSettings } from '../utils/storage';
 import { debugLog, sleep } from '../utils/helpers';
 
 import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult } from '../services/api';
@@ -59,6 +59,7 @@ interface SaveNotePayload {
   includeImages: boolean;
   maxImages: number;
   createIndexNote: boolean;
+  enableAutoTag?: boolean;  // 是否自动添加「墨问剪藏」标签
 }
 
 // Helper to proxy logs to Content Script console for debugging
@@ -101,6 +102,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     sendResponse({ success: true });
     return false;
+  }
+
+  // 通过 Background Script 保存设置，确保 Popup 关闭后设置仍能持久化
+  if (message.type === 'SAVE_SETTING') {
+    console.log('[墨问 Background] ⚙️ SAVE_SETTING received:', message.payload);
+    (async () => {
+      try {
+        await saveSettings(message.payload);
+        console.log('[墨问 Background] ✅ Settings saved successfully');
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error('[墨问 Background] ❌ Failed to save settings:', error);
+        sendResponse({ success: false, error: String(error) });
+      }
+    })();
+    return true; // 保持消息通道开放以便异步响应
   }
 
   if (message.type === 'SAVE_NOTE') {
@@ -224,7 +241,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
     return { success: false, error: '无法加载设置', errorCode: 'SETTINGS_ERROR' };
   }
 
-  const { extractResult, isPublic, includeImages, maxImages, createIndexNote } = payload;
+  const { extractResult, isPublic, includeImages, maxImages, createIndexNote, enableAutoTag } = payload;
 
   // Reset cancel flag and create new AbortController
   isCancelRequested = false;
@@ -326,7 +343,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
         try {
           // Pass logToContentScript to createNote so internal logs are visible to user
-          result = await createNote(settings.apiKey, part.title, part.content, isPublic, logToContentScript, extractResult.sourceUrl);
+          result = await createNote(settings.apiKey, part.title, part.content, isPublic, logToContentScript, extractResult.sourceUrl, enableAutoTag);
         } catch (apiErr) {
           const errMsg = apiErr instanceof Error ? apiErr.message : 'Exception';
           console.log(`[note] part ${part.index + 1} exception: ${errMsg}`);
@@ -389,7 +406,8 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
       const indexResult = await createNoteWithBody(
         settings.apiKey,
         indexBody,
-        isPublic
+        isPublic,
+        enableAutoTag
       );
 
       if (indexResult.success) {
