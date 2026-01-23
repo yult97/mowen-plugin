@@ -98,7 +98,16 @@ export interface NoteCreateResult {
 }
 
 // Save progress types
-export type SaveStatus = 'idle' | 'extracting' | 'uploading' | 'creating' | 'success' | 'failed' | 'cancelled';
+export type SaveStatus =
+  | 'idle'
+  | 'extracting'
+  | 'uploading'
+  | 'uploading_images'
+  | 'creating'
+  | 'creating_note'
+  | 'success'
+  | 'failed'
+  | 'cancelled';
 
 export interface SaveProgress {
   status: SaveStatus;

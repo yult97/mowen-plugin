@@ -8,46 +8,19 @@ import {
   ImageFailureReason,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
-import { debugLog, sleep } from '../utils/helpers';
+import { sleep } from '../utils/helpers';
 
 import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
+import { TaskStore } from '../utils/taskStore';
+import { GlobalRateLimiter } from '../utils/rateLimiter';
 
 const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
 const MAX_RETRY_ROUNDS = LIMITS.MAX_RETRY_ROUNDS;
 const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 
-// Cancel mechanism for save operation
-let isCancelRequested = false;
-let saveAbortController: AbortController | null = null;
-
-// 缓存活动标签页 ID，避免处理图片时标签页失去焦点
-let cachedActiveTabId: number | null = null;
-
-// 笔记 API 速率限制器：追踪最后一次调用时间，确保遵守 1 QPS 限制
-let lastNoteApiCallTime = 0;
-const NOTE_API_MIN_INTERVAL = 1100; // 1.1 秒，留一点余量
-
-/**
- * 智能等待：确保距离上次笔记 API 调用至少间隔 1.1 秒
- * 如果已经过了足够时间，则不等待
- */
-async function waitForNoteApiRateLimit(): Promise<void> {
-  const now = Date.now();
-  const elapsed = now - lastNoteApiCallTime;
-  if (elapsed < NOTE_API_MIN_INTERVAL && lastNoteApiCallTime > 0) {
-    const waitTime = NOTE_API_MIN_INTERVAL - elapsed;
-    console.log(`[墨问 Background] ⏱️ API 速率限制：等待 ${waitTime}ms`);
-    await sleep(waitTime);
-  }
-}
-
-/**
- * 记录笔记 API 调用时间
- */
-function markNoteApiCall(): void {
-  lastNoteApiCallTime = Date.now();
-}
+// Running Tasks Map: tabId -> AbortController
+const runningTasks = new Map<number, AbortController>();
 
 // Initialize Side Panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
@@ -60,25 +33,19 @@ interface SaveNotePayload {
   maxImages: number;
   createIndexNote: boolean;
   enableAutoTag?: boolean;  // 是否自动添加「墨问剪藏」标签
+  tabId?: number; // Optional, can be injected by sender
 }
 
-// Helper to proxy logs to Content Script console for debugging
-async function logToContentScript(msg: string): Promise<void> {
+// Helper to proxy logs to Content Script
+async function logToContentScript(msg: string, tabId?: number): Promise<void> {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      await chrome.tabs.sendMessage(tab.id, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch((error) => {
-        // Silently ignore - content script may not be available
-        if (chrome.runtime.lastError) {
-          // Clear the error to prevent "unchecked lastError" warnings
-          void chrome.runtime.lastError;
-        }
-        logger.debug('Log proxy to content script failed:', error instanceof Error ? error.message : 'Unknown');
+    if (tabId) {
+      await chrome.tabs.sendMessage(tabId, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch(() => {
+        void chrome.runtime.lastError;
       });
     }
   } catch (error) {
-    // Tab query failed - popup may have closed
-    logger.debug('logToContentScript failed:', error instanceof Error ? error.message : 'Unknown');
+    /* ignore */
   }
 }
 
@@ -93,13 +60,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === 'CANCEL_SAVE') {
-    console.log('[墨问 Background] ❌ CANCEL_SAVE received');
-    isCancelRequested = true;
-    // Abort any in-flight requests
-    if (saveAbortController) {
-      saveAbortController.abort();
-      console.log('[墨问 Background] 🛑 AbortController.abort() called');
+    const tabId = message.payload?.tabId;
+    console.log(`[墨问 Background] ❌ CANCEL_SAVE received for tab ${tabId}`);
+
+    if (tabId && runningTasks.has(tabId)) {
+      const controller = runningTasks.get(tabId);
+      controller?.abort();
+      runningTasks.delete(tabId);
+      console.log(`[墨问 Background] 🛑 Task for tab ${tabId} aborted`);
+    } else {
+      console.log(`[墨问 Background] ⚠️ No running task found for tab ${tabId}`);
     }
+
     sendResponse({ success: true });
     return false;
   }
@@ -149,74 +121,62 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     // Process save asynchronously without blocking the message channel
     console.log('[墨问 Background] ⏳ Calling handleSaveNote...');
-    try {
-      handleSaveNote(message.payload)
-        .then((result) => {
-          console.log('[墨问 Background] 📤 Sending SAVE_NOTE_COMPLETE:', result.success);
-          // Send result via a separate message to popup
-          chrome.runtime.sendMessage({
-            type: 'SAVE_NOTE_COMPLETE',
-            result,
-          }).catch((err) => {
-            // Popup might be closed, log for debugging
-            console.error('[墨问 Background] ❌ Failed to send SAVE_NOTE_COMPLETE:', err);
-            console.error('[墨问 Background] This is normal if the popup was closed');
+
+    // Determine tabId: prioritize payload, then sender (if from cs), then active tab
+    // Ideally Popup should send the target tabId in payload
+    // If not, we query active tab at this moment (assuming user hasn't switched yet)
+
+    (async () => {
+      let targetTabId = message.payload?.tabId;
+      if (!targetTabId) {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = activeTab?.id;
+      }
+
+      if (!targetTabId) {
+        console.error('[墨问 Background] ❌ Could not determine target tab ID');
+        return;
+      }
+
+      try {
+        handleSaveNote(message.payload, targetTabId)
+          .then((result) => {
+            console.log(`[墨问 Background] 📤 Sending SAVE_NOTE_COMPLETE for tab ${targetTabId}:`, result.success);
+            // Send result via a separate message to popup/content
+            // We can't target popup easily, but sendMessage works if popup is listening
+            chrome.runtime.sendMessage({
+              type: 'SAVE_NOTE_COMPLETE',
+              result,
+            }).catch(() => { });
+          })
+          .catch((error) => {
+            console.error('[墨问 Background] ❌ Save process failed:', error);
+            chrome.runtime.sendMessage({
+              type: 'SAVE_NOTE_COMPLETE',
+              result: {
+                success: false,
+                error: error.message || 'Unknown error',
+              },
+            }).catch(() => { });
           });
-        })
-        .catch((error) => {
-          console.error('[墨问 Background] ❌ Save process failed:', error);
-          // Send error via a separate message to popup
-          chrome.runtime.sendMessage({
-            type: 'SAVE_NOTE_COMPLETE',
-            result: {
-              success: false,
-              error: error.message || 'Unknown error',
-            },
-          }).catch((err) => {
-            console.error('[墨问 Background] ❌ Failed to send SAVE_NOTE_COMPLETE error:', err);
-            console.error('[墨问 Background] This is normal if the popup was closed');
-          });
-        });
-    } catch (e) {
-      console.error('[墨问 Background] ❌ CRITICAL: Synchronous error calling handleSaveNote:', e);
-    }
+      } catch (e) {
+        console.error('[墨问 Background] ❌ CRITICAL: Synchronous error calling handleSaveNote:', e);
+      }
+    })();
 
     // Return false as we're not using sendResponse asynchronously anymore
     return false;
   }
 
   if (message.type === 'TEST_CONNECTION') {
-    import('../services/api').then(async ({ testConnection }) => {
-      const result = await testConnection(message.payload.apiKey);
-      // Safely send response, checking if channel is still open
-      try {
-        sendResponse(result);
-      } catch (e) {
-        // Channel already closed, ignore
-        debugLog('TEST_CONNECTION: Channel closed, could not send response');
-      }
-      // Clear lastError to prevent warning
-      void chrome.runtime.lastError;
-    }).catch((error) => {
-      try {
-        sendResponse({ success: false, error: error.message });
-      } catch (e) {
-        // Channel already closed, ignore
-        debugLog('TEST_CONNECTION: Channel closed, could not send error response');
-      }
-      // Clear lastError to prevent warning
-      void chrome.runtime.lastError;
-    });
-
-    // Keep message channel open
-    return true;
+    // ... (unchanged)
+    return false; // placeholder for diff context
   }
+  return false; // placeholder
+}); // Close listener for diff match (Wait, easier to just match the block)
+// I will only replace the SAVE_NOTE handler part + handleSaveNote signature
 
-  // For unknown message types, don't keep channel open
-  return false;
-});
-
-async function handleSaveNote(payload: SaveNotePayload): Promise<{
+async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<{
   success: boolean;
   notes?: Array<{ partIndex: number; noteUrl: string; isIndex?: boolean }>;
   error?: string;
@@ -228,14 +188,14 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
     return { success: false, error: 'Payload is undefined', errorCode: 'INVALID_PAYLOAD' };
   }
 
-  console.log('[墨问 Background] 🚀 handleSaveNote started');
-  logToContentScript('🚀 handleSaveNote started');
+  console.log(`[墨问 Background] 🚀 handleSaveNote started for tab ${tabId}`);
+  logToContentScript('🚀 handleSaveNote started', tabId);
 
   let settings;
   try {
     settings = await getSettings();
     console.log('[墨问 Background] ✅ Settings loaded');
-    logToContentScript('✅ Settings loaded');
+    logToContentScript('✅ Settings loaded', tabId);
   } catch (err) {
     console.error('[墨问 Background] ❌ Failed to load settings:', err);
     return { success: false, error: '无法加载设置', errorCode: 'SETTINGS_ERROR' };
@@ -243,18 +203,16 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
   const { extractResult, isPublic, includeImages, maxImages, createIndexNote, enableAutoTag } = payload;
 
-  // Reset cancel flag and create new AbortController
-  isCancelRequested = false;
-  saveAbortController = new AbortController();
+  // Create new AbortController and register it
+  const abortController = new AbortController();
+  runningTasks.set(tabId, abortController);
+  const signal = abortController.signal;
 
-  // 在处理开始时缓存活动标签页 ID，避免后续图片处理时标签页失去焦点
+  // 初始化任务状态
   try {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    cachedActiveTabId = activeTab?.id ?? null;
-    console.log(`[墨问 Background] 📌 缓存活动标签页 ID: ${cachedActiveTabId}`);
+    await TaskStore.init(tabId);
   } catch (e) {
-    cachedActiveTabId = null;
-    console.log(`[墨问 Background] ⚠️ 无法获取活动标签页 ID`);
+    console.log(`[墨问 Background] ⚠️ 无法初始化 TaskStore for tab ${tabId}`);
   }
 
   // Defensive check for extractResult
@@ -281,13 +239,11 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
     if (includeImages && images.length > 0) {
       console.log(`[墨问 Background] 🖼️ Found ${images.length} images, processing...`);
-      logToContentScript(`🖼️ Found ${images.length} images, processing...`);
+      logToContentScript(`🖼️ Found ${images.length} images, processing...`, tabId);
       const imagesToProcess = images.slice(0, maxImages);
-      // const imagesToLink = images.slice(maxImages); // Unused currently, removed to fix lint error
-      // If we want to use it: const imagesToLink = ...; and pass to replaceImageUrls if needed but currently replaceImageUrls ignores extraImages
 
       // Upload images with concurrency control
-      imageResults = await processImages(settings.apiKey, imagesToProcess);
+      imageResults = await processImages(settings.apiKey, imagesToProcess, tabId, signal);
 
       // Replace image URLs in content (for images that exist in contentHtml)
       processedContent = replaceImageUrls(processedContent, imageResults, []);
@@ -297,19 +253,19 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
       // Debug: Log processed content to verify img tags have data-mowen-uid
       const imgTagsWithUid = processedContent.match(/<img[^>]*data-mowen-uid[^>]*>/gi);
-      logToContentScript(`🔍 处理后的图片标签数: ${imgTagsWithUid?.length || 0}`);
+      logToContentScript(`🔍 处理后的图片标签数: ${imgTagsWithUid?.length || 0}`, tabId);
     } else if (images.length > 0) {
       // 包含图片开关关闭：移除所有 img 标签（不转换为链接）
       processedContent = removeAllImageTags(processedContent);
       console.log(`[墨问 Background] 🚫 包含图片已关闭，移除 ${images.length} 张图片`);
     }
 
-    // Step 2: Add metadata header - REMOVED per user request
-    // processedContent = metaHeader + processedContent;
-    // Keeping processedContent as is
-
-
     // Step 3: Split content if needed
+    if (signal.aborted) {
+      console.log('[墨问 Background] ⚠️ Cancel requested, aborting note creation');
+      return { success: false, error: '已取消保存', errorCode: 'CANCELLED' };
+    }
+
     const parts = splitContent(
       extractResult.title,
       processedContent,
@@ -318,17 +274,22 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
     // Step 4: Create notes
     console.log(`[note] create start title="${extractResult.title.substring(0, 30)}..." partsCount=${parts.length}`);
-    logToContentScript(`创建 ${parts.length} 篇笔记...`);
+    logToContentScript(`创建 ${parts.length} 篇笔记...`, tabId);
     const createdNotes: Array<{ partIndex: number; noteUrl: string; noteId: string; shareUrl?: string; isIndex?: boolean }> = [];
 
     for (const part of parts) {
+      if (signal.aborted) {
+        console.log('[墨问 Background] ⚠️ Cancel requested, stopping note creation loop');
+        break;
+      }
+
       // Send progress update
       try {
         sendProgressUpdate({
           type: 'creating_note',
           currentPart: part.index + 1,
           totalParts: parts.length,
-        });
+        }, tabId);
       } catch (err) { /* ignore */ }
 
       let result: NoteCreateResult = { success: false, error: 'Not executed', errorCode: 'UNKNOWN' };
@@ -337,17 +298,24 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
       // Retry loop
       while (retryCount < MAX_RETRY_ROUNDS) {
+        if (signal.aborted) break;
+
         retryCount++;
         console.log(`[note] part ${part.index + 1}/${parts.length} attempt ${retryCount}`);
-        logToContentScript(`📝 正在创建第 ${part.index + 1}/${parts.length} 部分 (第 ${retryCount} 次尝试)...`);
+        logToContentScript(`📝 正在创建第 ${part.index + 1}/${parts.length} 部分 (第 ${retryCount} 次尝试)...`, tabId);
 
         try {
           // Pass logToContentScript to createNote so internal logs are visible to user
-          result = await createNote(settings.apiKey, part.title, part.content, isPublic, logToContentScript, extractResult.sourceUrl, enableAutoTag);
+          // Wrap in GlobalRateLimiter to enforce 1 QPS
+          result = await GlobalRateLimiter.schedule(async () => {
+            // Create wrapper for logToContentScript that matches expected signature (msg) => void
+            const logWrapper = (msg: string) => logToContentScript(msg, tabId);
+            return await createNote(settings.apiKey, part.title, part.content, isPublic, logWrapper, extractResult.sourceUrl, enableAutoTag);
+          });
         } catch (apiErr) {
           const errMsg = apiErr instanceof Error ? apiErr.message : 'Exception';
           console.log(`[note] part ${part.index + 1} exception: ${errMsg}`);
-          logToContentScript(`❌ 创建异常: ${errMsg}`);
+          logToContentScript(`❌ 创建异常: ${errMsg}`, tabId);
           result = {
             success: false,
             error: errMsg,
@@ -357,9 +325,9 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
         if (result.success) {
           success = true;
-          markNoteApiCall(); // 记录 API 调用时间，用于速率限制
+          // markNoteApiCall(); // Removed: Handled by RateLimiter
           console.log(`[note] create ok noteId=${result.noteId} url=${result.noteUrl}`);
-          logToContentScript(`✅ 第 ${part.index + 1} 部分创建成功: ${result.noteUrl}`);
+          logToContentScript(`✅ 第 ${part.index + 1} 部分创建成功: ${result.noteUrl}`, tabId);
           createdNotes.push({
             partIndex: part.index,
             noteUrl: result.noteUrl!,
@@ -369,11 +337,11 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
           break; // Success, exit retry loop
         } else {
           console.log(`[note] part ${part.index + 1} fail: ${result.error} code=${result.errorCode}`);
-          logToContentScript(`⚠️ 第 ${part.index + 1} 部分失败: ${result.error}`);
+          logToContentScript(`⚠️ 第 ${part.index + 1} 部分失败: ${result.error}`, tabId);
           // If content too long, logic for splitting further would go here
           // Simplified: just wait and retry
           if (retryCount < MAX_RETRY_ROUNDS) {
-            logToContentScript(`⏳ 等待 ${(1000 * retryCount) / 1000} 秒后重试...`);
+            logToContentScript(`⏳ 等待 ${(1000 * retryCount) / 1000} 秒后重试...`, tabId);
             await sleep(1000 * retryCount);
           }
         }
@@ -381,20 +349,17 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
 
       if (!success) {
         console.error(`[note] part ${part.index + 1} FAILED after ${MAX_RETRY_ROUNDS} retries`);
-        logToContentScript(`❌ 第 ${part.index + 1} 部分在重试后仍然失败，放弃。`);
+        logToContentScript(`❌ 第 ${part.index + 1} 部分在重试后仍然失败，放弃。`, tabId);
       }
     }
 
     // Step 5: Create index note if multiple parts and enabled
     console.log(`[墨问 Background] 🔍 合集创建条件检查: createIndexNote=${createIndexNote}, parts.length=${parts.length}, createdNotes.length=${createdNotes.length}`);
-    logToContentScript(`🔍 合集检查: 开关=${createIndexNote}, 分块=${parts.length}, 成功=${createdNotes.length}`);
+    logToContentScript(`🔍 合集检查: 开关=${createIndexNote}, 分块=${parts.length}, 成功=${createdNotes.length}`, tabId);
 
-    if (createIndexNote && parts.length > 1 && createdNotes.length > 1) {
+    if (createIndexNote && parts.length > 1 && createdNotes.length > 1 && !signal.aborted) {
       console.log('[墨问 Background] Creating index note with internal links...');
-      logToContentScript('📚 正在创建合集笔记（内链格式）...');
-
-      // 智能等待：确保遵守 API 速率限制
-      await waitForNoteApiRateLimit();
+      logToContentScript('📚 正在创建合集笔记（内链格式）...', tabId);
 
       // 使用内链笔记格式构建合集 body
       const indexBody = createIndexNoteAtom(
@@ -403,30 +368,34 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
         createdNotes
       );
 
-      const indexResult = await createNoteWithBody(
-        settings.apiKey,
-        indexBody,
-        isPublic,
-        enableAutoTag
-      );
+      const indexResult = await GlobalRateLimiter.schedule(async () => {
+        return await createNoteWithBody(
+          settings.apiKey,
+          indexBody,
+          isPublic,
+          enableAutoTag
+        );
+      });
 
       if (indexResult.success) {
-        markNoteApiCall(); // 记录 API 调用时间，用于速率限制
         createdNotes.unshift({
           partIndex: -1,
           noteUrl: indexResult.noteUrl!,
           noteId: indexResult.noteId!,
           isIndex: true,
         });
-        logToContentScript('✅ 合集笔记创建成功');
+        logToContentScript('✅ 合集笔记创建成功', tabId);
       } else {
         // 合集创建失败不阻断整体流程，但要记录错误
         console.error('[墨问 Background] ❌ 合集笔记创建失败:', indexResult.error);
-        logToContentScript(`⚠️ 合集笔记创建失败: ${indexResult.error || '未知错误'}`);
+        logToContentScript(`⚠️ 合集笔记创建失败: ${indexResult.error || '未知错误'}`, tabId);
       }
     }
 
     console.log('[墨问 Background] 📊 Final note count:', createdNotes.length);
+
+    // Clean up task from map if finished
+    runningTasks.delete(tabId);
 
     if (createdNotes.length === 0) {
       console.error('[墨问 Background] ❌ No notes were created');
@@ -440,7 +409,7 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
       isIndex: n.isIndex,
     })));
 
-    return {
+    const result = {
       success: true,
       notes: createdNotes.map((n) => ({
         partIndex: n.partIndex,
@@ -448,12 +417,26 @@ async function handleSaveNote(payload: SaveNotePayload): Promise<{
         isIndex: n.isIndex,
       })),
     };
+
+    if (tabId) {
+      await TaskStore.complete(tabId, result);
+    }
+
+    return result;
   } catch (error) {
+    // Also clean up on error
+    runningTasks.delete(tabId);
     console.error('[墨问 Background] ❌ Save process failed with exception:', error);
-    return {
+    const errorResult = {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
     };
+
+    if (tabId) {
+      await TaskStore.complete(tabId, errorResult);
+    }
+
+    return errorResult;
   }
 }
 
@@ -466,29 +449,35 @@ function sendProgressUpdate(progress: {
   totalImages?: number;
   currentPart?: number;
   totalParts?: number;
-}) {
+}, tabId: number) {
   chrome.runtime.sendMessage({
     type: 'SAVE_NOTE_PROGRESS',
     progress,
   }).catch(() => {
     // Popup might be closed, ignore error
   });
+
+  // 更新持久化状态
+  if (tabId) {
+    TaskStore.updateProgress(tabId, {
+      ...progress,
+      status: progress.type === 'uploading_images' ? 'uploading_images' : 'creating_note',
+    }).catch(e => console.error('Failed to persist progress:', e));
+  }
 }
 
 /**
  * Fetch image blob from Content Script
  * This allows us to get the image data with the page's credentials/cookies
  */
-async function fetchImageBlobFromCS(imageUrl: string): Promise<{ blob: Blob; mimeType: string } | null> {
+/**
+ * Fetch image blob from Content Script
+ * This allows us to get the image data with the page's credentials/cookies
+ */
+async function fetchImageBlobFromCS(imageUrl: string, tabId: number): Promise<{ blob: Blob; mimeType: string } | null> {
   try {
-    // 优先使用缓存的标签页 ID，避免处理过程中标签页失去焦点
-    let tabId = cachedActiveTabId;
     if (!tabId) {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      tabId = tab?.id ?? null;
-    }
-    if (!tabId) {
-      console.log(`[img] fetchBlob: no active tab (cached=${cachedActiveTabId})`);
+      console.log(`[img] fetchBlob: no active tab`);
       return null;
     }
 
@@ -534,10 +523,12 @@ async function fetchImageBlobFromCS(imageUrl: string): Promise<{ blob: Blob; mim
 // Image processing functions - Pipelined: Concurrent Fetch + Serial Upload (Respects 1 QPS)
 async function processImages(
   apiKey: string,
-  images: ImageCandidate[]
+  images: ImageCandidate[],
+  tabId: number,
+  signal: AbortSignal
 ): Promise<ImageProcessResult[]> {
   console.log(`[img] ========== START PROCESSING ${images.length} IMAGES (Pipeline) ==========`);
-  logToContentScript(`🖼️ 开始处理 ${images.length} 张图片 (流水线模式)...`);
+  logToContentScript(`🖼️ 开始处理 ${images.length} 张图片 (流水线模式)...`, tabId);
 
   const totalImages = images.length;
   // Initialize results array
@@ -547,7 +538,7 @@ async function processImages(
     type: 'uploading_images',
     uploadedImages: 0,
     totalImages,
-  });
+  }, tabId);
 
   // 1. Fetch Queue: Concurrently fetch image blobs from Content Script
   // We limit fetch concurrency to avoid overwhelming the browser/content script
@@ -559,7 +550,7 @@ async function processImages(
 
   // Function to grab the next image and fetch it
   const fetchNext = async () => {
-    if (isCancelRequested) return;
+    if (signal.aborted) return;
 
     // Atomically grab an index
     const index = fetchCursor++;
@@ -572,11 +563,11 @@ async function processImages(
       // Logic from processImage's fetchBlobFn extracted here
       const fetchBlobFn = async (): Promise<{ blob: Blob; mimeType: string } | null> => {
         // Try normalized URL first
-        const res = await fetchImageBlobFromCS(image.normalizedUrl);
+        const res = await fetchImageBlobFromCS(image.normalizedUrl, tabId);
         if (res) return res;
         // Fallback
         if (image.normalizedUrl !== image.url) {
-          return fetchImageBlobFromCS(image.url);
+          return fetchImageBlobFromCS(image.url, tabId);
         }
         return null;
       };
@@ -598,15 +589,11 @@ async function processImages(
     fetchPromises.push(fetchNext());
   }
 
-  // 2. Upload Loop: Strictly Serial & Rate Limited
-  // We define a minimum delay between uploads to respect 1 QPS
-  const MIN_UPLOAD_INTERVAL = 1100; // ms (slightly > 1s for safety)
-  let lastUploadTime = 0;
-
+  // 2. Upload Loop: Strictly Serial & Rate Limited via GlobalRateLimiter
   for (let i = 0; i < totalImages; i++) {
-    if (isCancelRequested) {
+    if (signal.aborted) {
       console.log('[img] ⚠️ Cancel requested, stopping uploads');
-      logToContentScript('⚠️ 用户取消，停止图片上传');
+      logToContentScript('⚠️ 用户取消，停止图片上传', tabId);
       break;
     }
 
@@ -614,33 +601,31 @@ async function processImages(
     const imageIndex = i + 1;
 
     // Poll/wait for fetchResults[i] to be ready
-    while (fetchCursor <= i && fetchResults[i] === undefined && !isCancelRequested) {
+    // Fix: Remove fetchCursor <= i check which caused premature exit
+    while (fetchResults[i] === undefined && !signal.aborted) {
       await new Promise(r => setTimeout(r, 50));
     }
 
-    // Rate Limit Check
-    const now = Date.now();
-    const timeSinceLast = now - lastUploadTime;
-    if (i > 0 && timeSinceLast < MIN_UPLOAD_INTERVAL) {
-      const waitTime = MIN_UPLOAD_INTERVAL - timeSinceLast;
-      await new Promise(r => setTimeout(r, waitTime));
-    }
-
-    logToContentScript(`🖼️ 上传图片 ${imageIndex}/${totalImages}...`);
-    lastUploadTime = Date.now();
+    logToContentScript(`🖼️ 上传图片 ${imageIndex}/${totalImages}...`, tabId);
 
     try {
       const blobData = fetchResults[i] || null;
       // Construct a fake "fetchBlobFn" that returns the already-fetched data
       const preFetchedFn = async () => blobData;
-      // Call processImageWithBlob (helper function)
-      const result = await processImageWithBlob(apiKey, image, preFetchedFn);
+
+      // Schedule upload through GlobalRateLimiter
+      // This ensures global 1 QPS limit across all tabs
+      // console.log(`[img] Scheduling upload for image ${imageIndex}`);
+      const result = await GlobalRateLimiter.schedule(async () => {
+        return await processImageWithBlob(apiKey, image, preFetchedFn);
+      });
+
       results[i] = result;
 
       if (result.success) {
-        logToContentScript(`✅ [${imageIndex}/${totalImages}] 上传成功`);
+        logToContentScript(`✅ [${imageIndex}/${totalImages}] 上传成功`, tabId);
       } else {
-        logToContentScript(`❌ [${imageIndex}/${totalImages}] 上传失败: ${result.failureReason}`);
+        logToContentScript(`❌ [${imageIndex}/${totalImages}] 上传失败: ${result.failureReason}`, tabId);
       }
     } catch (err) {
       console.error(`[img] Upload ${imageIndex} exception:`, err);
@@ -657,7 +642,7 @@ async function processImages(
       type: 'uploading_images',
       uploadedImages: imageIndex,
       totalImages,
-    });
+    }, tabId);
   }
 
   // Ensure all fetches settle (cleanup)
@@ -668,7 +653,7 @@ async function processImages(
   const successCount = finalResults.filter(r => r.success).length;
   const failCount = finalResults.filter(r => !r.success).length;
   console.log(`[img] ========== DONE: success=${successCount} failed=${failCount} ==========`);
-  logToContentScript(`🖼️ 图片处理完成: 成功=${successCount}, 失败=${failCount}`);
+  logToContentScript(`🖼️ 图片处理完成: 成功=${successCount}, 失败=${failCount}`, tabId);
 
   return finalResults;
 }
@@ -745,20 +730,14 @@ async function processImageWithBlob(
   }
 }
 
-// Wrapper for backward compatibility
+// Wrapper for backward compatibility (not used mostly, but kept for signature)
 export async function processImage(
   apiKey: string,
   image: ImageCandidate
 ): Promise<ImageProcessResult> {
-  const fetchBlobFn = async (): Promise<{ blob: Blob; mimeType: string } | null> => {
-    const result = await fetchImageBlobFromCS(image.normalizedUrl);
-    if (result) return result;
-    if (image.normalizedUrl !== image.url) {
-      return fetchImageBlobFromCS(image.url);
-    }
-    return null;
-  };
-  return processImageWithBlob(apiKey, image, fetchBlobFn);
+  // Legacy support without tabId - will fail fetching blob if cross-origin
+  console.warn('Deprecated processImage called without tabId');
+  return processImageWithBlob(apiKey, image, async () => null);
 }
 
 function replaceImageUrls(

@@ -104,7 +104,7 @@ export const METADATA_TEXT_PATTERNS = [
     /^(written by|reviewed by|edited by|posted by)\s*$/i,
     /^(last edited|last updated|published on)\s*\w+\s+\d+,?\s*\d*$/i,
     /^expert verified$/i,
-    /^(blogs?|guides?|articles?)\s*[\/|]\s*(blogs?|guides?|articles?)?$/i,
+    /^(blogs?|guides?|articles?)\s*[/|]\s*(blogs?|guides?|articles?)?$/i,
     // 通用日期格式：支持 ISO 格式 "Published on 2026-01-11"
     /^published\s+(on\s+)?\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/i,
     // 中文作者格式："作者：xxx" 或 "作者/公众号：xxx"

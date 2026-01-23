@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Settings, ExtractResult, SaveProgress, DEFAULT_SETTINGS } from '../types';
 import { getSettings } from '../utils/storage';
+import { TaskStore, TaskState } from '../utils/taskStore';
 import { injectContentScript } from '../utils/contentScriptHelper';
 import {
   Settings as SettingsIcon,
@@ -56,8 +57,49 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   useEffect(() => {
     initializePopup();
 
-    // Listen for storage changes (e.g., settings updated in Options page)
+    // Listen for storage changes (e.g., settings updated in Options page OR task progress)
     const handleStorageChange = async (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => {
+      // 1. Handle Task State Changes (Session Storage)
+      if (areaName === 'session') {
+        // We need to know current tab ID to filter relevant updates
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!activeTab?.id) return;
+
+        const taskKey = `mowen_task_${activeTab.id}`;
+        if (changes[taskKey]) {
+          const newValue = changes[taskKey].newValue as TaskState | undefined;
+
+          if (!newValue) {
+            // Task cleared?
+            return;
+          }
+
+          console.log('[墨问 Popup] 🔄 Storage update:', newValue.status);
+
+          if (newValue.status === 'processing' && newValue.progress) {
+            setPreviewState('P3_Saving');
+            setProgress({
+              ...newValue.progress,
+              status: newValue.progress.status === 'uploading_images' ? 'uploading_images' : 'creating_note'
+            } as SaveProgress);
+          } else if (newValue.status === 'success' && newValue.result?.success) {
+            setPreviewState('P4_Success');
+            setProgress({
+              status: 'success',
+              notes: newValue.result.notes,
+            });
+          } else if (newValue.status === 'failed') {
+            setPreviewState('P5_Failed');
+            setProgress({
+              status: 'failed',
+              error: newValue.result?.error || '保存失败',
+              errorCode: newValue.result?.errorCode,
+            });
+          }
+        }
+      }
+
+      // 2. Handle Settings Changes (Sync/Local Storage)
       if (areaName === 'sync' || areaName === 'local') {
         if (changes['mowen_settings']) {
           const { oldValue, newValue } = changes['mowen_settings'];
@@ -87,9 +129,19 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     };
 
     // Listen for tab activation (switching tabs)
-    const handleTabChange = async (_activeInfo: chrome.tabs.TabActiveInfo) => {
-      console.log('[墨问 Popup] Tab switched, auto-fetching preview...');
-      // Reset preview state and trigger auto-fetch
+    const handleTabChange = async (activeInfo: chrome.tabs.TabActiveInfo) => {
+      console.log('[墨问 Popup] Tab switched to:', activeInfo.tabId);
+
+      // Try to restore persisted task state for the new active tab FIRST!
+      const restored = await checkPersistedState(activeInfo.tabId);
+      if (restored) {
+        console.log('[墨问 Popup] ♻️ Restored persisted task state for tab:', activeInfo.tabId);
+        await updateCurrentTab();
+        return; // Do NOT reset state if we have a running/completed task
+      }
+
+      // No persisted state found, reset and auto-fetch as usual
+      console.log('[墨问 Popup] No persisted state, auto-fetching preview...');
       setPreviewState('P1_PreviewLoading');
       setExtractResult(null);
       setProgress({ status: 'idle' });
@@ -342,6 +394,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // Get current tab info and determine clippability
       await updateCurrentTab();
 
+      // Check for persisted task state first (RESUME)
+      const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (currentTab?.id) {
+        const restored = await checkPersistedState(currentTab.id);
+        if (restored) {
+          setLoading(false);
+          return; // Skip rest of initialization if restored
+        }
+      }
+
       // Check if current page is clippable directly from URL
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       let canClip = false;
@@ -443,6 +505,44 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       console.error('[墨问 Popup] ❌ Failed to initialize popup:', error);
       setLoading(false);
     }
+  };
+
+  /**
+   * 检查并恢复持久化的任务状态
+   * 只恢复仍在处理中的任务；成功/失败状态在显示后立即清理，
+   * 避免用户关闭插件再打开时看到旧的结果页面
+   */
+  const checkPersistedState = async (tabId: number) => {
+    try {
+      console.log('[墨问 Popup] 🔍 Checking persisted state for tab:', tabId);
+      const state = await TaskStore.get(tabId);
+
+      if (!state) {
+        console.log('[墨问 Popup] No persisted state found');
+        return false;
+      }
+
+      console.log('[墨问 Popup] ♻️ Found persisted state:', state.status);
+
+      if (state.status === 'processing' && state.progress) {
+        // 恢复进度显示 - 任务仍在进行中
+        setPreviewState('P3_Saving');
+        setProgress({
+          ...state.progress,
+          status: state.progress.status === 'uploading_images' ? 'uploading_images' : 'creating_note'
+        } as SaveProgress);
+        return true;
+      } else if (state.status === 'success' || state.status === 'failed') {
+        // 成功/失败状态：不再恢复，直接清理
+        // 用户期望重新打开插件时是干净的预览页面
+        console.log('[墨问 Popup] 🧹 Clearing completed task state, user should see fresh preview');
+        await TaskStore.clear(tabId);
+        return false; // 返回 false 让 initializePopup 继续正常流程
+      }
+    } catch (e) {
+      console.error('[墨问 Popup] Failed to restore state:', e);
+    }
+    return false;
   };
 
   const checkClippability = (url: URL): boolean => {
@@ -587,6 +687,10 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   };
 
   const handleCancelPreview = () => {
+    // Clear legacy state if any
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (tab?.id) TaskStore.clear(tab.id);
+    });
     setPreviewState('P0_Idle');
     setExtractResult(null);
   };
@@ -683,6 +787,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         }
       } catch (e) { console.error('Proxy log failed', e); }
 
+      // Get tab ID before sending to ensure correct task binding
+      const [saveTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const saveTabId = saveTab?.id;
+      console.log('[墨问 Popup] 📤 Sending SAVE_NOTE with tabId:', saveTabId);
+
       const response = await Promise.race([
         chrome.runtime.sendMessage({
           type: 'SAVE_NOTE',
@@ -693,6 +802,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             maxImages: settings.maxImages,
             createIndexNote: settings.createIndexNote,
             enableAutoTag,
+            tabId: saveTabId, // Include tabId for proper task binding
           },
         }),
         new Promise<never>((_, reject) =>
@@ -767,6 +877,10 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   };
 
   const handleRetry = () => {
+    // Clear failed state to start fresh
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (tab?.id) TaskStore.clear(tab.id);
+    });
     setPreviewState('P2_PreviewReady');
     setProgress({ status: 'idle' });
   };
@@ -781,7 +895,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     console.log('[墨问 Popup] ❌ User confirmed cancel');
     setShowCancelConfirm(false);
     try {
-      await chrome.runtime.sendMessage({ type: 'CANCEL_SAVE' });
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        await chrome.runtime.sendMessage({
+          type: 'CANCEL_SAVE',
+          payload: { tabId: tab.id }
+        });
+        // IMPORTANT: Clear persisted task state to prevent stale restoration on tab switch
+        await TaskStore.clear(tab.id);
+        console.log('[墨问 Popup] 🧹 Cleared TaskStore for tab:', tab.id);
+      }
     } catch (err) {
       console.error('[墨问 Popup] Failed to send cancel message:', err);
     }
@@ -891,8 +1014,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
               chrome.runtime.sendMessage({
                 type: 'SAVE_SETTING',
                 payload: { enableAutoTag: newValue }
+              }).then((response) => {
+                if (!response?.success) {
+                  console.error('[墨问 Popup] SAVE_SETTING failed:', response?.error);
+                  // 恢复 UI 状态以反映保存失败
+                  setEnableAutoTag(!newValue);
+                }
               }).catch((err) => {
                 console.error('[墨问 Popup] Failed to save enableAutoTag:', err);
+                // 恢复 UI 状态以反映保存失败
+                setEnableAutoTag(!newValue);
               });
             }}
           >
@@ -1096,9 +1227,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
     // P3 Saving
     if (previewState === 'P3_Saving') {
-      const imageProgress = progress.totalImages ? (progress.uploadedImages || 0) / progress.totalImages : 0;
-      const noteProgress = progress.totalParts ? (progress.currentPart || 0) / progress.totalParts : 0;
-      const isUploadingImages = progress.totalImages && (progress.uploadedImages || 0) < progress.totalImages;
 
       // Generate cancel confirmation description
       const getCancelDescription = () => {
@@ -1126,56 +1254,83 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             <RefreshCw className="animate-spin text-brand-primary mx-auto mb-3" size={32} />
             <p className="text-sm font-medium text-text-primary mb-4">正在保存到墨问…</p>
 
-            {/* Progress Bars */}
+            {/* Unified Progress Bar - Two Phases: Image Upload then Note Creation */}
             <div className="space-y-3 text-left px-2">
-              {/* Image Upload Progress */}
-              {progress.totalImages !== undefined && progress.totalImages > 0 && (
-                <div>
-                  <div className="flex justify-between items-center text-xs mb-1">
-                    <span className="text-text-secondary">
-                      {isUploadingImages ? '正在上传图片...' : '图片上传完成'}
-                    </span>
-                    <div className="flex items-center gap-3">
-                      <span className="text-text-secondary">{progress.uploadedImages || 0}/{progress.totalImages}</span>
-                      <button
-                        className="text-brand-primary hover:underline px-2 py-1"
-                        onClick={handleCancelClick}
-                      >
-                        取消
-                      </button>
+              {(() => {
+                // Calculate unified progress: Image phase (0-50%) + Note phase (50-100%)
+                const hasImages = progress.totalImages !== undefined && progress.totalImages > 0;
+                const hasNotes = progress.totalParts !== undefined && progress.totalParts > 0;
+
+                // Determine current phase and calculate overall progress
+                let overallProgress = 0;
+                let phaseLabel = '准备中...';
+                let phaseDetail = '';
+
+                if (hasImages) {
+                  const imageProgress = (progress.uploadedImages || 0) / progress.totalImages!;
+                  const imagesComplete = (progress.uploadedImages || 0) >= progress.totalImages!;
+
+                  if (!imagesComplete) {
+                    // Phase 1: Uploading images (0% - 50%)
+                    overallProgress = (imageProgress * 50);
+                    phaseLabel = '正在上传图片...';
+                    phaseDetail = `${progress.uploadedImages || 0}/${progress.totalImages}`;
+                  } else if (hasNotes) {
+                    // Phase 2: Creating notes (50% - 100%)
+                    const noteProgress = (progress.currentPart || 0) / progress.totalParts!;
+                    overallProgress = 50 + (noteProgress * 50);
+                    phaseLabel = '正在创建笔记...';
+                    phaseDetail = `${progress.currentPart || 0}/${progress.totalParts}`;
+                  } else {
+                    // Images done, no notes yet
+                    overallProgress = 50;
+                    phaseLabel = '图片上传完成，准备创建笔记...';
+                  }
+                } else if (hasNotes) {
+                  // No images, only notes (0% - 100%)
+                  const noteProgress = (progress.currentPart || 0) / progress.totalParts!;
+                  overallProgress = noteProgress * 100;
+                  phaseLabel = '正在创建笔记...';
+                  phaseDetail = `${progress.currentPart || 0}/${progress.totalParts}`;
+                } else {
+                  // No progress data yet
+                  phaseLabel = '处理中...';
+                }
+
+                return (
+                  <div>
+                    <div className="flex justify-between items-center text-xs mb-1">
+                      <span className="text-text-secondary">{phaseLabel}</span>
+                      <div className="flex items-center gap-3">
+                        {phaseDetail && <span className="text-text-secondary">{phaseDetail}</span>}
+                        <button
+                          className="text-brand-primary hover:underline px-2 py-1"
+                          onClick={handleCancelClick}
+                        >
+                          取消
+                        </button>
+                      </div>
                     </div>
+                    <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-brand-primary rounded-full transition-all duration-300"
+                        style={{ width: `${Math.min(overallProgress, 100)}%` }}
+                      />
+                    </div>
+                    {/* Show phase indicator */}
+                    {hasImages && hasNotes && (
+                      <div className="flex justify-between text-xs text-text-secondary mt-1.5">
+                        <span className={overallProgress < 50 ? 'text-brand-primary font-medium' : ''}>
+                          ① 上传图片
+                        </span>
+                        <span className={overallProgress >= 50 ? 'text-brand-primary font-medium' : ''}>
+                          ② 创建笔记
+                        </span>
+                      </div>
+                    )}
                   </div>
-                  <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-brand-primary rounded-full transition-all duration-300"
-                      style={{ width: `${imageProgress * 100}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Note Creation Progress */}
-              {progress.totalParts !== undefined && progress.totalParts > 0 && (
-                <div>
-                  <div className="flex justify-between items-center text-xs mb-1">
-                    <span className="text-text-secondary">
-                      {progress.currentPart && progress.currentPart < progress.totalParts ? '正在创建笔记...' : '笔记创建'}
-                    </span>
-                    <span className="text-text-secondary">{progress.currentPart || 0}/{progress.totalParts}</span>
-                  </div>
-                  <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-green-500 rounded-full transition-all duration-300"
-                      style={{ width: `${noteProgress * 100}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Status Text when no progress bars shown */}
-              {!progress.totalImages && !progress.totalParts && (
-                <p className="text-xs text-text-secondary text-center">处理中...</p>
-              )}
+                );
+              })()}
             </div>
           </div>
 
