@@ -6,14 +6,18 @@ import {
   NotePart,
   NoteCreateResult,
   ImageFailureReason,
+  SaveHighlightPayload,
+  HighlightSaveResult,
+  Highlight,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
 import { sleep } from '../utils/helpers';
 
-import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult } from '../services/api';
+import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 import { TaskStore } from '../utils/taskStore';
 import { GlobalRateLimiter } from '../utils/rateLimiter';
+import { htmlToNoteAtom } from '../utils/noteAtom';
 
 const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
 const MAX_RETRY_ROUNDS = LIMITS.MAX_RETRY_ROUNDS;
@@ -25,6 +29,63 @@ const runningTasks = new Map<number, AbortController>();
 // Initialize Side Panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error('[墨问 Background] ❌ Failed to set side panel behavior:', error));
+
+// ============================================
+// 右键菜单注册（用于划线保存）
+// ============================================
+chrome.runtime.onInstalled.addListener(() => {
+  // 注册右键菜单：选中文本时显示"保存到墨问"
+  chrome.contextMenus.create({
+    id: 'mowen-save-selection',
+    title: '保存到墨问笔记',
+    contexts: ['selection'],
+  });
+  console.log('[墨问 Background] ✅ Context menu registered');
+});
+
+// 处理右键菜单点击
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === 'mowen-save-selection' && info.selectionText && tab?.id) {
+    console.log('[墨问 Background] 📝 Context menu clicked, selection:', info.selectionText.substring(0, 50));
+
+    // 构造划线数据
+    const highlight: Highlight = {
+      id: `ctx-${Date.now()}`,
+      text: info.selectionText,
+      sourceUrl: info.pageUrl || tab.url || '',
+      pageTitle: tab.title || 'Unknown',
+      createdAt: new Date().toISOString(),
+    };
+
+    // 获取设置
+    const settings = await getSettings();
+
+    // 保存划线
+    const payload: SaveHighlightPayload = {
+      highlight,
+      isPublic: settings.defaultPublic,
+      enableAutoTag: settings.enableAutoTag,
+    };
+
+    try {
+      const result = await handleSaveHighlight(payload);
+
+      // 通知 Content Script 显示结果
+      if (tab.id) {
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'HIGHLIGHT_RESULT',
+          payload: result,
+        }).catch(() => {
+          // Content script 可能未加载，忽略
+        });
+      }
+
+      console.log('[墨问 Background] ✅ Context menu save result:', result.success);
+    } catch (error) {
+      console.error('[墨问 Background] ❌ Context menu save failed:', error);
+    }
+  }
+});
 
 interface SaveNotePayload {
   extractResult: ExtractResult;
@@ -168,6 +229,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  // 处理划线保存请求
+  if (message.type === 'SAVE_HIGHLIGHT') {
+    console.log('[墨问 Background] 📝 SAVE_HIGHLIGHT request received');
+    console.log('[墨问 Background] 📝 SAVE_HIGHLIGHT payload:', message.payload);
+
+    // 使用 Promise 包装确保 sendResponse 一定被调用
+    handleSaveHighlight(message.payload as SaveHighlightPayload)
+      .then((result) => {
+        console.log('[墨问 Background] ✅ SAVE_HIGHLIGHT result:', result);
+        sendResponse(result);
+      })
+      .catch((error) => {
+        console.error('[墨问 Background] ❌ SAVE_HIGHLIGHT error:', error);
+        const errorResult: HighlightSaveResult = {
+          success: false,
+          isAppend: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+        console.log('[墨问 Background] ❌ SAVE_HIGHLIGHT sending error result:', errorResult);
+        sendResponse(errorResult);
+      });
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  // 打开设置页
+  if (message.type === 'OPEN_OPTIONS_PAGE') {
+    chrome.runtime.openOptionsPage();
+    sendResponse({ success: true });
+    return false;
+  }
+
   if (message.type === 'TEST_CONNECTION') {
     // ... (unchanged)
     return false; // placeholder for diff context
@@ -175,6 +267,217 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false; // placeholder
 }); // Close listener for diff match (Wait, easier to just match the block)
 // I will only replace the SAVE_NOTE handler part + handleSaveNote signature
+
+/**
+ * 处理划线保存请求
+ * 首次保存创建笔记，后续保存追加到同一笔记
+ */
+async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<HighlightSaveResult> {
+  const { highlight, isPublic, enableAutoTag, existingNoteId, existingBody } = payload;
+
+  console.log(`[墨问 Background] 📝 handleSaveHighlight: existingNoteId=${existingNoteId || 'none'}, hasExistingBody=${!!existingBody}`);
+
+  // 获取设置
+  const settings = await getSettings();
+  if (!settings.apiKey) {
+    return {
+      success: false,
+      isAppend: false,
+      error: 'API Key 未配置',
+      errorCode: 'UNAUTHORIZED',
+    };
+  }
+
+  const apiKey = settings.apiKey;
+
+  // 如果有已存在的笔记，尝试追加
+  if (existingNoteId) {
+    console.log(`[墨问 Background] 📝 Attempting to append to existing note: ${existingNoteId}`);
+
+    try {
+      let originalBody: { type: string; content?: unknown[] } | null = null;
+
+      // 优先使用本地缓存的 body
+      if (existingBody) {
+        console.log(`[墨问 Background] 📝 Using cached body from local storage`);
+        originalBody = existingBody as { type: string; content?: unknown[] };
+      } else {
+        // 缓存丢失，跳过追加流程，直接创建新笔记
+        console.log(`[墨问 Background] ⚠️ No cached body available, will create new note`);
+      }
+
+      if (originalBody && Array.isArray(originalBody.content)) {
+        // 空行分隔
+        const emptyParagraph = {
+          type: 'paragraph',
+          content: [],
+        };
+
+        // 时间标注 + 👇划线内容（符合墨问 API 规范：quote 的 content 直接是 text 节点数组）
+        const timeQuote = {
+          type: 'quote',
+          content: [
+            { type: 'text', text: `📌 ${new Date(highlight.createdAt).toLocaleString('zh-CN')}`, marks: [{ type: 'highlight' }] },
+          ],
+        };
+        const highlightLabelQuote = {
+          type: 'quote',
+          content: [
+            { type: 'text', text: '👇划线内容', marks: [{ type: 'highlight' }] },
+          ],
+        };
+
+        // 将 HTML 转换为 NoteAtom 格式以保留格式（引用、加粗、换行等）
+        // 直接使用原始 HTML，不强制包裹 blockquote，以保留用户选中内容的原始结构
+        const highlightHtml = highlight.html || `<p>${highlight.text}</p>`;
+        const highlightAtom = htmlToNoteAtom(highlightHtml);
+        const highlightBlocks = highlightAtom.content || [];
+
+        // 追加到 content 数组：空行 + 时间引用 + 👇划线内容 + 空行 + 划线内容
+        originalBody.content.push(emptyParagraph, timeQuote, highlightLabelQuote, emptyParagraph, ...highlightBlocks);
+
+        // 调用编辑 API
+        const editResult = await editNote(apiKey, existingNoteId, originalBody);
+
+        if (editResult.success) {
+          const noteUrl = isPublic
+            ? `https://note.mowen.cn/detail/${existingNoteId}`
+            : `https://note.mowen.cn/editor/${existingNoteId}`;
+
+          return {
+            success: true,
+            noteId: existingNoteId,
+            noteUrl,
+            isAppend: true,
+            // 返回更新后的 body 供前端缓存
+            updatedBody: originalBody,
+          };
+        } else {
+          console.log(`[墨问 Background] ⚠️ Edit failed: ${editResult.error}, errorCode: ${editResult.errorCode}, falling back to create new note`);
+        }
+      } else {
+        console.log(`[墨问 Background] ⚠️ No valid body found, falling back to create new note`);
+      }
+    } catch (error) {
+      console.error('[墨问 Background] ❌ Append failed:', error);
+      // 降级为创建新笔记
+    }
+  }
+
+  // 创建新笔记
+  console.log('[墨问 Background] 📝 Creating new highlight note');
+
+  // 构建划线内容 HTML（用于创建新笔记）
+  const highlightHtml = formatHighlightContent(highlight);
+
+  // URL 安全验证：仅允许 http/https 协议
+  const isValidUrl = (url: string): boolean => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  };
+  const safeSourceUrl = isValidUrl(highlight.sourceUrl) ? highlight.sourceUrl : '';
+
+  const title = `划线笔记：${highlight.pageTitle.substring(0, 50)}`;
+  // 格式：标题 + 来源链接（由 createNote 统一添加）+ 时间引用 + 👇划线内容 + 空行 + 划线内容
+  // 注意：来源链接通过 sourceUrl 参数传递给 createNote，与剪藏笔记保持一致的处理方式
+  const content = `
+    <p></p>
+    <blockquote><p><mark>📌 ${new Date(highlight.createdAt).toLocaleString('zh-CN')}</mark></p><p><mark>👇划线内容</mark></p></blockquote>
+    <p></p>
+    ${highlightHtml}
+  `;
+
+  const createResult = await createNote(
+    apiKey,
+    title,
+    content,
+    isPublic,
+    undefined,
+    safeSourceUrl || undefined, // 通过 sourceUrl 参数传递，与剪藏笔记保持一致
+    enableAutoTag
+  );
+
+  if (createResult.success) {
+    // 构建初始 body 结构（用于前端缓存，便于后续追加）
+    // 生成与服务端笔记结构一致的 NoteAtom body
+    // 注意：API 只支持 doc, paragraph, quote, image 类型，不支持 heading
+    const contentAtom = htmlToNoteAtom(content);
+    // 使用 paragraph + bold 表示标题（与 createNote 的结构一致）
+    const titleParagraph = {
+      type: 'paragraph',
+      content: [{ type: 'text', text: title, marks: [{ type: 'bold' }] }],
+    };
+    // 空段落（用于标题和内容之间的分隔）
+    const emptyParagraphAfterTitle = {
+      type: 'paragraph',
+      content: [],
+    };
+    // 来源链接段落（与 createNote 中 createOriginalLinkHtml 生成的结构一致）
+    const sourceLinkParagraph = safeSourceUrl ? {
+      type: 'paragraph',
+      content: [
+        { type: 'text', text: '📄 来源：' },
+        { type: 'text', text: '查看原文', marks: [{ type: 'link', attrs: { href: safeSourceUrl } }] },
+      ],
+    } : null;
+    // 构建完整的 body：标题段落 + 空行 + 来源链接（如有）+ 空行 + 内容
+    const bodyContent: unknown[] = [titleParagraph, emptyParagraphAfterTitle];
+    if (sourceLinkParagraph) {
+      bodyContent.push(sourceLinkParagraph);
+      // 来源链接后添加空行，与时间引用分隔
+      bodyContent.push({ type: 'paragraph', content: [] });
+    }
+    bodyContent.push(...(contentAtom.content || []));
+    const initialBody = {
+      type: 'doc',
+      content: bodyContent,
+    } as unknown as Record<string, unknown>;
+    console.log('[墨问 Background] 📝 Created note with initial body for caching (including title paragraph)');
+
+    return {
+      success: true,
+      noteId: createResult.noteId,
+      noteUrl: createResult.noteUrl,
+      isAppend: false,
+      updatedBody: initialBody,  // 返回初始 body 供前端缓存
+    };
+  } else {
+    return {
+      success: false,
+      isAppend: false,
+      error: createResult.error,
+      errorCode: createResult.errorCode,
+    };
+  }
+}
+
+/**
+ * 格式化划线内容为 HTML
+ */
+function formatHighlightContent(highlight: Highlight): string {
+  // 基础 XSS 防护：移除危险内容
+  const sanitizeHtml = (html: string): string => {
+    return html
+      // 移除 script 标签及其内容
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+      // 移除 javascript: 协议
+      .replace(/javascript:/gi, '')
+      // 移除内联事件处理器（如 onclick, onerror 等）
+      .replace(/\s+on\w+\s*=/gi, ' data-removed=');
+  };
+
+  // 如果有 HTML 格式，优先使用原始 HTML，保留用户选中内容的原始结构
+  // 不强制包裹 blockquote，以免把不在引用块里的文字也变成引用块
+  if (highlight.html) {
+    return sanitizeHtml(highlight.html);
+  }
+  // 否则使用纯文本，作为普通段落
+  return `<p>${highlight.text}</p>`;
+}
 
 async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<{
   success: boolean;

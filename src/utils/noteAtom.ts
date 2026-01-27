@@ -586,7 +586,6 @@ function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
     // Rule 1 & 4 (Heading patterns): "一、", "二、", "16 个..." (Title-like?), "5 个..."
     // Heuristic: Short lines starting with number patterns or specific chars
     const isHeadingPattern = /^(一|二|三|四|五|六|七|八|九|十|\d+)(\.|、|\s)/.test(text) ||
-      /^——/.test(text) ||
       text.length < 30 && /^(提示词|适用|核心问题)/.test(text);
 
     // Apply bold if heading pattern (and not already bold)
@@ -657,9 +656,9 @@ function splitParagraphByKeywords(block: NoteAtom): NoteAtom[] {
   let currentContent: NoteAtom[] = [];
 
   // Keywords to split BEFORE (start new paragraph):
-  // "提示词：", "适用：", "——"
-  // We use a regex to split the text content, keeping the delimiters.
-  const splitKeywordsList = ['提示词：', '适用：', '——'];
+  // "提示词：", "适用："
+  // Note: 移除了 '——' 因为破折号是正常标点，不应用于段落拆分
+  const splitKeywordsList = ['提示词：', '适用：'];
   const splitRegex = new RegExp(`(${splitKeywordsList.map(kw => kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
 
   for (const node of block.content) {

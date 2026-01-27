@@ -20,6 +20,7 @@ import {
 import { clearQuoteUrlCache } from './twitterExtractor';
 import { fetchImageAsBase64 } from './imageFetcher';
 import { ExtractResult } from '../types';
+import { initHighlighter } from './highlighter';
 
 // State for auto-extraction
 let observer: MutationObserver | null = null;
@@ -207,9 +208,108 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  // HIGHLIGHT_RESULT: 处理右键菜单保存结果（显示 Toast）
+  if (message.type === 'HIGHLIGHT_RESULT') {
+    const result = message.payload as { success: boolean; noteUrl?: string; isAppend?: boolean; error?: string };
+    showHighlightResultToast(result);
+    sendResponse({ success: true });
+    return false;
+  }
+
   // Unknown message types
   return false;
 });
+
+/**
+ * 显示划线保存结果 Toast（用于右键菜单保存）
+ */
+function showHighlightResultToast(result: { success: boolean; noteUrl?: string; isAppend?: boolean; error?: string }): void {
+  // 移除已有的 toast
+  const existingToast = document.querySelector('.mowen-toast');
+  if (existingToast) {
+    existingToast.remove();
+  }
+
+  const toast = document.createElement('div');
+  const type = result.success ? 'success' : 'error';
+  toast.className = `mowen-toast ${type}`;
+
+  const message = result.success
+    ? (result.isAppend ? '✓ 已追加到划线笔记' : '✓ 已创建划线笔记')
+    : (result.error || '保存失败');
+
+  let html = `
+    <span class="mowen-toast-icon">${result.success ? '✓' : '✕'}</span>
+    <span class="mowen-toast-message">${message}</span>
+  `;
+
+  if (result.success && result.noteUrl) {
+    html += `<a href="${result.noteUrl}" target="_blank" class="mowen-toast-link">查看笔记 →</a>`;
+  }
+
+  toast.innerHTML = html;
+
+  // 注入 Toast 样式（如果尚未注入）
+  injectToastStyles();
+
+  document.body.appendChild(toast);
+
+  // 3秒后自动消失
+  setTimeout(() => {
+    toast.classList.add('mowen-toast-out');
+    setTimeout(() => toast.remove(), 200);
+  }, 3000);
+}
+
+/**
+ * 注入 Toast 样式
+ */
+function injectToastStyles(): void {
+  if (document.getElementById('mowen-toast-styles')) return;
+
+  const style = document.createElement('style');
+  style.id = 'mowen-toast-styles';
+  style.textContent = `
+    .mowen-toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: rgba(31, 41, 55, 0.95);
+      backdrop-filter: blur(10px);
+      color: #FFFFFF;
+      border-radius: 10px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      animation: mowen-toast-in 0.3s ease-out forwards;
+    }
+    @keyframes mowen-toast-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .mowen-toast-out {
+      animation: mowen-toast-out 0.2s ease-in forwards;
+    }
+    @keyframes mowen-toast-out {
+      from { opacity: 1; transform: translateY(0); }
+      to { opacity: 0; transform: translateY(10px); }
+    }
+    .mowen-toast-link {
+      color: #60A5FA;
+      text-decoration: none;
+      margin-left: 8px;
+    }
+    .mowen-toast-link:hover { text-decoration: underline; }
+    .mowen-toast.success .mowen-toast-icon { color: #34D399; }
+    .mowen-toast.error .mowen-toast-icon { color: #F87171; }
+  `;
+  document.head.appendChild(style);
+}
 
 /**
  * Schedule content extraction with debouncing.
@@ -318,3 +418,19 @@ setTimeout(() => {
     // Ignore error if popup is not open
   });
 }, 100);
+
+// ============================================
+// 划线功能初始化
+// ============================================
+// 默认启用划线功能
+// 延迟初始化，确保页面 DOM 已就绪
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    initHighlighter();
+  });
+} else {
+  // DOM 已就绪，直接初始化
+  setTimeout(() => {
+    initHighlighter();
+  }, 500);
+}

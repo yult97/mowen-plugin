@@ -1109,6 +1109,56 @@ function extractFileName(url: string): string {
   }
 }
 
+/**
+ * 编辑笔记内容（用于划线追加）
+ * API: POST /note/edit
+ * 文档: https://mowen.apifox.cn/296486093e0
+ * 
+ * 注意：此 API 会替换整个笔记内容，需要先获取原内容再追加
+ */
+export async function editNote(
+  apiKey: string,
+  noteId: string,
+  body: Record<string, unknown>
+): Promise<{ success: boolean; noteId?: string; error?: string; errorCode?: string }> {
+  console.log(`[sw] editNote start: noteId=${noteId}`);
+
+  try {
+    const requestData = {
+      noteId,
+      body,
+    };
+
+    const data = await apiRequest<{ noteId: string }>('/note/edit', apiKey, requestData);
+
+    console.log(`[sw] editNote success: noteId=${data?.noteId || noteId}`);
+    return {
+      success: true,
+      noteId: data?.noteId || noteId,
+    };
+  } catch (error) {
+    console.error('[sw] editNote error:', error);
+
+    // 检查是否为笔记不存在的错误
+    if (error instanceof ApiRequestError) {
+      const errorCode = getErrorCode(error);
+      return {
+        success: false,
+        error: error.message,
+        errorCode,
+      };
+    }
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      errorCode: 'UNKNOWN',
+    };
+  }
+}
+
+// getNote 函数已删除（不再使用，优化为仅使用本地缓存）
+
 export async function testConnection(apiKey: string): Promise<NoteCreateResult> {
   const testTitle = `【墨问笔记助手】连接测试（${formatDate()}）`;
   const testContent = `

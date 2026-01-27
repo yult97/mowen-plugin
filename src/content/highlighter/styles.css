@@ -1,0 +1,278 @@
+/**
+ * 墨问划线功能样式
+ * 使用品牌配色：红色主色 #BF4045
+ */
+
+/* ================================
+   浮动工具栏样式
+   ================================ */
+.mowen-selection-toolbar {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(232, 224, 218, 0.8);
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(17, 24, 39, 0.15);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  transform: translateY(-8px);
+  opacity: 0;
+  animation: mowen-toolbar-fadein 0.2s ease-out forwards;
+  user-select: none;
+}
+
+@keyframes mowen-toolbar-fadein {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-8px);
+  }
+}
+
+.mowen-toolbar-fadeout {
+  animation: mowen-toolbar-fadeout 0.15s ease-in forwards;
+}
+
+@keyframes mowen-toolbar-fadeout {
+  from {
+    opacity: 1;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+/* 品牌图标 */
+.mowen-toolbar-icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.mowen-toolbar-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* 保存按钮 */
+.mowen-toolbar-save-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: #BF4045;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  white-space: nowrap;
+}
+
+.mowen-toolbar-save-btn:hover {
+  background: #A8383D;
+}
+
+.mowen-toolbar-save-btn:active {
+  background: #8F2F33;
+}
+
+.mowen-toolbar-save-btn:disabled {
+  background: #9CA3AF;
+  cursor: not-allowed;
+}
+
+/* 保存成功状态 */
+.mowen-toolbar-save-btn.success {
+  background: #10B981;
+}
+
+/* 加载中状态 */
+.mowen-toolbar-save-btn.loading {
+  pointer-events: none;
+}
+
+.mowen-toolbar-save-btn.loading::after {
+  content: '';
+  width: 12px;
+  height: 12px;
+  border: 2px solid transparent;
+  border-top-color: #FFFFFF;
+  border-radius: 50%;
+  animation: mowen-spin 0.6s linear infinite;
+  margin-left: 4px;
+}
+
+@keyframes mowen-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 分隔线 */
+.mowen-toolbar-divider {
+  width: 1px;
+  height: 20px;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+/* 关闭按钮 */
+.mowen-toolbar-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #6B7280;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mowen-toolbar-close-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: #1F2937;
+}
+
+/* ================================
+   划线高亮样式
+   ================================ */
+.mowen-highlight {
+  background-color: rgba(191, 64, 69, 0.2);
+  border-radius: 2px;
+  padding: 0 2px;
+  margin: 0 -2px;
+  transition: background-color 0.2s ease;
+}
+
+.mowen-highlight:hover {
+  background-color: rgba(191, 64, 69, 0.35);
+}
+
+/* 已保存的划线 */
+.mowen-highlight.saved {
+  background-color: rgba(191, 64, 69, 0.25);
+  cursor: pointer;
+}
+
+/* ================================
+   Toast 提示样式
+   ================================ */
+.mowen-toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: rgba(31, 41, 55, 0.95);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: #FFFFFF;
+  border-radius: 10px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  animation: mowen-toast-in 0.3s ease-out forwards;
+}
+
+@keyframes mowen-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mowen-toast-out {
+  animation: mowen-toast-out 0.2s ease-in forwards;
+}
+
+@keyframes mowen-toast-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+.mowen-toast-icon {
+  flex-shrink: 0;
+}
+
+.mowen-toast-message {
+  flex: 1;
+}
+
+.mowen-toast-link {
+  color: #60A5FA;
+  text-decoration: none;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+.mowen-toast-link:hover {
+  text-decoration: underline;
+}
+
+/* 成功状态 */
+.mowen-toast.success .mowen-toast-icon {
+  color: #34D399;
+}
+
+/* 错误状态 */
+.mowen-toast.error .mowen-toast-icon {
+  color: #F87171;
+}
+
+/* 警告状态 */
+.mowen-toast.warning .mowen-toast-icon {
+  color: #FBBF24;
+}
+
+/* ================================
+   未配置 Key 提示样式
+   ================================ */
+.mowen-toolbar-unconfigured {
+  color: #6B7280;
+  font-size: 12px;
+}
+
+.mowen-toolbar-config-btn {
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid #BF4045;
+  color: #BF4045;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mowen-toolbar-config-btn:hover {
+  background: rgba(191, 64, 69, 0.08);
+}

@@ -138,7 +138,12 @@ export type MessageType =
   | 'SETTINGS_RESULT'
   | 'SAVE_SETTINGS'
   | 'FETCH_IMAGE'
-  | 'FETCH_IMAGE_RESULT';
+  | 'FETCH_IMAGE_RESULT'
+  // 划线功能消息类型
+  | 'SAVE_HIGHLIGHT'
+  | 'HIGHLIGHT_RESULT'
+  | 'GET_HIGHLIGHT_NOTE_ID'
+  | 'CLEAR_HIGHLIGHT_NOTE_ID';
 
 export interface Message<T = unknown> {
   type: MessageType;
@@ -179,4 +184,61 @@ export interface NoteAtom {
   items?: string[];
   ordered?: boolean;
   language?: string;
+}
+
+// ============================================
+// 划线功能类型定义
+// ============================================
+
+/**
+ * 单条划线数据
+ */
+export interface Highlight {
+  id: string;                    // 唯一标识（UUID）
+  text: string;                  // 划线文本内容
+  html?: string;                 // 保留原始 HTML 格式
+  sourceUrl: string;             // 来源页面 URL
+  pageTitle: string;             // 页面标题
+  createdAt: string;             // 创建时间 ISO 8601
+  noteId?: string;               // 关联的墨问笔记 ID
+  noteUrl?: string;              // 笔记 URL
+}
+
+/**
+ * 保存划线请求载荷
+ */
+export interface SaveHighlightPayload {
+  highlight: Highlight;
+  isPublic: boolean;
+  enableAutoTag?: boolean;
+  existingNoteId?: string;       // 如果存在，则追加到该笔记
+  existingBody?: Record<string, unknown>;  // 本地缓存的笔记 body，避免调用 getNote API
+}
+
+/**
+ * 划线保存结果
+ */
+export interface HighlightSaveResult {
+  success: boolean;
+  noteId?: string;
+  noteUrl?: string;
+  isAppend: boolean;             // 是否为追加模式
+  error?: string;
+  errorCode?: string;
+  updatedBody?: Record<string, unknown>;  // 追加成功后返回更新的 body，供前端缓存
+}
+
+/**
+ * 页面划线缓存数据（存储在 chrome.storage.local）
+ */
+export interface HighlightNoteCache {
+  noteId: string;
+  noteUrl: string;
+  pageUrl: string;
+  pageTitle: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+  highlightCount: number;
+  body?: Record<string, unknown>;  // 本地缓存的笔记 body（NoteAtom 格式）
+  expiresAt?: string;  // 缓存过期时间 ISO 8601（24 小时后）
 }
