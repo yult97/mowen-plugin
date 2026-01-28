@@ -26,9 +26,30 @@ const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 // Running Tasks Map: tabId -> AbortController
 const runningTasks = new Map<number, AbortController>();
 
-// Initialize Side Panel behavior
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
+// ============================================
+// Side Panel 配置：仅在当前 tab 显示，切换 tab 后不自动显示在其他 tab
+// ============================================
+
+// 1. 禁用自动打开行为，改为手动控制
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false })
   .catch((error) => console.error('[墨问 Background] ❌ Failed to set side panel behavior:', error));
+
+// 2. 当用户点击 action 时，仅为当前 tab 启用并打开 Side Panel
+chrome.action.onClicked.addListener(async (tab) => {
+  if (tab.id) {
+    try {
+      // 仅为当前 tab 启用并打开 Side Panel
+      await chrome.sidePanel.setOptions({
+        tabId: tab.id,
+        path: 'sidepanel.html',
+        enabled: true,
+      });
+      await chrome.sidePanel.open({ tabId: tab.id });
+    } catch (error) {
+      console.error('[墨问 Background] ❌ Failed to open side panel for tab:', error);
+    }
+  }
+});
 
 // ============================================
 // 右键菜单注册（用于划线保存）
@@ -39,8 +60,14 @@ chrome.runtime.onInstalled.addListener(() => {
     id: 'mowen-save-selection',
     title: '保存到墨问笔记',
     contexts: ['selection'],
+  }, () => {
+    // 检查是否有错误（如菜单已存在）
+    if (chrome.runtime.lastError) {
+      console.log('[墨问 Background] ⚠️ Context menu creation:', chrome.runtime.lastError.message);
+    } else {
+      console.log('[墨问 Background] ✅ Context menu registered');
+    }
   });
-  console.log('[墨问 Background] ✅ Context menu registered');
 });
 
 // 处理右键菜单点击
@@ -98,15 +125,11 @@ interface SaveNotePayload {
 }
 
 // Helper to proxy logs to Content Script
-async function logToContentScript(msg: string, tabId?: number): Promise<void> {
-  try {
-    if (tabId) {
-      await chrome.tabs.sendMessage(tabId, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch(() => {
-        void chrome.runtime.lastError;
-      });
-    }
-  } catch (error) {
-    /* ignore */
+function logToContentScript(msg: string, tabId?: number): void {
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch(() => {
+      // Content script 可能未加载，忽略错误
+    });
   }
 }
 
@@ -174,7 +197,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message.payload) {
       console.error('[墨问 Background] ❌ Payload is undefined/null in SAVE_NOTE message');
       sendResponse({ success: false, error: 'Payload is undefined' });
-      return;
+      return false;
     }
 
     // Send immediate acknowledgment to prevent message channel timeout
@@ -260,12 +283,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  if (message.type === 'TEST_CONNECTION') {
-    // ... (unchanged)
-    return false; // placeholder for diff context
-  }
-  return false; // placeholder
-}); // Close listener for diff match (Wait, easier to just match the block)
+  return false;
+});
 // I will only replace the SAVE_NOTE handler part + handleSaveNote signature
 
 /**
@@ -611,8 +630,8 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
           // Pass logToContentScript to createNote so internal logs are visible to user
           // Wrap in GlobalRateLimiter to enforce 1 QPS
           result = await GlobalRateLimiter.schedule(async () => {
-            // Create wrapper for logToContentScript that matches expected signature (msg) => void
-            const logWrapper = (msg: string) => logToContentScript(msg, tabId);
+            // Create async wrapper for logToContentScript that matches expected signature
+            const logWrapper = async (msg: string) => { logToContentScript(msg, tabId); };
             return await createNote(settings.apiKey, part.title, part.content, isPublic, logWrapper, extractResult.sourceUrl, enableAutoTag);
           });
         } catch (apiErr) {
@@ -769,10 +788,6 @@ function sendProgressUpdate(progress: {
   }
 }
 
-/**
- * Fetch image blob from Content Script
- * This allows us to get the image data with the page's credentials/cookies
- */
 /**
  * Fetch image blob from Content Script
  * This allows us to get the image data with the page's credentials/cookies

@@ -7,7 +7,7 @@
  * 3. 与 Background 通信进行保存
  */
 
-import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult } from '../../types';
+import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult, HIGHLIGHT_STORAGE_KEYS } from '../../types';
 import { SelectionToolbar, SelectionToolbarCallbacks } from './SelectionToolbar';
 import { SelectionInfo } from './types';
 
@@ -42,6 +42,8 @@ export class HighlightManager {
       onSave: (selectionInfo) => this.handleSave(selectionInfo),
       onClose: () => this.clearSelection(),
       onConfigureKey: () => this.openOptionsPage(),
+      onDisable: (type) => this.handleDisable(type),
+      onOpenSettings: () => this.openOptionsPage(),
     };
 
     this.toolbar = new SelectionToolbar(callbacks);
@@ -50,6 +52,8 @@ export class HighlightManager {
     this.injectStyles();
     this.bindEvents();
     this.checkApiKey();
+    this.checkDisableState();  // 检查禁用状态
+    this.bindStorageListener();  // 监听存储变化（多标签页同步）
   }
 
   /**
@@ -69,6 +73,102 @@ export class HighlightManager {
     this.toolbar.destroy();
     this.removeStyles();
     this.unbindEvents();
+    this.unbindStorageListener();
+  }
+
+  /**
+   * 绑定存储变化监听器（多标签页同步）
+   */
+  private bindStorageListener(): void {
+    chrome.storage.onChanged.addListener(this.handleStorageChange);
+  }
+
+  /**
+   * 解绑存储变化监听器
+   */
+  private unbindStorageListener(): void {
+    chrome.storage.onChanged.removeListener(this.handleStorageChange);
+  }
+
+  /**
+   * 处理存储变化（多标签页同步禁用状态）
+   */
+  private handleStorageChange = (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string): void => {
+    if (areaName !== 'local') return;
+
+    // 检查是否是禁用状态变化
+    if (changes[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || changes[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]) {
+      console.log('[Highlighter] 🔄 Storage changed, re-checking disable state...');
+      this.checkDisableState();
+    }
+  };
+
+  /**
+   * 检查禁用状态
+   */
+  private async checkDisableState(): Promise<void> {
+    try {
+      const result = await chrome.storage.local.get([
+        HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
+        HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS,
+      ]);
+
+      const globalDisabled = result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] as boolean | undefined;
+      const disabledDomains = result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] as string[] | undefined;
+
+      // 全局禁用检查
+      if (globalDisabled) {
+        console.log('[Highlighter] 🚫 Global disabled, hiding toolbar');
+        this.setEnabled(false);
+        return;
+      }
+
+      // 域名禁用检查
+      if (disabledDomains && disabledDomains.length > 0) {
+        const currentDomain = window.location.hostname;
+        if (disabledDomains.includes(currentDomain)) {
+          console.log('[Highlighter] 🚫 Domain disabled:', currentDomain);
+          this.setEnabled(false);
+          return;
+        }
+      }
+
+      // 未禁用，确保启用
+      this.setEnabled(true);
+    } catch (error) {
+      console.error('[Highlighter] Failed to check disable state:', error);
+    }
+  }
+
+  /**
+   * 处理禁用操作
+   */
+  private async handleDisable(type: 'domain' | 'global'): Promise<void> {
+    try {
+      if (type === 'global') {
+        // 全局禁用
+        await chrome.storage.local.set({ [HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED]: true });
+        console.log('[Highlighter] ✅ Global disabled');
+        this.showToast('划线功能已全局禁用', 'success');
+      } else {
+        // 域名禁用
+        const currentDomain = window.location.hostname;
+        const result = await chrome.storage.local.get([HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]);
+        const disabledDomains = (result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] as string[] | undefined) || [];
+
+        if (!disabledDomains.includes(currentDomain)) {
+          disabledDomains.push(currentDomain);
+          await chrome.storage.local.set({ [HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]: disabledDomains });
+        }
+        console.log('[Highlighter] ✅ Domain disabled:', currentDomain);
+        this.showToast(`已在 ${currentDomain} 禁用划线功能`, 'success');
+      }
+
+      this.setEnabled(false);
+    } catch (error) {
+      console.error('[Highlighter] Failed to disable:', error);
+      this.showToast('禁用失败，请重试', 'error');
+    }
   }
 
   /**
@@ -376,6 +476,50 @@ export class HighlightManager {
       /* 加载状态 */
       .mowen-toast.loading .mowen-toast-icon {
         color: #BF4045;
+      }
+
+      /* ====== 禁用菜单 ====== */
+      .mowen-disable-menu {
+        z-index: 2147483647;
+        min-width: 140px;
+        padding: 4px 0;
+        background: #FFFFFF;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.06);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 13px;
+        animation: mowen-menu-in 0.15s ease-out forwards;
+      }
+      @keyframes mowen-menu-in {
+        from { opacity: 0; transform: translateY(-4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .mowen-disable-menu-item {
+        padding: 8px 12px;
+        color: #1F2937;
+        cursor: pointer;
+        transition: background-color 0.15s ease;
+        white-space: nowrap;
+      }
+      .mowen-disable-menu-item:hover {
+        background: rgba(0, 0, 0, 0.04);
+      }
+      .mowen-disable-menu-footer {
+        padding: 8px 12px;
+        border-top: 1px solid rgba(0, 0, 0, 0.06);
+        margin-top: 2px;
+        font-size: 11px;
+        color: #9CA3AF;
+      }
+      .mowen-disable-menu-link {
+        color: #3B82F6;
+        text-decoration: none;
+        margin-left: 4px;
+        cursor: pointer;
+      }
+      .mowen-disable-menu-link:hover {
+        text-decoration: underline;
       }
     `;
   }

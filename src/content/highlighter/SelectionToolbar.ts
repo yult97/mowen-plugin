@@ -42,6 +42,8 @@ export interface SelectionToolbarCallbacks {
     onSave: (selectionInfo: SelectionInfo) => Promise<{ success: boolean; noteUrl?: string; isAppend?: boolean; error?: string }>;
     onClose: () => void;
     onConfigureKey: () => void;
+    onDisable: (type: 'domain' | 'global') => void;
+    onOpenSettings: () => void;
 }
 
 export class SelectionToolbar {
@@ -52,6 +54,7 @@ export class SelectionToolbar {
     private isApiKeyConfigured: boolean = false;
     private hideTimeout: ReturnType<typeof setTimeout> | null = null;
     private resetTimeout: ReturnType<typeof setTimeout> | null = null;
+    private disableMenu: HTMLDivElement | null = null;
 
     constructor(callbacks: SelectionToolbarCallbacks) {
         this.callbacks = callbacks;
@@ -120,6 +123,7 @@ export class SelectionToolbar {
         if (this.resetTimeout) {
             clearTimeout(this.resetTimeout);
         }
+        this.hideDisableMenu();
         if (this.container) {
             this.container.remove();
             this.container = null;
@@ -215,13 +219,115 @@ export class SelectionToolbar {
             saveBtn?.addEventListener('click', () => this.handleSave());
         }
 
-        // 绑定关闭按钮事件
-        const closeBtn = this.container.querySelector('.mowen-toolbar-close-btn');
-        closeBtn?.addEventListener('click', () => {
-            this.callbacks.onClose();
+        // 绑定关闭按钮事件（单击弹出菜单）
+        this.bindCloseButtonEvents();
+    }
+
+    /**
+     * 绑定关闭按钮事件（单击弹出菜单）
+     */
+    private closeButtonHandler: ((e: Event) => void) | null = null;
+
+    private bindCloseButtonEvents(): void {
+        const closeBtn = this.container?.querySelector('.mowen-toolbar-close-btn');
+        if (!closeBtn) return;
+
+        // 移除旧的事件监听器（避免重复绑定）
+        if (this.closeButtonHandler) {
+            closeBtn.removeEventListener('click', this.closeButtonHandler);
+        }
+
+        // 创建并绑定新的事件监听器
+        this.closeButtonHandler = (e: Event) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.showDisableMenu();
+        };
+        closeBtn.addEventListener('click', this.closeButtonHandler);
+    }
+
+    /**
+     * 显示关闭选项菜单
+     */
+    private showDisableMenu(): void {
+        // 如果已存在，先移除
+        this.hideDisableMenu();
+
+        const closeBtn = this.container?.querySelector('.mowen-toolbar-close-btn');
+        if (!closeBtn) return;
+
+        const rect = closeBtn.getBoundingClientRect();
+
+        this.disableMenu = document.createElement('div');
+        this.disableMenu.className = 'mowen-disable-menu';
+        this.disableMenu.innerHTML = `
+            <div class="mowen-disable-menu-item" data-action="session">隐藏直到下次访问</div>
+            <div class="mowen-disable-menu-item" data-action="domain">在此网站禁用</div>
+            <div class="mowen-disable-menu-item" data-action="global">全局禁用</div>
+            <div class="mowen-disable-menu-footer">
+                <span>您可以在此处重新启用</span>
+                <a href="#" class="mowen-disable-menu-link">设置</a>
+            </div>
+        `;
+
+        // 定位在关闭按钮下方，右边缘对齐
+        this.disableMenu.style.position = 'fixed';
+        this.disableMenu.style.top = `${rect.bottom + 6}px`;
+        this.disableMenu.style.right = `${window.innerWidth - rect.right}px`; // 右对齐
+
+        document.body.appendChild(this.disableMenu);
+
+        // 绑定菜单项事件
+        this.disableMenu.querySelectorAll('.mowen-disable-menu-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                const action = (e.target as HTMLElement).getAttribute('data-action') as 'session' | 'domain' | 'global';
+                if (action === 'session') {
+                    // 隐藏直到下次访问：直接关闭工具栏
+                    this.callbacks.onClose();
+                    this.hideDisableMenu();
+                    this.hide();
+                } else if (action) {
+                    this.callbacks.onDisable(action);
+                    this.hideDisableMenu();
+                    this.hide();
+                }
+            });
+        });
+
+        // 绑定设置链接
+        const settingsLink = this.disableMenu.querySelector('.mowen-disable-menu-link');
+        settingsLink?.addEventListener('click', (e) => {
+            e.preventDefault();
+            this.callbacks.onOpenSettings();
+            this.hideDisableMenu();
             this.hide();
         });
+
+        // 点击外部关闭菜单
+        setTimeout(() => {
+            document.addEventListener('click', this.handleOutsideClick);
+        }, 0);
     }
+
+    /**
+     * 隐藏禁用菜单
+     */
+    private hideDisableMenu(): void {
+        if (this.disableMenu) {
+            this.disableMenu.remove();
+            this.disableMenu = null;
+        }
+        document.removeEventListener('click', this.handleOutsideClick);
+    }
+
+    /**
+     * 处理菜单外部点击
+     */
+    private handleOutsideClick = (e: MouseEvent): void => {
+        if (this.disableMenu && !this.disableMenu.contains(e.target as Node)) {
+            this.hideDisableMenu();
+        }
+    };
 
     /**
      * 获取按钮内容（图标 + 文本）

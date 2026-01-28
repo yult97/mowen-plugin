@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Settings, DEFAULT_SETTINGS, ERROR_MESSAGES } from '../types';
+import { Settings, DEFAULT_SETTINGS, ERROR_MESSAGES, HIGHLIGHT_STORAGE_KEYS } from '../types';
 import { getSettings, saveSettings, clampMaxImages } from '../utils/storage';
 import { testConnection } from '../services/api';
 import { Settings as SettingsIcon, Key, Eye, EyeOff, Check, X, RefreshCw, ExternalLink, ChevronDown, ChevronUp, RotateCcw, Copy, BookOpen, Info } from 'lucide-react';
@@ -22,15 +22,24 @@ const Options: React.FC = () => {
   const [showTutorial, setShowTutorial] = useState(false);
   const [copyStatus, setCopyStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const apiKeyInputRef = React.useRef<HTMLInputElement>(null);
+  // 划线禁用状态
+  const [highlightGlobalDisabled, setHighlightGlobalDisabled] = useState(false);
+  const [highlightDisabledDomains, setHighlightDisabledDomains] = useState<string[]>([]);
+  // 原始划线状态（用于检测变化）
+  const [originalHighlightGlobalDisabled, setOriginalHighlightGlobalDisabled] = useState(false);
+  const [originalHighlightDisabledDomains, setOriginalHighlightDisabledDomains] = useState<string[]>([]);
 
   useEffect(() => {
     loadSettings();
+    loadHighlightDisableState();
   }, []);
 
   useEffect(() => {
-    const changed = JSON.stringify(settings) !== JSON.stringify(originalSettings);
-    setHasChanges(changed);
-  }, [settings, originalSettings]);
+    const settingsChanged = JSON.stringify(settings) !== JSON.stringify(originalSettings);
+    const highlightChanged = highlightGlobalDisabled !== originalHighlightGlobalDisabled ||
+      JSON.stringify(highlightDisabledDomains) !== JSON.stringify(originalHighlightDisabledDomains);
+    setHasChanges(settingsChanged || highlightChanged);
+  }, [settings, originalSettings, highlightGlobalDisabled, originalHighlightGlobalDisabled, highlightDisabledDomains, originalHighlightDisabledDomains]);
 
   // Clear test result when API Key is empty
   useEffect(() => {
@@ -63,6 +72,23 @@ const Options: React.FC = () => {
     }
   };
 
+  // 加载划线禁用状态
+  const loadHighlightDisableState = async () => {
+    try {
+      const result = await chrome.storage.local.get([
+        HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
+        HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS,
+      ]);
+      setHighlightGlobalDisabled(result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || false);
+      setHighlightDisabledDomains(result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] || []);
+      // 保存原始值
+      setOriginalHighlightGlobalDisabled(result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || false);
+      setOriginalHighlightDisabledDomains(result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] || []);
+    } catch (error) {
+      console.error('[Options] Failed to load highlight disable state:', error);
+    }
+  };
+
   const handleSave = async () => {
     setIsSaving(true);
     try {
@@ -82,6 +108,22 @@ const Options: React.FC = () => {
       await saveSettings(settingsToSave);
       setOriginalSettings(settingsToSave);
       setSettings(settingsToSave);
+
+      // 保存划线功能设置
+      if (highlightGlobalDisabled) {
+        await chrome.storage.local.set({ [HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED]: true });
+      } else {
+        await chrome.storage.local.remove(HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED);
+      }
+      if (highlightDisabledDomains.length > 0) {
+        await chrome.storage.local.set({ [HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]: highlightDisabledDomains });
+      } else {
+        await chrome.storage.local.remove(HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS);
+      }
+      // 更新原始划线状态
+      setOriginalHighlightGlobalDisabled(highlightGlobalDisabled);
+      setOriginalHighlightDisabledDomains(highlightDisabledDomains);
+
       setHasChanges(false);
     } finally {
       setIsSaving(false);
@@ -90,6 +132,9 @@ const Options: React.FC = () => {
 
   const handleReset = () => {
     setSettings(DEFAULT_SETTINGS);
+    // 同时重置划线禁用状态
+    setHighlightGlobalDisabled(false);
+    setHighlightDisabledDomains([]);
   };
 
   const handleTestConnection = async () => {
@@ -487,6 +532,66 @@ const Options: React.FC = () => {
               </div>
             </div>
           )}
+        </div>
+
+        {/* Card 4: Highlight Settings */}
+        <div className="card p-5">
+          <h2 className="text-base font-semibold text-text-primary mb-4">划线功能</h2>
+
+          <div className="space-y-4">
+            {/* Global Enable/Disable Toggle */}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-text-primary">启用划线功能</p>
+                <p className="text-xs text-text-secondary mt-0.5">选中文字后显示保存到墨问按钮</p>
+              </div>
+              <button
+                className={`switch ${!highlightGlobalDisabled ? 'switch-on' : 'switch-off'}`}
+                onClick={() => setHighlightGlobalDisabled(!highlightGlobalDisabled)}
+              >
+                <span
+                  className={`switch-thumb ${!highlightGlobalDisabled ? 'translate-x-5' : 'translate-x-1'}`}
+                />
+              </button>
+            </div>
+
+            {/* Disabled Domains List */}
+            {highlightDisabledDomains.length > 0 && (
+              <div className="p-3 bg-gray-50 rounded-lg border border-gray-100">
+                <p className="text-sm font-medium text-text-primary mb-2">以下网站已禁用划线功能：</p>
+                <div className="space-y-2">
+                  {highlightDisabledDomains.map((domain) => (
+                    <div key={domain} className="flex items-center justify-between text-sm">
+                      <span className="text-text-secondary">{domain}</span>
+                      <button
+                        className="text-xs text-red-500 hover:text-red-700"
+                        onClick={() => {
+                          setHighlightDisabledDomains(highlightDisabledDomains.filter(d => d !== domain));
+                        }}
+                      >
+                        移除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {highlightDisabledDomains.length > 1 && (
+                  <button
+                    className="mt-3 text-xs text-red-500 hover:text-red-700"
+                    onClick={() => setHighlightDisabledDomains([])}
+                  >
+                    清除所有禁用网站
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* No disabled domains message */}
+            {highlightDisabledDomains.length === 0 && !highlightGlobalDisabled && (
+              <p className="text-xs text-text-secondary">
+                目前没有禁用的网站。您可以在网页上通过关闭按钮来禁用特定网站的划线功能。
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Sticky Footer */}

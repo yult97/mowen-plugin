@@ -132,8 +132,6 @@ export type MessageType =
   | 'SAVE_NOTE'
   | 'SAVE_PROGRESS'
   | 'SAVE_COMPLETE'
-  | 'TEST_CONNECTION'
-  | 'TEST_RESULT'
   | 'GET_SETTINGS'
   | 'SETTINGS_RESULT'
   | 'SAVE_SETTINGS'
@@ -242,3 +240,25 @@ export interface HighlightNoteCache {
   body?: Record<string, unknown>;  // 本地缓存的笔记 body（NoteAtom 格式）
   expiresAt?: string;  // 缓存过期时间 ISO 8601（24 小时后）
 }
+
+// ============================================
+// 划线功能禁用状态类型定义
+// ============================================
+
+/**
+ * 划线功能禁用状态
+ */
+export interface HighlightDisableState {
+  globalDisabled: boolean;           // 全局禁用
+  disabledDomains: string[];         // 被禁用的域名列表
+}
+
+/**
+ * 划线禁用存储 Key
+ */
+export const HIGHLIGHT_STORAGE_KEYS = {
+  /** 全局禁用开关 */
+  GLOBAL_DISABLED: 'highlight_disabled',
+  /** 被禁用的域名列表 */
+  DISABLED_DOMAINS: 'highlight_disabled_domains',
+} as const;
