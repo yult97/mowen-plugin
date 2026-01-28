@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "墨问笔记助手",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "一键剪藏网页/公众号文章到墨问笔记，支持图片抓取、超长自动拆分",
   "icons": {
     "16": "public/icons/icon16.png",
