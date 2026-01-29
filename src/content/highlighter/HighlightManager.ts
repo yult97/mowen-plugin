@@ -526,10 +526,12 @@ export class HighlightManager {
 
   /**
    * 绑定事件
+   * 使用捕获阶段（true）确保在网站的事件处理器之前接收事件
+   * 这样即使网站调用 stopPropagation() 也不会阻断我们的监听器
    */
   private bindEvents(): void {
-    document.addEventListener('mouseup', this.handleMouseUp);
-    document.addEventListener('mousedown', this.handleMouseDown);
+    document.addEventListener('mouseup', this.handleMouseUp, true);
+    document.addEventListener('mousedown', this.handleMouseDown, true);
     document.addEventListener('keydown', this.handleKeyDown);
   }
 
@@ -537,8 +539,8 @@ export class HighlightManager {
    * 解绑事件
    */
   private unbindEvents(): void {
-    document.removeEventListener('mouseup', this.handleMouseUp);
-    document.removeEventListener('mousedown', this.handleMouseDown);
+    document.removeEventListener('mouseup', this.handleMouseUp, true);
+    document.removeEventListener('mousedown', this.handleMouseDown, true);
     document.removeEventListener('keydown', this.handleKeyDown);
   }
 

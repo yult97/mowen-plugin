@@ -27,28 +27,97 @@ const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 const runningTasks = new Map<number, AbortController>();
 
 // ============================================
-// Side Panel 配置：仅在当前 tab 显示，切换 tab 后不自动显示在其他 tab
+// Side Panel 配置：Tab 级别可见性控制
+// 原理：利用 setOptions({ tabId, enabled }) 在 Tab 切换时动态切换可见性
+// 使用 chrome.storage.session 持久化状态，避免 Service Worker 重启后丢失
 // ============================================
 
-// 1. 禁用自动打开行为，改为手动控制
+// Side Panel 状态持久化 key
+const SIDE_PANEL_TABS_KEY = 'sidePanelOpenedTabs';
+
+// 辅助函数：获取已开启 Side Panel 的 Tab 列表
+async function getSidePanelOpenedTabs(): Promise<Set<number>> {
+  const result = await chrome.storage.session.get(SIDE_PANEL_TABS_KEY);
+  const tabs = result[SIDE_PANEL_TABS_KEY] || [];
+  return new Set<number>(tabs);
+}
+
+// 辅助函数：添加 Tab 到已开启列表
+async function addSidePanelTab(tabId: number): Promise<void> {
+  const tabs = await getSidePanelOpenedTabs();
+  tabs.add(tabId);
+  await chrome.storage.session.set({ [SIDE_PANEL_TABS_KEY]: Array.from(tabs) });
+}
+
+// 辅助函数：从已开启列表移除 Tab
+async function removeSidePanelTab(tabId: number): Promise<void> {
+  const tabs = await getSidePanelOpenedTabs();
+  tabs.delete(tabId);
+  await chrome.storage.session.set({ [SIDE_PANEL_TABS_KEY]: Array.from(tabs) });
+}
+
+// 1. 禁用自动打开（需要手动控制以确保 enabled 先设置好）
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false })
   .catch((error) => console.error('[墨问 Background] ❌ Failed to set side panel behavior:', error));
 
-// 2. 当用户点击 action 时，仅为当前 tab 启用并打开 Side Panel
+// 2. 默认在全局禁用 Side Panel（仅在特定 tab 启用）
+chrome.sidePanel.setOptions({ enabled: false })
+  .catch((error) => console.error('[墨问 Background] ❌ Failed to set global side panel options:', error));
+
+// 3. 当用户点击 Action 时，为当前 tab 启用并打开 Side Panel
+// 关键：先同步调用 setOptions（不 await），然后立即 await open()
+// 这样 open() 仍在用户手势上下文中
 chrome.action.onClicked.addListener(async (tab) => {
   if (tab.id) {
     try {
-      // 仅为当前 tab 启用并打开 Side Panel
-      await chrome.sidePanel.setOptions({
+      // 同步启动 setOptions（不等待完成）
+      chrome.sidePanel.setOptions({
         tabId: tab.id,
         path: 'sidepanel.html',
         enabled: true,
       });
+
+      // 立即调用 open()，此时仍在用户手势上下文中
       await chrome.sidePanel.open({ tabId: tab.id });
+
+      // 持久化记录（open 成功后再保存）
+      await addSidePanelTab(tab.id);
+
+      console.log(`[墨问 Background] ✅ Side Panel opened for tab ${tab.id}`);
     } catch (error) {
-      console.error('[墨问 Background] ❌ Failed to open side panel for tab:', error);
+      console.error('[墨问 Background] ❌ Failed to open side panel:', error);
     }
   }
+});
+
+// 4. 当切换 tab 时，根据该 tab 是否开启过 Side Panel 来切换 enabled 状态
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  const { tabId, windowId } = activeInfo;
+  const openedTabs = await getSidePanelOpenedTabs();
+  const shouldEnable = openedTabs.has(tabId);
+
+  await chrome.sidePanel.setOptions({
+    tabId,
+    enabled: shouldEnable,
+  });
+
+  console.log(`[墨问 Background] 🔄 Tab ${tabId} activated, Side Panel enabled=${shouldEnable}`);
+
+  // 通知 Side Panel 刷新当前 Tab 信息（解决内容跨 Tab 残留问题）
+  // Side Panel 是持久化页面，需要主动通知它 Tab 已切换
+  if (shouldEnable) {
+    chrome.runtime.sendMessage({
+      type: 'TAB_ACTIVATED',
+      payload: { tabId, windowId },
+    }).catch(() => {
+      // Side Panel 可能未打开或未监听，忽略错误
+    });
+  }
+});
+
+// 5. 当 tab 关闭时，从记录中移除
+chrome.tabs.onRemoved.addListener((tabId) => {
+  removeSidePanelTab(tabId).catch(() => { });
 });
 
 // ============================================

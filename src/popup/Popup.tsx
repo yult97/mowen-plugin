@@ -234,8 +234,23 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       }
     };
 
+    // Handle TAB_ACTIVATED from background (Side Panel 切换 Tab 时刷新)
+    const handleTabActivated = async (message: { type: string; payload?: { tabId: number; windowId: number } }) => {
+      if (message.type === 'TAB_ACTIVATED' && message.payload) {
+        console.log('[墨问 Popup] 🔄 TAB_ACTIVATED received, refreshing for tab:', message.payload.tabId);
+
+        // 清理旧内容，重新加载新 Tab 的内容
+        setExtractResult(null);
+        setPreviewState('P1_PreviewLoading');
+        setProgress({ status: 'idle' });
+        await updateCurrentTab();
+        // 触发自动获取预览
+        setAutoFetchTrigger(prev => prev + 1);
+      }
+    };
+
     // UNIFIED message handler - prevents conflicts between multiple listeners
-    const handleRuntimeMessage = (message: { type: string; result?: any; progress?: any; data?: ExtractResult }) => {
+    const handleRuntimeMessage = (message: { type: string; result?: any; progress?: any; data?: ExtractResult; payload?: any }) => {
       console.log('[墨问 Popup] Received message:', message.type);
 
       // Handle all message types in one listener
@@ -243,6 +258,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       handleSaveProgress(message);
       handleContentUpdate(message);
       handleContentScriptReady(message);
+      handleTabActivated(message);
     };
 
     // Add listeners
