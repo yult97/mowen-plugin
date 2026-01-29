@@ -55,6 +55,80 @@ export interface ImageUploadResult {
   degradeReason?: string;
 }
 
+// 墨问内部 API 响应类型（用于获取笔记内容）
+interface NoteShowResponse {
+  code?: number;
+  detail?: {
+    noteBase: {
+      uuid: string;
+      title: string;
+      content: string;  // HTML 格式的笔记内容
+      digest: string;
+      createdAt: number;
+    };
+  };
+}
+
+// 获取笔记内容结果
+export interface GetNoteContentResult {
+  success: boolean;
+  content?: string;  // HTML 格式
+  title?: string;
+  error?: string;
+}
+
+/**
+ * 获取笔记当前内容（从服务端）
+ * 使用墨问内部 API 获取笔记的最新 HTML 内容
+ * 用于实现真正的增量追加：先获取服务端最新内容，再追加新划线
+ */
+export async function getNoteContent(noteId: string): Promise<GetNoteContentResult> {
+  const INTERNAL_API_URL = 'https://note.mowen.cn/api/note/wxa/v1/note/show';
+
+  try {
+    console.log(`[getNoteContent] 正在获取笔记内容: ${noteId}`);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 秒超时
+
+    const response = await fetch(INTERNAL_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uuid: noteId }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.error(`[getNoteContent] HTTP 错误: ${response.status}`);
+      return { success: false, error: `HTTP ${response.status}` };
+    }
+
+    const data: NoteShowResponse = await response.json();
+
+    // 检查返回的 code（0 表示成功，undefined 也视为成功）
+    if ((data.code === undefined || data.code === 0) && data.detail?.noteBase) {
+      console.log(`[getNoteContent] ✅ 成功获取笔记内容，长度: ${data.detail.noteBase.content?.length || 0}`);
+      return {
+        success: true,
+        content: data.detail.noteBase.content,
+        title: data.detail.noteBase.title,
+      };
+    }
+
+    console.error(`[getNoteContent] API 返回错误: code=${data.code}`);
+    return { success: false, error: `API error: code ${data.code}` };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      console.error('[getNoteContent] 请求超时');
+      return { success: false, error: '请求超时' };
+    }
+    console.error('[getNoteContent] 请求失败:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
 class ApiRequestError extends Error {
   status: number;
   code?: number | string;

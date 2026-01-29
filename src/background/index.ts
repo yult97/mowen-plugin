@@ -13,7 +13,7 @@ import {
 import { getSettings, saveSettings } from '../utils/storage';
 import { sleep } from '../utils/helpers';
 
-import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
+import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote, getNoteContent } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 import { TaskStore } from '../utils/taskStore';
 import { GlobalRateLimiter } from '../utils/rateLimiter';
@@ -385,66 +385,75 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
     try {
       let originalBody: { type: string; content?: unknown[] } | null = null;
 
-      // 优先使用本地缓存的 body
-      if (existingBody) {
-        console.log(`[墨问 Background] 📝 Using cached body from local storage`);
-        originalBody = existingBody as { type: string; content?: unknown[] };
+      // 🔥 新增：优先从服务端获取最新内容，实现真正的增量追加
+      console.log(`[墨问 Background] 📥 Fetching latest content from server...`);
+      const serverContent = await getNoteContent(existingNoteId);
+
+      if (serverContent.success && serverContent.content) {
+        // 将服务端 HTML 转换为 NoteAtom
+        console.log(`[墨问 Background] ✅ Got server content, length: ${serverContent.content.length}`);
+        const serverBody = htmlToNoteAtom(serverContent.content);
+        originalBody = serverBody as { type: string; content?: unknown[] };
       } else {
-        // 缓存丢失，跳过追加流程，直接创建新笔记
-        console.log(`[墨问 Background] ⚠️ No cached body available, will create new note`);
-      }
-
-      if (originalBody && Array.isArray(originalBody.content)) {
-        // 空行分隔
-        const emptyParagraph = {
-          type: 'paragraph',
-          content: [],
-        };
-
-        // 时间标注 + 👇划线内容（符合墨问 API 规范：quote 的 content 直接是 text 节点数组）
-        const timeQuote = {
-          type: 'quote',
-          content: [
-            { type: 'text', text: `📌 ${new Date(highlight.createdAt).toLocaleString('zh-CN')}`, marks: [{ type: 'highlight' }] },
-          ],
-        };
-        const highlightLabelQuote = {
-          type: 'quote',
-          content: [
-            { type: 'text', text: '👇划线内容', marks: [{ type: 'highlight' }] },
-          ],
-        };
-
-        // 将 HTML 转换为 NoteAtom 格式以保留格式（引用、加粗、换行等）
-        // 直接使用原始 HTML，不强制包裹 blockquote，以保留用户选中内容的原始结构
-        const highlightHtml = highlight.html || `<p>${highlight.text}</p>`;
-        const highlightAtom = htmlToNoteAtom(highlightHtml);
-        const highlightBlocks = highlightAtom.content || [];
-
-        // 追加到 content 数组：空行 + 时间引用 + 👇划线内容 + 空行 + 划线内容
-        originalBody.content.push(emptyParagraph, timeQuote, highlightLabelQuote, emptyParagraph, ...highlightBlocks);
-
-        // 调用编辑 API
-        const editResult = await editNote(apiKey, existingNoteId, originalBody);
-
-        if (editResult.success) {
-          const noteUrl = isPublic
-            ? `https://note.mowen.cn/detail/${existingNoteId}`
-            : `https://note.mowen.cn/editor/${existingNoteId}`;
-
-          return {
-            success: true,
-            noteId: existingNoteId,
-            noteUrl,
-            isAppend: true,
-            // 返回更新后的 body 供前端缓存
-            updatedBody: originalBody,
-          };
+        // 服务端获取失败，降级使用本地缓存
+        console.log(`[墨问 Background] ⚠️ Server fetch failed: ${serverContent.error}, trying local cache`);
+        if (existingBody) {
+          console.log(`[墨问 Background] 📝 Using cached body from local storage`);
+          originalBody = existingBody as { type: string; content?: unknown[] };
         } else {
-          console.log(`[墨问 Background] ⚠️ Edit failed: ${editResult.error}, errorCode: ${editResult.errorCode}, falling back to create new note`);
+          // 缓存也没有，跳过追加流程，直接创建新笔记
+          console.log(`[墨问 Background] ⚠️ No cached body available, will create new note`);
         }
-      } else {
-        console.log(`[墨问 Background] ⚠️ No valid body found, falling back to create new note`);
+
+        if (originalBody && Array.isArray(originalBody.content)) {
+          // 空行分隔
+          const emptyParagraph = {
+            type: 'paragraph',
+            content: [],
+          };
+
+          // 时间标注 + 👇划线内容 合并为单个 quote 块
+          // 使用两个 paragraph 节点在同一个 quote 中实现换行效果
+          const headerQuote = {
+            type: 'quote',
+            content: [
+              { type: 'text', text: `📌 ${new Date(highlight.createdAt).toLocaleString('zh-CN')}`, marks: [{ type: 'highlight' }] },
+              { type: 'hardBreak' },  // 换行
+              { type: 'text', text: '👇划线内容', marks: [{ type: 'highlight' }] },
+            ],
+          };
+
+          // 将 HTML 转换为 NoteAtom 格式以保留格式（引用、加粗、换行等）
+          // 直接使用原始 HTML，不强制包裹 blockquote，以保留用户选中内容的原始结构
+          const highlightHtml = highlight.html || `<p>${highlight.text}</p>`;
+          const highlightAtom = htmlToNoteAtom(highlightHtml);
+          const highlightBlocks = highlightAtom.content || [];
+
+          // 追加到 content 数组：空行 + 头部引用 + 空行 + 划线内容
+          originalBody.content.push(emptyParagraph, headerQuote, emptyParagraph, ...highlightBlocks);
+
+          // 调用编辑 API
+          const editResult = await editNote(apiKey, existingNoteId, originalBody);
+
+          if (editResult.success) {
+            const noteUrl = isPublic
+              ? `https://note.mowen.cn/detail/${existingNoteId}`
+              : `https://note.mowen.cn/editor/${existingNoteId}`;
+
+            return {
+              success: true,
+              noteId: existingNoteId,
+              noteUrl,
+              isAppend: true,
+              // 返回更新后的 body 供前端缓存（虽然现在不太依赖了，但保持兼容）
+              updatedBody: originalBody,
+            };
+          } else {
+            console.log(`[墨问 Background] ⚠️ Edit failed: ${editResult.error}, errorCode: ${editResult.errorCode}, falling back to create new note`);
+          }
+        } else {
+          console.log(`[墨问 Background] ⚠️ No valid body found, falling back to create new note`);
+        }
       }
     } catch (error) {
       console.error('[墨问 Background] ❌ Append failed:', error);

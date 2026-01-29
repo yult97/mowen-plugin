@@ -137,7 +137,7 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
   normalized = normalized.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi,
     (_m, _l, content) => `\n<p class="__heading__"><strong>${content}</strong></p>\n`);
 
-  // 2. Handle blockquotes
+  // 2. Handle blockquotes (standard HTML)
   const quoteBlocks: Array<{ placeholder: string; content: string }> = [];
   normalized = normalized.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi, (_m, content) => {
     const placeholder = `<!--QUOTE:${quoteBlocks.length}-->`;
@@ -145,11 +145,19 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
     return `\n${placeholder}\n`;
   });
 
+  // 2.1 Handle Mowen custom quote format: <p type="quote">...</p>
+  // 墨问使用自定义属性 type="quote" 来表示引用块
+  normalized = normalized.replace(/<p\s+type\s*=\s*["']quote["'][^>]*>([\s\S]*?)<\/p>/gi, (_m, content) => {
+    const placeholder = `<!--QUOTE:${quoteBlocks.length}-->`;
+    quoteBlocks.push({ placeholder, content });
+    return `\n${placeholder}\n`;
+  });
+
   // 调试日志：打印识别到的 blockquote 数量
   if (quoteBlocks.length > 0) {
-    console.log(`[noteAtom] 🔍 识别到 ${quoteBlocks.length} 个 blockquote 块`);
+    console.log(`[noteAtom] 🔍 识别到 ${quoteBlocks.length} 个 quote 块（含墨问自定义格式）`);
     quoteBlocks.forEach((q, i) => {
-      console.log(`[noteAtom] 📋 blockquote #${i + 1} 内容预览: ${q.content.substring(0, 100)}...`);
+      console.log(`[noteAtom] 📋 quote #${i + 1} 内容预览: ${q.content.substring(0, 100)}...`);
     });
   }
 
@@ -804,6 +812,15 @@ function parseInlineContent(html: string): NoteAtom[] {
       if (styleMarks.length > 0) {
         currentMarks = [...currentMarks, ...styleMarks];
       }
+
+      // 墨问自定义属性支持：<span type="highlight"> 表示高亮
+      const typeAttrMatch = attributes.match(/type\s*=\s*["']([^"']+)["']/i);
+      if (typeAttrMatch) {
+        const typeValue = typeAttrMatch[1].toLowerCase();
+        if (typeValue === 'highlight') {
+          currentMarks = [...currentMarks, { type: 'highlight' }];
+        }
+      }
     }
 
     lastIndex = match.index + match[0].length;
@@ -1044,7 +1061,7 @@ function stripHtmlAndDecode(html: string): string {
 }
 
 /**
- * Decode HTML entities
+ * Decode HTML entities (both named and numeric)
  */
 function decodeHtmlEntities(text: string): string {
   const entities: Record<string, string> = {
@@ -1056,7 +1073,23 @@ function decodeHtmlEntities(text: string): string {
     '&lsquo;': '\u2018', '&rsquo;': '\u2019', '&ldquo;': '\u201c', '&rdquo;': '\u201d',
     '&bull;': '•', '&middot;': '·'
   };
-  return text.replace(/&[a-zA-Z0-9#]+;/g, (entity) => entities[entity] || entity);
+
+  // 先处理命名实体
+  let result = text.replace(/&[a-zA-Z]+;/g, (entity) => entities[entity] || entity);
+
+  // 处理十进制数字实体，如 &#34; &#39; &#8220;
+  result = result.replace(/&#(\d+);/g, (_match, code) => {
+    const num = parseInt(code, 10);
+    return String.fromCharCode(num);
+  });
+
+  // 处理十六进制数字实体，如 &#x22; &#x27;
+  result = result.replace(/&#x([0-9a-fA-F]+);/g, (_match, code) => {
+    const num = parseInt(code, 16);
+    return String.fromCharCode(num);
+  });
+
+  return result;
 }
 
 /**
