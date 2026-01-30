@@ -695,6 +695,8 @@ export class HighlightManager {
         const isExpired = existingCache.expiresAt && new Date(existingCache.expiresAt) < new Date();
         if (isExpired) {
           console.log('[Highlighter] ⚠️ Cache expired, will create new note');
+          // 提示用户缓存已过期，将创建新笔记
+          this.showToast('ℹ️ 缓存已过期，将创建新的划线笔记', 'warning');
           existingCache = undefined;
         } else {
           existingNoteId = existingCache.noteId;

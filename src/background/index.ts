@@ -26,6 +26,27 @@ const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
 // Running Tasks Map: tabId -> AbortController
 const runningTasks = new Map<number, AbortController>();
 
+// 辅助函数：检查任务是否已被取消（从 session storage 读取持久化状态）
+async function isTaskCancelled(tabId: number): Promise<boolean> {
+  try {
+    const cancelKey = `mowen_cancelled_${tabId}`;
+    const result = await chrome.storage.session.get(cancelKey);
+    return !!result[cancelKey];
+  } catch {
+    return false;
+  }
+}
+
+// 辅助函数：清除取消状态（任务开始时调用）
+async function clearCancelledState(tabId: number): Promise<void> {
+  try {
+    const cancelKey = `mowen_cancelled_${tabId}`;
+    await chrome.storage.session.remove(cancelKey);
+  } catch {
+    // 忽略错误
+  }
+}
+
 // ============================================
 // Side Panel 配置：Tab 级别可见性控制
 // 原理：利用 setOptions({ tabId, enabled }) 在 Tab 切换时动态切换可见性
@@ -216,13 +237,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const tabId = message.payload?.tabId;
     console.log(`[墨问 Background] ❌ CANCEL_SAVE received for tab ${tabId}`);
 
-    if (tabId && runningTasks.has(tabId)) {
-      const controller = runningTasks.get(tabId);
-      controller?.abort();
-      runningTasks.delete(tabId);
-      console.log(`[墨问 Background] 🛑 Task for tab ${tabId} aborted`);
+    if (tabId) {
+      // 1. 立即中断内存中的任务（如果存在）
+      if (runningTasks.has(tabId)) {
+        const controller = runningTasks.get(tabId);
+        controller?.abort();
+        runningTasks.delete(tabId);
+        console.log(`[墨问 Background] 🛑 Task for tab ${tabId} aborted (in-memory)`);
+      }
+
+      // 2. 持久化取消状态到 session storage（防止 Service Worker 重启后丢失）
+      const cancelKey = `mowen_cancelled_${tabId}`;
+      chrome.storage.session.set({ [cancelKey]: Date.now() }).then(() => {
+        console.log(`[墨问 Background] 💾 Cancellation state persisted for tab ${tabId}`);
+      }).catch((e) => {
+        console.warn('[墨问 Background] Failed to persist cancel state:', e);
+      });
     } else {
-      console.log(`[墨问 Background] ⚠️ No running task found for tab ${tabId}`);
+      console.log(`[墨问 Background] ⚠️ No tabId provided for CANCEL_SAVE`);
     }
 
     sendResponse({ success: true });
@@ -401,16 +433,13 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
           content: [],
         };
 
-        // 时间标注 + 👇划线内容（符合墨问 API 规范：quote 的 content 直接是 text 节点数组）
-        const timeQuote = {
+        // 时间标注 + 👇划线内容 合并为单个 quote 块，使用 hardBreak 换行
+        // 这样避免两个独立 quote 块之间产生多余空行
+        const headerQuote = {
           type: 'quote',
           content: [
             { type: 'text', text: `📌 ${new Date(highlight.createdAt).toLocaleString('zh-CN')}`, marks: [{ type: 'highlight' }] },
-          ],
-        };
-        const highlightLabelQuote = {
-          type: 'quote',
-          content: [
+            { type: 'hardBreak' },
             { type: 'text', text: '👇划线内容', marks: [{ type: 'highlight' }] },
           ],
         };
@@ -421,8 +450,8 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
         const highlightAtom = htmlToNoteAtom(highlightHtml);
         const highlightBlocks = highlightAtom.content || [];
 
-        // 追加到 content 数组：空行 + 时间引用 + 👇划线内容 + 空行 + 划线内容
-        originalBody.content.push(emptyParagraph, timeQuote, highlightLabelQuote, emptyParagraph, ...highlightBlocks);
+        // 追加到 content 数组：空行 + 头部引用 + 空行 + 划线内容
+        originalBody.content.push(emptyParagraph, headerQuote, emptyParagraph, ...highlightBlocks);
 
         // 调用编辑 API
         const editResult = await editNote(apiKey, existingNoteId, originalBody);
@@ -547,15 +576,46 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
  * 格式化划线内容为 HTML
  */
 function formatHighlightContent(highlight: Highlight): string {
-  // 基础 XSS 防护：移除危险内容
+  // 增强型 XSS 防护：移除所有危险内容
   const sanitizeHtml = (html: string): string => {
-    return html
-      // 移除 script 标签及其内容
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-      // 移除 javascript: 协议
-      .replace(/javascript:/gi, '')
-      // 移除内联事件处理器（如 onclick, onerror 等）
-      .replace(/\s+on\w+\s*=/gi, ' data-removed=');
+    let result = html;
+
+    // 1. 先解码常见的 HTML 实体编码攻击（如 &#106;avascript:）
+    result = result.replace(/&#(\d+);?/gi, (_match, code) => {
+      const num = parseInt(code, 10);
+      return num < 128 ? String.fromCharCode(num) : _match;
+    });
+    result = result.replace(/&#x([0-9a-fA-F]+);?/gi, (_match, code) => {
+      const num = parseInt(code, 16);
+      return num < 128 ? String.fromCharCode(num) : _match;
+    });
+
+    // 2. 移除所有脚本相关标签及其内容
+    result = result.replace(/<(script|iframe|object|embed|form|input|button|textarea|select|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
+    // 移除自闭合的危险标签
+    result = result.replace(/<(script|iframe|object|embed|form|input|button|textarea|select|style)[^>]*\/?>/gi, '');
+
+    // 3. 移除 SVG（可能包含脚本和事件处理器）
+    result = result.replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '');
+    result = result.replace(/<svg[^>]*\/?>/gi, '');
+
+    // 4. 移除所有事件处理器（更严格的正则，包括各种空白符）
+    result = result.replace(/\s+on\w+\s*=\s*["'][^"']*["']/gi, '');
+    result = result.replace(/\s+on\w+\s*=\s*[^\s>]+/gi, '');
+
+    // 5. 移除危险协议（javascript:, vbscript:, data:, blob:）
+    result = result.replace(/(?:javascript|vbscript|data|blob)\s*:/gi, 'blocked:');
+
+    // 6. 移除 base 标签（可能劫持相对 URL）
+    result = result.replace(/<base[^>]*\/?>/gi, '');
+
+    // 7. 移除 meta 标签（可能包含刷新重定向）
+    result = result.replace(/<meta[^>]*\/?>/gi, '');
+
+    // 8. 移除 link 标签（可能加载恶意资源）
+    result = result.replace(/<link[^>]*\/?>/gi, '');
+
+    return result;
   };
 
   // 如果有 HTML 格式，优先使用原始 HTML，保留用户选中内容的原始结构
@@ -605,6 +665,18 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
   } catch (e) {
     console.log(`[墨问 Background] ⚠️ 无法初始化 TaskStore for tab ${tabId}`);
   }
+
+  // 检查是否有之前遗留的取消状态，有则清除
+  await clearCancelledState(tabId);
+
+  // 在执行过程中定期检查取消状态的辅助函数（预留供后续任务中断点使用）
+  const _checkCancelled = async (): Promise<boolean> => {
+    // 先检查内存中的 AbortController
+    if (signal.aborted) return true;
+    // 再检查持久化的取消状态
+    return await isTaskCancelled(tabId);
+  };
+  void _checkCancelled; // 标记为已使用，供 TypeScript 忽略
 
   // Defensive check for extractResult
   if (!extractResult) {

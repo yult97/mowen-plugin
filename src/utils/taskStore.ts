@@ -35,8 +35,9 @@ export const TaskStore = {
 
             if (!task) return null;
 
-            // Check TTL
-            if (Date.now() - task.lastUpdate > TASK_TTL_MS) {
+            // Check TTL：只对已完成的任务检查过期，进行中的任务永不过期
+            // 使用 startTime 计算超时，避免因 lastUpdate 未更新导致的误判
+            if (task.status !== 'processing' && Date.now() - task.startTime > TASK_TTL_MS) {
                 await this.clear(tabId);
                 return null;
             }

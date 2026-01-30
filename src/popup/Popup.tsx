@@ -865,11 +865,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       let errorMessage = '保存失败，请重试';
       if (error instanceof Error) {
         if (error.message.includes('timeout')) {
-          errorMessage = '后台服务响应超时，请检查扩展是否正常运行';
+          // 这是等待 Background 确认的超时，不是保存操作本身的超时
+          errorMessage = '后台服务响应超时（5秒内未确认）。可能的原因：\n• 扩展正在忙于其他任务\n• 后台服务被浏览器挂起\n请稍后重试或重新加载扩展';
         } else if (error.message.includes('Could not establish connection')) {
-          errorMessage = '无法连接到后台服务，请重新加载扩展';
+          errorMessage = '无法连接到后台服务。请尝试：\n• 刷新当前页面\n• 在 chrome://extensions 中重新加载扩展';
         } else if (error.message.includes('Extension context invalidated')) {
-          errorMessage = '扩展已失效，请刷新页面或重新加载扩展';
+          errorMessage = '扩展上下文已失效。请刷新页面后重试';
         } else {
           errorMessage = error.message;
         }
