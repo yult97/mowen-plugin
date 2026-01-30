@@ -707,6 +707,11 @@ export class HighlightManager {
       }
     } catch (error) {
       console.error('[Highlighter] Failed to get cache:', error);
+      // 如果是扩展上下文失效，提前返回并提示用户
+      if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+        this.showToast('扩展已更新，请刷新页面后重试', 'error');
+        return { success: false, error: '扩展已更新，请刷新页面后重试' };
+      }
     }
 
     // 发送保存请求到 Background
@@ -819,7 +824,13 @@ export class HighlightManager {
       }
     } catch (error) {
       console.error('[Highlighter] Save failed:', error);
-      const errorMsg = error instanceof Error ? error.message : '保存失败';
+      let errorMsg = error instanceof Error ? error.message : '保存失败';
+
+      // 针对扩展上下文失效错误提供友好提示
+      if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+        errorMsg = '扩展已更新，请刷新页面后重试';
+      }
+
       this.showToast(errorMsg, 'error');
       return {
         success: false,
