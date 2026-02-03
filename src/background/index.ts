@@ -144,27 +144,88 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'mowen-save-selection' && info.selectionText && tab?.id) {
     console.log('[墨问 Background] 📝 Context menu clicked, selection:', info.selectionText.substring(0, 50));
 
+    const pageUrl = info.pageUrl || tab.url || '';
+    const pageTitle = tab.title || 'Unknown';
+
     // 构造划线数据
     const highlight: Highlight = {
       id: `ctx-${Date.now()}`,
       text: info.selectionText,
-      sourceUrl: info.pageUrl || tab.url || '',
-      pageTitle: tab.title || 'Unknown',
+      sourceUrl: pageUrl,
+      pageTitle: pageTitle,
       createdAt: new Date().toISOString(),
     };
 
     // 获取设置
     const settings = await getSettings();
 
-    // 保存划线
+    // 查询已有笔记缓存（与 HighlightManager 保持一致的逻辑）
+    // 生成缓存 Key：使用 origin + pathname，忽略 hash 和 query
+    const getPageKey = (url: string): string => {
+      try {
+        const urlObj = new URL(url);
+        return `${urlObj.origin}${urlObj.pathname}`;
+      } catch {
+        return url;
+      }
+    };
+    const pageKey = getPageKey(pageUrl);
+    const cacheKey = `highlight_note_${pageKey}`;
+
+    let existingNoteId: string | undefined;
+    let existingBody: Record<string, unknown> | undefined;
+
+    try {
+      const cached = await chrome.storage.local.get([cacheKey]);
+      const existingCache = cached[cacheKey] as {
+        noteId?: string;
+        body?: Record<string, unknown>;
+        expiresAt?: string;
+      } | undefined;
+
+      if (existingCache?.noteId) {
+        // 缓存过期检查（24小时）
+        const isExpired = existingCache.expiresAt && new Date(existingCache.expiresAt) < new Date();
+        if (!isExpired) {
+          existingNoteId = existingCache.noteId;
+          existingBody = existingCache.body;
+          console.log('[墨问 Background] ✅ Found existing noteId for context menu:', existingNoteId);
+        } else {
+          console.log('[墨问 Background] ⚠️ Cache expired for context menu save');
+        }
+      }
+    } catch (error) {
+      console.error('[墨问 Background] Failed to get cache for context menu:', error);
+    }
+
+    // 保存划线（包含缓存信息以支持追加）
     const payload: SaveHighlightPayload = {
       highlight,
       isPublic: settings.defaultPublic,
       enableAutoTag: settings.enableAutoTag,
+      existingNoteId,
+      existingBody,
     };
 
     try {
       const result = await handleSaveHighlight(payload);
+
+      // 更新缓存（如果保存成功）
+      if (result.success && result.noteId) {
+        const newCache = {
+          noteId: result.noteId,
+          noteUrl: result.noteUrl,
+          pageUrl,
+          pageTitle,
+          createdAt: new Date().toISOString(),
+          lastUpdatedAt: new Date().toISOString(),
+          highlightCount: 1,
+          body: result.updatedBody,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        };
+        await chrome.storage.local.set({ [cacheKey]: newCache });
+        console.log('[墨问 Background] ✅ Cache updated for context menu save');
+      }
 
       // 通知 Content Script 显示结果
       if (tab.id) {
@@ -182,6 +243,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     }
   }
 });
+
 
 interface SaveNotePayload {
   extractResult: ExtractResult;

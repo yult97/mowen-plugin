@@ -110,6 +110,13 @@ export class HighlightManager {
       if (currentUrl !== this.lastUrl) {
         console.log('[Highlighter] 🔄 URL changed, re-checking disable state...');
         this.lastUrl = currentUrl;
+        // SPA 路由切换时重置 sessionHidden 标志
+        // 这样从被排除的页面（如 editor）切换到正常页面（如 detail）后
+        // 划线功能能正常恢复，无需刷新页面
+        if (this.sessionHidden) {
+          console.log('[Highlighter] 🔄 Resetting sessionHidden due to URL change');
+          this.sessionHidden = false;
+        }
         this.checkDisableState();
       }
     }, 500);  // 每 500ms 检查一次
@@ -289,17 +296,19 @@ export class HighlightManager {
         user-select: none !important;
         box-sizing: border-box !important;
         pointer-events: auto !important;
+        will-change: transform, opacity !important;
       }
       @keyframes mowen-toolbar-fadein {
         from { opacity: 0; transform: translateY(-4px); }
         to { opacity: 1; transform: translateY(-8px); }
       }
       .mowen-toolbar-fadeout {
-        animation: mowen-toolbar-fadeout 0.15s ease-in forwards !important;
+        animation: mowen-toolbar-fadeout 0.1s ease-out forwards !important;
+        pointer-events: none !important;
       }
       @keyframes mowen-toolbar-fadeout {
         from { opacity: 1; transform: translateY(-8px); }
-        to { opacity: 0; transform: translateY(-4px); }
+        to { opacity: 0; transform: translateY(-12px); }
       }
 
       /* ====== 主按钮（胶囊按钮）====== */
@@ -790,6 +799,8 @@ export class HighlightManager {
     // 如果没有 existingNoteId，说明要创建新笔记，需要设置锁
     // 使用辅助函数封装释放逻辑，避免 TypeScript 类型推断问题
     let releaseLock: ((result: { noteId: string; noteUrl: string } | null) => void) | undefined;
+    // 标志位：确保锁只释放一次，避免 finally 中重复释放
+    let lockReleased = false;
 
     if (!existingNoteId) {
       const creationPromise = new Promise<{ noteId: string; noteUrl: string } | null>((resolve) => {
@@ -823,7 +834,10 @@ export class HighlightManager {
         console.error('[Highlighter] Save failed: No response from background');
         this.showToast('保存失败：后台服务无响应', 'error');
         // 释放锁
-        releaseLock?.(null);
+        if (releaseLock && !lockReleased) {
+          releaseLock(null);
+          lockReleased = true;
+        }
         return {
           success: false,
           error: '后台服务无响应',
@@ -835,6 +849,11 @@ export class HighlightManager {
         if (!response.noteId || !response.noteUrl) {
           console.error('[Highlighter] ❌ Missing noteId or noteUrl in success response');
           this.showToast('服务返回数据异常', 'error');
+          // 释放锁
+          if (releaseLock && !lockReleased) {
+            releaseLock(null);
+            lockReleased = true;
+          }
           return {
             success: false,
             error: '服务返回数据异常',
@@ -858,7 +877,10 @@ export class HighlightManager {
         await chrome.storage.local.set({ [cacheKey]: newCache });
 
         // 释放锁并传递结果
-        releaseLock?.({ noteId: response.noteId, noteUrl: response.noteUrl });
+        if (releaseLock && !lockReleased) {
+          releaseLock({ noteId: response.noteId, noteUrl: response.noteUrl });
+          lockReleased = true;
+        }
 
         // 显示 Toast（已保存/追加成功）
         this.showToast(
@@ -877,6 +899,11 @@ export class HighlightManager {
         if (response.errorCode === 'NOTE_NOT_FOUND') {
           await chrome.storage.local.remove(cacheKey);
           console.log('[Highlighter] 🗑️ Cache cleared due to note not found');
+        }
+        // 释放锁
+        if (releaseLock && !lockReleased) {
+          releaseLock(null);
+          lockReleased = true;
         }
         this.showToast(response.error || '保存失败', 'error');
         return {
@@ -899,9 +926,10 @@ export class HighlightManager {
         error: errorMsg,
       };
     } finally {
-      // 确保锁一定会被释放
-      if (releaseLock && this.pendingNoteCreation.has(pageKey)) {
+      // 确保锁一定会被释放（仅当尚未释放时）
+      if (releaseLock && !lockReleased && this.pendingNoteCreation.has(pageKey)) {
         releaseLock(null);
+        lockReleased = true;
       }
     }
   }

@@ -110,13 +110,21 @@ export class SelectionToolbar {
      * 隐藏工具栏
      */
     hide(): void {
+        // 清除之前的隐藏定时器，避免多次调用时冲突
+        if (this.hideTimeout) {
+            clearTimeout(this.hideTimeout);
+            this.hideTimeout = null;
+        }
         if (this.container) {
+            // 添加淡出动画类
             this.container.classList.add('mowen-toolbar-fadeout');
+            // 动画结束后隐藏元素（与 CSS 动画时间同步：100ms）
             this.hideTimeout = setTimeout(() => {
                 if (this.container) {
                     this.container.style.display = 'none';
+                    this.container.classList.remove('mowen-toolbar-fadeout');
                 }
-            }, 150);
+            }, 100);
         }
         this.currentSelection = null;
         this.state = 'idle';

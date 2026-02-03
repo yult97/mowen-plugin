@@ -222,6 +222,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 /**
  * 显示划线保存结果 Toast（用于右键菜单保存）
+ * 样式与 HighlightManager 的 showToast 保持一致
  */
 function showHighlightResultToast(result: { success: boolean; noteUrl?: string; isAppend?: boolean; error?: string }): void {
   // 移除已有的 toast
@@ -235,16 +236,29 @@ function showHighlightResultToast(result: { success: boolean; noteUrl?: string; 
   toast.className = `mowen-toast ${type}`;
 
   const message = result.success
-    ? (result.isAppend ? '✓ 已追加到划线笔记' : '✓ 已创建划线笔记')
+    ? '保存成功'
     : (result.error || '保存失败');
 
+  // 根据类型选择图标（与 HighlightManager 一致）
+  const iconHtml = result.success
+    ? `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M5 7H19V19C19 20.1046 18.1046 21 17 21H7C5.89543 21 5 20.1046 5 19V7Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <path d="M8 7V5C8 3.89543 8.89543 3 10 3H14C15.1046 3 16 3.89543 16 5V7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M12 10L12.9 12.2L15 12.5L13.5 14L13.8 16.5L12 15.4L10.2 16.5L10.5 14L9 12.5L11.1 12.2L12 10Z" fill="currentColor"/>
+       </svg>`
+    : `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" fill="none"/>
+        <path d="M15 9L9 15M9 9L15 15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+       </svg>`;
+
   let html = `
-    <span class="mowen-toast-icon">${result.success ? '✓' : '✕'}</span>
+    <span class="mowen-toast-icon">${iconHtml}</span>
     <span class="mowen-toast-message">${message}</span>
   `;
 
+  // 如果有链接，添加操作按钮
   if (result.success && result.noteUrl) {
-    html += `<a href="${result.noteUrl}" target="_blank" class="mowen-toast-link">查看笔记 →</a>`;
+    html += `<a href="${result.noteUrl}" target="_blank" class="mowen-toast-action">去墨问笔记查看</a>`;
   }
 
   toast.innerHTML = html;
@@ -262,7 +276,7 @@ function showHighlightResultToast(result: { success: boolean; noteUrl?: string; 
 }
 
 /**
- * 注入 Toast 样式
+ * 注入 Toast 样式（与 HighlightManager 一致）
  */
 function injectToastStyles(): void {
   if (document.getElementById('mowen-toast-styles')) return;
@@ -272,24 +286,25 @@ function injectToastStyles(): void {
   style.textContent = `
     .mowen-toast {
       position: fixed;
-      bottom: 24px;
-      right: 24px;
+      top: 16px;
+      right: 16px;
       z-index: 2147483647;
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 12px 16px;
-      background: rgba(31, 41, 55, 0.95);
-      backdrop-filter: blur(10px);
-      color: #FFFFFF;
-      border-radius: 10px;
+      gap: 12px;
+      padding: 14px 20px;
+      background: #FFFFFF;
+      border: 1px solid rgba(0, 0, 0, 0.06);
+      border-radius: 16px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 14px;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      font-weight: 500;
+      color: #1F2937;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.06);
       animation: mowen-toast-in 0.3s ease-out forwards;
     }
     @keyframes mowen-toast-in {
-      from { opacity: 0; transform: translateY(10px); }
+      from { opacity: 0; transform: translateY(-10px); }
       to { opacity: 1; transform: translateY(0); }
     }
     .mowen-toast-out {
@@ -297,16 +312,47 @@ function injectToastStyles(): void {
     }
     @keyframes mowen-toast-out {
       from { opacity: 1; transform: translateY(0); }
-      to { opacity: 0; transform: translateY(10px); }
+      to { opacity: 0; transform: translateY(-10px); }
     }
-    .mowen-toast-link {
-      color: #60A5FA;
+    .mowen-toast-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      flex-shrink: 0;
+    }
+    .mowen-toast-icon svg {
+      width: 24px;
+      height: 24px;
+    }
+    .mowen-toast-message {
+      flex: 1;
+      color: #1F2937;
+      white-space: nowrap;
+    }
+    .mowen-toast-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 8px 14px;
+      background: rgba(0, 0, 0, 0.04);
+      border: none;
+      border-radius: 20px;
+      color: #6B7280;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
       text-decoration: none;
-      margin-left: 8px;
+      white-space: nowrap;
+      transition: all 0.15s ease;
     }
-    .mowen-toast-link:hover { text-decoration: underline; }
-    .mowen-toast.success .mowen-toast-icon { color: #34D399; }
-    .mowen-toast.error .mowen-toast-icon { color: #F87171; }
+    .mowen-toast-action:hover {
+      background: rgba(0, 0, 0, 0.08);
+      color: #374151;
+    }
+    .mowen-toast.success .mowen-toast-icon { color: #BF4045; }
+    .mowen-toast.error .mowen-toast-icon { color: #EF4444; }
   `;
   document.head.appendChild(style);
 }

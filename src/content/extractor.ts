@@ -128,9 +128,16 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
             const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
             for (const block of allBlocks) {
                 const blockText = block.textContent?.trim() || '';
-                // 只匹配小块的元素（避免移除整个容器）
-                // 额外检查：确保元素内容基本等于标题文本（允许少量差异）
-                if (blockText.length < 200 && blockText.length < titleText.length * 2 && blockText.startsWith(titleText)) {
+                // 严格匹配条件：
+                // 1. 元素内容不超过 100 字符（避免匹配到大块内容）
+                // 2. 元素内容长度在标题长度的 1.2 倍以内（允许标点符号差异）
+                // 3. 元素内容必须以标题文本开头
+                // 4. 避免误删：元素内容不能比标题长很多（可能是包含标题的正文段落）
+                const isExactMatch = blockText.length <= titleText.length * 1.2;
+                const isSmallBlock = blockText.length < 100;
+                const startsWithTitle = blockText.startsWith(titleText);
+
+                if (isSmallBlock && isExactMatch && startsWithTitle) {
                     block.remove();
                     contentHtml = tempDiv.innerHTML;
                     blocks = parseBlocks(tempDiv);
@@ -210,9 +217,16 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
             const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
             for (const block of allBlocks) {
                 const blockText = block.textContent?.trim() || '';
-                // 只匹配小块的元素（避免移除整个容器）
-                // 额外检查：确保元素内容基本等于标题文本（允许少量差异）
-                if (blockText.length < 200 && blockText.length < titleText.length * 2 && blockText.startsWith(titleText)) {
+                // 严格匹配条件：
+                // 1. 元素内容不超过 100 字符（避免匹配到大块内容）
+                // 2. 元素内容长度在标题长度的 1.2 倍以内（允许标点符号差异）
+                // 3. 元素内容必须以标题文本开头
+                // 4. 避免误删：元素内容不能比标题长很多（可能是包含标题的正文段落）
+                const isExactMatch = blockText.length <= titleText.length * 1.2;
+                const isSmallBlock = blockText.length < 100;
+                const startsWithTitle = blockText.startsWith(titleText);
+
+                if (isSmallBlock && isExactMatch && startsWithTitle) {
                     block.remove();
                     contentHtml = tempDiv.innerHTML;
                     break;
@@ -286,6 +300,25 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
                 }
             });
         }
+    }
+
+    // 5.6 【新增】移除正文中的重复标题
+    // 某些网站（如纽约时报中文网）的 <h1> 标题位于 <article> 内部，
+    // 导致 Readability 将其作为正文一部分提取，与 title 字段重复。
+    // 在此移除与 title 完全匹配的 h1 元素。
+    {
+        const tempDivForH1 = document.createElement('div');
+        tempDivForH1.innerHTML = contentHtml;
+        const h1Elements = tempDivForH1.querySelectorAll('h1');
+        h1Elements.forEach(h1 => {
+            const h1Text = h1.textContent?.trim() || '';
+            // 如果 h1 内容与标题完全匹配或为空，则移除
+            if (h1Text === title || h1Text === '') {
+                console.log('[extractor] 🗑️ Removing duplicate h1 from content:', h1Text.substring(0, 30));
+                h1.remove();
+            }
+        });
+        contentHtml = tempDivForH1.innerHTML;
     }
 
     // 6. HTML 规范化 (Post-processing)

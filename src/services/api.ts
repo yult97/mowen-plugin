@@ -243,9 +243,15 @@ export async function createNote(
   log(`createNote start: "${title.substring(0, 30)}..." (${content.length} chars)`);
 
   try {
+    // 移除 content 开头与标题重复的内容
+    const cleanedContent = removeDuplicateTitleFromContent(content, title);
+    if (cleanedContent !== content) {
+      log('createNote: removed duplicate title from content');
+    }
+
     // Build the complete HTML with title as a heading, original link, and content
     const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
-    const fullHtml = `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${content}`;
+    const fullHtml = `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${cleanedContent}`;
     log(`createNote: fullHtml length = ${fullHtml.length}`);
 
     // Convert HTML to NoteAtom format
@@ -425,6 +431,52 @@ export async function createNoteWithBody(
       errorCode,
     };
   }
+}
+
+/**
+ * 移除 content 开头与标题重复的内容
+ * 某些网站（如纽约时报中文网）的 Readability 输出会在正文开头包含与标题相同的内容，
+ * 这会导致最终笔记中标题出现两次。
+ * 
+ * 检测并移除以下情况：
+ * 1. content 以 <h1>标题</h1> 开头
+ * 2. content 以 <p>标题</p> 或类似块级元素开头，且内容与标题完全匹配
+ */
+function removeDuplicateTitleFromContent(content: string, title: string): string {
+  if (!content || !title) return content;
+
+  const trimmedContent = content.trim();
+  const normalizedTitle = title.trim();
+
+  // 辅助函数：比较两个字符串是否相同（忽略标点符号和空白差异）
+  const normalize = (s: string) => s.replace(/[\s.,;:!?。，；：！？\u200B]/g, '').toLowerCase();
+  const normalizedTitleClean = normalize(normalizedTitle);
+
+  // 情况 1: content 以 <h1>标题</h1> 开头
+  const h1Regex = /^\s*<h1[^>]*>([\s\S]*?)<\/h1>\s*/i;
+  const h1Match = trimmedContent.match(h1Regex);
+  if (h1Match) {
+    const h1Content = h1Match[1].replace(/<[^>]*>/g, '').trim(); // 去除内部 HTML 标签
+    if (normalize(h1Content) === normalizedTitleClean) {
+      console.log('[api] Removing duplicate h1 title from content:', h1Content.substring(0, 30));
+      return trimmedContent.replace(h1Regex, '');
+    }
+  }
+
+  // 情况 2: content 以 <p>标题</p>、<div>标题</div> 等块级元素开头
+  const blockRegex = /^\s*<(p|div|section|header)[^>]*>([\s\S]*?)<\/\1>\s*/i;
+  const blockMatch = trimmedContent.match(blockRegex);
+  if (blockMatch) {
+    const blockContent = blockMatch[2].replace(/<[^>]*>/g, '').trim();
+    // 只有当内容长度接近标题长度时才移除，避免误删正文段落
+    if (blockContent.length <= normalizedTitle.length * 1.5 &&
+      normalize(blockContent) === normalizedTitleClean) {
+      console.log('[api] Removing duplicate block title from content:', blockContent.substring(0, 30));
+      return trimmedContent.replace(blockRegex, '');
+    }
+  }
+
+  return content;
 }
 
 /**
