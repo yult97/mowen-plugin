@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Settings, DEFAULT_SETTINGS, ERROR_MESSAGES, HIGHLIGHT_STORAGE_KEYS } from '../types';
+import { Settings, DEFAULT_SETTINGS, ERROR_MESSAGES, HIGHLIGHT_STORAGE_KEYS, DEFAULT_EXCLUDED_URLS } from '../types';
 import { getSettings, saveSettings, clampMaxImages } from '../utils/storage';
 import { testConnection } from '../services/api';
 import { Settings as SettingsIcon, Key, Eye, EyeOff, Check, X, RefreshCw, ExternalLink, ChevronDown, ChevronUp, RotateCcw, Copy, BookOpen, Info } from 'lucide-react';
@@ -22,12 +22,14 @@ const Options: React.FC = () => {
   const [showTutorial, setShowTutorial] = useState(false);
   const [copyStatus, setCopyStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const apiKeyInputRef = React.useRef<HTMLInputElement>(null);
-  // 划线禁用状态
   const [highlightGlobalDisabled, setHighlightGlobalDisabled] = useState(false);
   const [highlightDisabledDomains, setHighlightDisabledDomains] = useState<string[]>([]);
+  const [highlightExcludedUrls, setHighlightExcludedUrls] = useState<string[]>(DEFAULT_EXCLUDED_URLS);
+  const [newExcludedUrl, setNewExcludedUrl] = useState('');
   // 原始划线状态（用于检测变化）
   const [originalHighlightGlobalDisabled, setOriginalHighlightGlobalDisabled] = useState(false);
   const [originalHighlightDisabledDomains, setOriginalHighlightDisabledDomains] = useState<string[]>([]);
+  const [originalHighlightExcludedUrls, setOriginalHighlightExcludedUrls] = useState<string[]>(DEFAULT_EXCLUDED_URLS);
 
   useEffect(() => {
     loadSettings();
@@ -37,9 +39,10 @@ const Options: React.FC = () => {
   useEffect(() => {
     const settingsChanged = JSON.stringify(settings) !== JSON.stringify(originalSettings);
     const highlightChanged = highlightGlobalDisabled !== originalHighlightGlobalDisabled ||
-      JSON.stringify(highlightDisabledDomains) !== JSON.stringify(originalHighlightDisabledDomains);
+      JSON.stringify(highlightDisabledDomains) !== JSON.stringify(originalHighlightDisabledDomains) ||
+      JSON.stringify(highlightExcludedUrls) !== JSON.stringify(originalHighlightExcludedUrls);
     setHasChanges(settingsChanged || highlightChanged);
-  }, [settings, originalSettings, highlightGlobalDisabled, originalHighlightGlobalDisabled, highlightDisabledDomains, originalHighlightDisabledDomains]);
+  }, [settings, originalSettings, highlightGlobalDisabled, originalHighlightGlobalDisabled, highlightDisabledDomains, originalHighlightDisabledDomains, highlightExcludedUrls, originalHighlightExcludedUrls]);
 
   // Clear test result when API Key is empty
   useEffect(() => {
@@ -78,12 +81,17 @@ const Options: React.FC = () => {
       const result = await chrome.storage.local.get([
         HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
         HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS,
+        HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS,
       ]);
       setHighlightGlobalDisabled(result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || false);
       setHighlightDisabledDomains(result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] || []);
+      // 排除网址：如果未设置过，使用预设值
+      const excludedUrls = result[HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS];
+      setHighlightExcludedUrls(excludedUrls !== undefined ? excludedUrls : DEFAULT_EXCLUDED_URLS);
       // 保存原始值
       setOriginalHighlightGlobalDisabled(result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || false);
       setOriginalHighlightDisabledDomains(result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] || []);
+      setOriginalHighlightExcludedUrls(excludedUrls !== undefined ? excludedUrls : DEFAULT_EXCLUDED_URLS);
     } catch (error) {
       console.error('[Options] Failed to load highlight disable state:', error);
     }
@@ -120,9 +128,12 @@ const Options: React.FC = () => {
       } else {
         await chrome.storage.local.remove(HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS);
       }
+      // 保存排除网址
+      await chrome.storage.local.set({ [HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS]: highlightExcludedUrls });
       // 更新原始划线状态
       setOriginalHighlightGlobalDisabled(highlightGlobalDisabled);
       setOriginalHighlightDisabledDomains(highlightDisabledDomains);
+      setOriginalHighlightExcludedUrls(highlightExcludedUrls);
 
       setHasChanges(false);
     } finally {
@@ -135,6 +146,7 @@ const Options: React.FC = () => {
     // 同时重置划线禁用状态
     setHighlightGlobalDisabled(false);
     setHighlightDisabledDomains([]);
+    setHighlightExcludedUrls(DEFAULT_EXCLUDED_URLS);
   };
 
   const handleTestConnection = async () => {
@@ -591,6 +603,92 @@ const Options: React.FC = () => {
                 目前没有禁用的网站。您可以在网页上通过关闭按钮来禁用特定网站的划线功能。
               </p>
             )}
+
+            {/* Excluded URLs Section */}
+            <div className="border-t border-gray-100 pt-4 mt-4">
+              <div className="mb-3">
+                <p className="text-sm font-medium text-text-primary">排除网址（URL 前缀匹配）</p>
+                <p className="text-xs text-text-secondary mt-0.5">在以下网址开头的页面中不显示划线按钮</p>
+              </div>
+
+              {/* Add new URL */}
+              <div className="flex gap-2 mb-3">
+                <input
+                  type="text"
+                  className="input flex-1 text-sm"
+                  placeholder="输入网址，如 https://example.com/path"
+                  value={newExcludedUrl}
+                  onChange={(e) => setNewExcludedUrl(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newExcludedUrl.trim()) {
+                      if (!highlightExcludedUrls.includes(newExcludedUrl.trim())) {
+                        setHighlightExcludedUrls([...highlightExcludedUrls, newExcludedUrl.trim()]);
+                      }
+                      setNewExcludedUrl('');
+                    }
+                  }}
+                />
+                <button
+                  className="btn-secondary text-sm px-3"
+                  onClick={() => {
+                    if (newExcludedUrl.trim() && !highlightExcludedUrls.includes(newExcludedUrl.trim())) {
+                      setHighlightExcludedUrls([...highlightExcludedUrls, newExcludedUrl.trim()]);
+                      setNewExcludedUrl('');
+                    }
+                  }}
+                  disabled={!newExcludedUrl.trim()}
+                >
+                  添加
+                </button>
+              </div>
+
+              {/* Excluded URLs List */}
+              {highlightExcludedUrls.length > 0 && (
+                <div className="p-3 bg-gray-50 rounded-lg border border-gray-100">
+                  <div className="space-y-2">
+                    {highlightExcludedUrls.map((url) => (
+                      <div key={url} className="flex items-center justify-between text-sm">
+                        <span className="text-text-secondary truncate flex-1 mr-2" title={url}>{url}</span>
+                        <button
+                          className="text-xs text-red-500 hover:text-red-700 shrink-0"
+                          onClick={() => {
+                            setHighlightExcludedUrls(highlightExcludedUrls.filter(u => u !== url));
+                          }}
+                        >
+                          移除
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-3 mt-3 pt-3 border-t border-gray-200">
+                    <button
+                      className="text-xs text-text-secondary hover:text-text-primary"
+                      onClick={() => setHighlightExcludedUrls(DEFAULT_EXCLUDED_URLS)}
+                    >
+                      恢复默认
+                    </button>
+                    <button
+                      className="text-xs text-red-500 hover:text-red-700"
+                      onClick={() => setHighlightExcludedUrls([])}
+                    >
+                      清空全部
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {highlightExcludedUrls.length === 0 && (
+                <p className="text-xs text-text-secondary">
+                  没有排除的网址。
+                  <button
+                    className="text-brand-primary hover:underline ml-1"
+                    onClick={() => setHighlightExcludedUrls(DEFAULT_EXCLUDED_URLS)}
+                  >
+                    恢复默认
+                  </button>
+                </p>
+              )}
+            </div>
           </div>
         </div>
 

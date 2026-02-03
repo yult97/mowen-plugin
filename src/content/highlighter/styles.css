@@ -25,6 +25,14 @@
   opacity: 0;
   animation: mowen-toolbar-fadein 0.2s ease-out forwards;
   user-select: none;
+  cursor: move; /* 提示可拖动 */
+  transition: box-shadow 0.15s ease;
+}
+
+/* 拖动中状态 */
+.mowen-selection-toolbar.mowen-toolbar-dragging {
+  box-shadow: 0 8px 32px rgba(17, 24, 39, 0.25);
+  cursor: grabbing;
 }
 
 @keyframes mowen-toolbar-fadein {

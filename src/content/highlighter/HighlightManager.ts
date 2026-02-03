@@ -7,7 +7,7 @@
  * 3. 与 Background 通信进行保存
  */
 
-import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult, HIGHLIGHT_STORAGE_KEYS } from '../../types';
+import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult, HIGHLIGHT_STORAGE_KEYS, DEFAULT_EXCLUDED_URLS } from '../../types';
 import { SelectionToolbar, SelectionToolbarCallbacks } from './SelectionToolbar';
 import { SelectionInfo } from './types';
 
@@ -32,15 +32,22 @@ export class HighlightManager {
   private isEnabled: boolean = true;
   private isApiKeyConfigured: boolean = false;
   private styleElement: HTMLStyleElement | null = null;
+  // 会话级别隐藏标志：用于"隐藏直到下次访问"功能
+  // 用户刷新页面后会重置为 false
+  private sessionHidden: boolean = false;
   // 内存锁：防止并发创建多个笔记
-  // Key: pageKey, Value: Promise<{noteId, noteUrl} | null>
+  // Key: pageKey, Value: Promise<{noteId, noteUrl} | null> // 等待笔记创建的 Promise，用于并发控制
   private pendingNoteCreation: Map<string, Promise<{ noteId: string; noteUrl: string } | null>> = new Map();
+  // URL 变化检测
+  private lastUrl: string = '';
+  private urlCheckInterval: number | null = null;
 
   constructor() {
     // 创建工具栏回调
     const callbacks: SelectionToolbarCallbacks = {
       onSave: (selectionInfo) => this.handleSave(selectionInfo),
       onClose: () => this.clearSelection(),
+      onSessionHide: () => this.handleSessionHide(),
       onConfigureKey: () => this.openOptionsPage(),
       onDisable: (type) => this.handleDisable(type),
       onOpenSettings: () => this.openOptionsPage(),
@@ -54,6 +61,7 @@ export class HighlightManager {
     this.checkApiKey();
     this.checkDisableState();  // 检查禁用状态
     this.bindStorageListener();  // 监听存储变化（多标签页同步）
+    this.bindUrlChangeListener();  // 监听 URL 变化（SPA 路由切换）
   }
 
   /**
@@ -74,6 +82,7 @@ export class HighlightManager {
     this.removeStyles();
     this.unbindEvents();
     this.unbindStorageListener();
+    this.unbindUrlChangeListener();
   }
 
   /**
@@ -91,13 +100,41 @@ export class HighlightManager {
   }
 
   /**
+   * 绑定 URL 变化监听器（SPA 路由切换）
+   */
+  private bindUrlChangeListener(): void {
+    this.lastUrl = window.location.href;
+    // 使用定时器检测 URL 变化（兼容各种 SPA 路由方案）
+    this.urlCheckInterval = window.setInterval(() => {
+      const currentUrl = window.location.href;
+      if (currentUrl !== this.lastUrl) {
+        console.log('[Highlighter] 🔄 URL changed, re-checking disable state...');
+        this.lastUrl = currentUrl;
+        this.checkDisableState();
+      }
+    }, 500);  // 每 500ms 检查一次
+  }
+
+  /**
+   * 解绑 URL 变化监听器
+   */
+  private unbindUrlChangeListener(): void {
+    if (this.urlCheckInterval !== null) {
+      window.clearInterval(this.urlCheckInterval);
+      this.urlCheckInterval = null;
+    }
+  }
+
+  /**
    * 处理存储变化（多标签页同步禁用状态）
    */
   private handleStorageChange = (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string): void => {
     if (areaName !== 'local') return;
 
-    // 检查是否是禁用状态变化
-    if (changes[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || changes[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]) {
+    // 检查是否是禁用状态变化（包括排除网址变化）
+    if (changes[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] ||
+      changes[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] ||
+      changes[HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS]) {
       console.log('[Highlighter] 🔄 Storage changed, re-checking disable state...');
       this.checkDisableState();
     }
@@ -111,10 +148,13 @@ export class HighlightManager {
       const result = await chrome.storage.local.get([
         HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
         HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS,
+        HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS,
       ]);
 
       const globalDisabled = result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] as boolean | undefined;
       const disabledDomains = result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] as string[] | undefined;
+      // 排除的 URL 前缀列表，默认使用预设值
+      const excludedUrls = (result[HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS] as string[] | undefined) ?? DEFAULT_EXCLUDED_URLS;
 
       // 全局禁用检查
       if (globalDisabled) {
@@ -128,6 +168,17 @@ export class HighlightManager {
         const currentDomain = window.location.hostname;
         if (disabledDomains.includes(currentDomain)) {
           console.log('[Highlighter] 🚫 Domain disabled:', currentDomain);
+          this.setEnabled(false);
+          return;
+        }
+      }
+
+      // URL 前缀排除检查
+      if (excludedUrls && excludedUrls.length > 0) {
+        const currentUrl = window.location.href;
+        const isExcluded = excludedUrls.some(url => currentUrl.startsWith(url));
+        if (isExcluded) {
+          console.log('[Highlighter] 🚫 URL excluded:', currentUrl);
           this.setEnabled(false);
           return;
         }
@@ -169,6 +220,18 @@ export class HighlightManager {
       console.error('[Highlighter] Failed to disable:', error);
       this.showToast('禁用失败，请重试', 'error');
     }
+  }
+
+  /**
+   * 处理"隐藏直到下次访问"操作
+   * 设置会话级别隐藏标志，刷新页面后重置
+   */
+  private handleSessionHide(): void {
+    this.sessionHidden = true;
+    this.toolbar.hide();
+    this.clearSelection();
+    console.log('[Highlighter] Session hidden until next visit');
+    this.showToast('已隐藏，刷新页面后恢复', 'success');
   }
 
   /**
@@ -548,7 +611,8 @@ export class HighlightManager {
    * 处理鼠标抬起事件
    */
   private handleMouseUp = (event: MouseEvent): void => {
-    if (!this.isEnabled) return;
+    // 检查是否被禁用或会话级别隐藏
+    if (!this.isEnabled || this.sessionHidden) return;
 
     // 延迟执行，确保选区已更新（双击选中需要更长时间）
     setTimeout(() => {

@@ -251,6 +251,7 @@ export interface HighlightNoteCache {
 export interface HighlightDisableState {
   globalDisabled: boolean;           // 全局禁用
   disabledDomains: string[];         // 被禁用的域名列表
+  excludedUrls: string[];            // 排除的 URL 前缀列表
 }
 
 /**
@@ -261,4 +262,14 @@ export const HIGHLIGHT_STORAGE_KEYS = {
   GLOBAL_DISABLED: 'highlight_disabled',
   /** 被禁用的域名列表 */
   DISABLED_DOMAINS: 'highlight_disabled_domains',
+  /** 排除的 URL 前缀列表 */
+  EXCLUDED_URLS: 'highlight_excluded_urls',
 } as const;
+
+/**
+ * 预设排除网址（墨问编辑器）
+ */
+export const DEFAULT_EXCLUDED_URLS: string[] = [
+  'https://note.mowen.cn/editor',
+  'https://dev-note.mowen.cn/editor',
+];

@@ -7,7 +7,7 @@
 
 import { Readability } from '@mozilla/readability';
 import { ExtractResult, ContentBlock } from '../types';
-import { generateId, isWeixinArticle, getDomain, stripHtml } from '../utils/helpers';
+import { generateId, isWeixinArticle, getDomain, stripHtml, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 import { extractImages } from './images';
 import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
 // import { normalizeReadabilityHtml } from './extractor-utils'; // Defined internally
@@ -99,7 +99,7 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
     const authorEl = document.querySelector('#js_name') as HTMLElement;
     const publishTimeEl = document.querySelector('#publish_time') as HTMLElement;
 
-    const title = titleEl?.innerText?.trim() || document.title;
+    let title = titleEl?.innerText?.trim() || document.title;
     const author = authorEl?.innerText?.trim();
     const publishTime = publishTimeEl?.innerText?.trim();
 
@@ -111,6 +111,33 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
         cleanContent(contentClone);
         contentHtml = contentClone.innerHTML;
         blocks = parseBlocks(contentClone);
+    }
+
+    // 处理无标题情况：从正文中提取第一句话作为标题
+    if (!isValidPageTitle(title)) {
+        const plainText = stripHtml(contentHtml);
+        const extracted = extractTitleFromText(plainText, 30);
+        if (extracted.title) {
+            title = extracted.title;
+            // 从正文中移除已提取的标题部分
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = contentHtml;
+            // 获取纯标题文本（去除省略号）
+            const titleText = extracted.title.replace(/\.{3}$/, '').trim();
+            // 遍历所有块级元素，找到包含标题文本的第一个元素
+            const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
+            for (const block of allBlocks) {
+                const blockText = block.textContent?.trim() || '';
+                // 只匹配小块的元素（避免移除整个容器）
+                if (blockText.length < 200 && blockText.startsWith(titleText)) {
+                    block.remove();
+                    contentHtml = tempDiv.innerHTML;
+                    blocks = parseBlocks(tempDiv);
+                    break;
+                }
+            }
+            console.log('[extractor] 📝 Extracted title from content:', title);
+        }
     }
 
     const images = extractImages(contentEl || document.body);
@@ -164,8 +191,34 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
     console.log('[extractor] ✅ Readability parsed successfully');
 
     let contentHtml = article.content;
-    const title = article.title || document.title;
+    let title = article.title || document.title;
     const author = article.byline || undefined;
+
+    // 处理无标题情况：从正文中提取第一句话作为标题
+    if (!isValidPageTitle(title)) {
+        const plainText = stripHtml(contentHtml);
+        const extracted = extractTitleFromText(plainText, 30);
+        if (extracted.title) {
+            title = extracted.title;
+            // 从正文中移除已提取的标题部分
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = contentHtml;
+            // 获取纯标题文本（去除省略号）
+            const titleText = extracted.title.replace(/\.{3}$/, '').trim();
+            // 遍历所有块级元素，找到包含标题文本的第一个元素
+            const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
+            for (const block of allBlocks) {
+                const blockText = block.textContent?.trim() || '';
+                // 只匹配小块的元素（避免移除整个容器）
+                if (blockText.length < 200 && blockText.startsWith(titleText)) {
+                    block.remove();
+                    contentHtml = tempDiv.innerHTML;
+                    break;
+                }
+            }
+            console.log('[extractor] 📝 Extracted title from content:', title);
+        }
+    }
 
     // 辅助函数：提取 URL 路径用于对比（忽略协议和域名）
     // 例如 "http://www.latepost.com/uploads/cover/abc.png" -> "/uploads/cover/abc.png"

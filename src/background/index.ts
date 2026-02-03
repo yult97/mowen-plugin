@@ -11,7 +11,7 @@ import {
   Highlight,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
-import { sleep } from '../utils/helpers';
+import { sleep, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 
 import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
@@ -456,7 +456,7 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
   console.log('[墨问 Background] 📝 Creating new highlight note');
 
   // 构建划线内容 HTML（用于创建新笔记）
-  const highlightHtml = formatHighlightContent(highlight);
+  let highlightHtml = formatHighlightContent(highlight);
 
   // URL 安全验证：仅允许 http/https 协议
   const isValidUrl = (url: string): boolean => {
@@ -469,7 +469,25 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
   };
   const safeSourceUrl = isValidUrl(highlight.sourceUrl) ? highlight.sourceUrl : '';
 
-  const title = `划线笔记：${highlight.pageTitle.substring(0, 50)}`;
+  // 标题生成逻辑：
+  // 1. 如果页面标题有效，使用 "划线笔记：{页面标题（截取30字）}"
+  // 2. 如果页面标题无效，从划线内容中提取前 30 字作为标题
+  // 注意：正文始终保留原始 HTML 格式（包括链接），不再从正文中移除标题文本
+  let title: string;
+  if (isValidPageTitle(highlight.pageTitle)) {
+    // 页面标题有效，但也需要限制长度为30字
+    const truncatedTitle = highlight.pageTitle.length > 30
+      ? highlight.pageTitle.substring(0, 30) + '...'
+      : highlight.pageTitle;
+    title = `划线笔记：${truncatedTitle}`;
+    console.log('[墨问 Background] ✅ Using page title (truncated):', title);
+  } else {
+    // 从划线内容中提取标题
+    const { title: extractedTitle } = extractTitleFromText(highlight.text, 30);
+    title = `划线笔记：${extractedTitle || '未命名'}`;
+    console.log('[墨问 Background] 📝 Extracted title from content:', extractedTitle);
+  }
+
   // 格式：标题 + 来源链接（由 createNote 统一添加）+ 时间引用 + 👇划线内容 + 空行 + 划线内容
   // 注意：来源链接通过 sourceUrl 参数传递给 createNote，与剪藏笔记保持一致的处理方式
   const content = `

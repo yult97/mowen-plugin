@@ -1023,6 +1023,12 @@ function extractImageData(imgTag: string): ImageData | null {
     finalAlt = decodeHtmlEntities(dataCaptionMatch[1]);
   }
 
+  // 过滤无意义的默认 alt 值
+  const meaninglessAltWords = ['图片', 'image', 'picture', 'photo', 'img', '视频', 'video', '动图', 'gif'];
+  if (meaninglessAltWords.includes(finalAlt.trim().toLowerCase()) || meaninglessAltWords.includes(finalAlt.trim())) {
+    finalAlt = '';
+  }
+
   return {
     src: srcMatch[1],
     alt: finalAlt,

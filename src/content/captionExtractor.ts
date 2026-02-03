@@ -155,6 +155,21 @@ function isValidCaption(text: string | null, isWeakSignal = false): boolean {
     if (text.length < 2) return false; // 太短
     if (text.length > 80) return false; // 太长，可能是正文
 
+    // 2. 无意义的默认标注词（直接排除）
+    const meaninglessWords = [
+        '图片', 'image', 'picture', 'photo', 'img',
+        '视频', 'video',
+        '动图', 'gif',
+        '点击查看大图', '点击放大',
+    ];
+
+    const trimmedText = text.trim();
+
+    // 如果整个文本就是这些无意义的词，直接排除
+    if (meaninglessWords.some(w => trimmedText === w || trimmedText.toLowerCase() === w.toLowerCase())) {
+        return false;
+    }
+
     // 2. 关键词过滤 (Stopwords)
     const stopWords = [
         '点击', 'click', '查看', 'view', '更多', 'more',
