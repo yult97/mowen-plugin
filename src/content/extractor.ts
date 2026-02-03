@@ -129,7 +129,8 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
             for (const block of allBlocks) {
                 const blockText = block.textContent?.trim() || '';
                 // 只匹配小块的元素（避免移除整个容器）
-                if (blockText.length < 200 && blockText.startsWith(titleText)) {
+                // 额外检查：确保元素内容基本等于标题文本（允许少量差异）
+                if (blockText.length < 200 && blockText.length < titleText.length * 2 && blockText.startsWith(titleText)) {
                     block.remove();
                     contentHtml = tempDiv.innerHTML;
                     blocks = parseBlocks(tempDiv);
@@ -210,7 +211,8 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
             for (const block of allBlocks) {
                 const blockText = block.textContent?.trim() || '';
                 // 只匹配小块的元素（避免移除整个容器）
-                if (blockText.length < 200 && blockText.startsWith(titleText)) {
+                // 额外检查：确保元素内容基本等于标题文本（允许少量差异）
+                if (blockText.length < 200 && blockText.length < titleText.length * 2 && blockText.startsWith(titleText)) {
                     block.remove();
                     contentHtml = tempDiv.innerHTML;
                     break;
