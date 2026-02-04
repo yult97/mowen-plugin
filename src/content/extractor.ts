@@ -7,7 +7,7 @@
 
 import { Readability } from '@mozilla/readability';
 import { ExtractResult, ContentBlock } from '../types';
-import { generateId, isWeixinArticle, getDomain, stripHtml } from '../utils/helpers';
+import { generateId, isWeixinArticle, getDomain, stripHtml, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 import { extractImages } from './images';
 import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
 // import { normalizeReadabilityHtml } from './extractor-utils'; // Defined internally
@@ -99,7 +99,7 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
     const authorEl = document.querySelector('#js_name') as HTMLElement;
     const publishTimeEl = document.querySelector('#publish_time') as HTMLElement;
 
-    const title = titleEl?.innerText?.trim() || document.title;
+    let title = titleEl?.innerText?.trim() || document.title;
     const author = authorEl?.innerText?.trim();
     const publishTime = publishTimeEl?.innerText?.trim();
 
@@ -111,6 +111,41 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
         cleanContent(contentClone);
         contentHtml = contentClone.innerHTML;
         blocks = parseBlocks(contentClone);
+    }
+
+    // 处理无标题情况：从正文中提取第一句话作为标题
+    if (!isValidPageTitle(title)) {
+        const plainText = stripHtml(contentHtml);
+        const extracted = extractTitleFromText(plainText, 30);
+        if (extracted.title) {
+            title = extracted.title;
+            // 从正文中移除已提取的标题部分
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = contentHtml;
+            // 获取纯标题文本（去除省略号）
+            const titleText = extracted.title.replace(/\.{3}$/, '').trim();
+            // 遍历所有块级元素，找到包含标题文本的第一个元素
+            const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
+            for (const block of allBlocks) {
+                const blockText = block.textContent?.trim() || '';
+                // 严格匹配条件：
+                // 1. 元素内容不超过 100 字符（避免匹配到大块内容）
+                // 2. 元素内容长度在标题长度的 1.2 倍以内（允许标点符号差异）
+                // 3. 元素内容必须以标题文本开头
+                // 4. 避免误删：元素内容不能比标题长很多（可能是包含标题的正文段落）
+                const isExactMatch = blockText.length <= titleText.length * 1.2;
+                const isSmallBlock = blockText.length < 100;
+                const startsWithTitle = blockText.startsWith(titleText);
+
+                if (isSmallBlock && isExactMatch && startsWithTitle) {
+                    block.remove();
+                    contentHtml = tempDiv.innerHTML;
+                    blocks = parseBlocks(tempDiv);
+                    break;
+                }
+            }
+            console.log('[extractor] 📝 Extracted title from content:', title);
+        }
     }
 
     const images = extractImages(contentEl || document.body);
@@ -164,8 +199,42 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
     console.log('[extractor] ✅ Readability parsed successfully');
 
     let contentHtml = article.content;
-    const title = article.title || document.title;
+    let title = article.title || document.title;
     const author = article.byline || undefined;
+
+    // 处理无标题情况：从正文中提取第一句话作为标题
+    if (!isValidPageTitle(title)) {
+        const plainText = stripHtml(contentHtml);
+        const extracted = extractTitleFromText(plainText, 30);
+        if (extracted.title) {
+            title = extracted.title;
+            // 从正文中移除已提取的标题部分
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = contentHtml;
+            // 获取纯标题文本（去除省略号）
+            const titleText = extracted.title.replace(/\.{3}$/, '').trim();
+            // 遍历所有块级元素，找到包含标题文本的第一个元素
+            const allBlocks = tempDiv.querySelectorAll('p, div, section, span');
+            for (const block of allBlocks) {
+                const blockText = block.textContent?.trim() || '';
+                // 严格匹配条件：
+                // 1. 元素内容不超过 100 字符（避免匹配到大块内容）
+                // 2. 元素内容长度在标题长度的 1.2 倍以内（允许标点符号差异）
+                // 3. 元素内容必须以标题文本开头
+                // 4. 避免误删：元素内容不能比标题长很多（可能是包含标题的正文段落）
+                const isExactMatch = blockText.length <= titleText.length * 1.2;
+                const isSmallBlock = blockText.length < 100;
+                const startsWithTitle = blockText.startsWith(titleText);
+
+                if (isSmallBlock && isExactMatch && startsWithTitle) {
+                    block.remove();
+                    contentHtml = tempDiv.innerHTML;
+                    break;
+                }
+            }
+            console.log('[extractor] 📝 Extracted title from content:', title);
+        }
+    }
 
     // 辅助函数：提取 URL 路径用于对比（忽略协议和域名）
     // 例如 "http://www.latepost.com/uploads/cover/abc.png" -> "/uploads/cover/abc.png"
@@ -231,6 +300,25 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
                 }
             });
         }
+    }
+
+    // 5.6 【新增】移除正文中的重复标题
+    // 某些网站（如纽约时报中文网）的 <h1> 标题位于 <article> 内部，
+    // 导致 Readability 将其作为正文一部分提取，与 title 字段重复。
+    // 在此移除与 title 完全匹配的 h1 元素。
+    {
+        const tempDivForH1 = document.createElement('div');
+        tempDivForH1.innerHTML = contentHtml;
+        const h1Elements = tempDivForH1.querySelectorAll('h1');
+        h1Elements.forEach(h1 => {
+            const h1Text = h1.textContent?.trim() || '';
+            // 如果 h1 内容与标题完全匹配或为空，则移除
+            if (h1Text === title || h1Text === '') {
+                console.log('[extractor] 🗑️ Removing duplicate h1 from content:', h1Text.substring(0, 30));
+                h1.remove();
+            }
+        });
+        contentHtml = tempDivForH1.innerHTML;
     }
 
     // 6. HTML 规范化 (Post-processing)

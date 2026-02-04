@@ -41,6 +41,7 @@ export type ToolbarState = 'idle' | 'saving' | 'success' | 'error';
 export interface SelectionToolbarCallbacks {
     onSave: (selectionInfo: SelectionInfo) => Promise<{ success: boolean; noteUrl?: string; isAppend?: boolean; error?: string }>;
     onClose: () => void;
+    onSessionHide: () => void;
     onConfigureKey: () => void;
     onDisable: (type: 'domain' | 'global') => void;
     onOpenSettings: () => void;
@@ -55,6 +56,11 @@ export class SelectionToolbar {
     private hideTimeout: ReturnType<typeof setTimeout> | null = null;
     private resetTimeout: ReturnType<typeof setTimeout> | null = null;
     private disableMenu: HTMLDivElement | null = null;
+
+    // 拖动功能相关状态
+    private isDragging = false;
+    private dragOffset = { x: 0, y: 0 };
+    private hasBeenDragged = false; // 记录用户是否拖动过工具栏
 
     constructor(callbacks: SelectionToolbarCallbacks) {
         this.callbacks = callbacks;
@@ -80,16 +86,19 @@ export class SelectionToolbar {
             this.resetTimeout = null;
         }
 
-        // 计算位置
-        const position = this.calculatePosition(selectionInfo.rect);
-
         // 创建或更新工具栏
         if (!this.container) {
             this.createToolbar();
+            this.hasBeenDragged = false; // 新创建时重置拖动状态
         }
 
         this.updateToolbar();
-        this.setPosition(position);
+
+        // 只有在未拖动过时才重新计算位置，保留用户拖动后的位置
+        if (!this.hasBeenDragged) {
+            const position = this.calculatePosition(selectionInfo.rect);
+            this.setPosition(position);
+        }
 
         if (this.container) {
             this.container.style.display = 'flex';
@@ -101,16 +110,25 @@ export class SelectionToolbar {
      * 隐藏工具栏
      */
     hide(): void {
+        // 清除之前的隐藏定时器，避免多次调用时冲突
+        if (this.hideTimeout) {
+            clearTimeout(this.hideTimeout);
+            this.hideTimeout = null;
+        }
         if (this.container) {
+            // 添加淡出动画类
             this.container.classList.add('mowen-toolbar-fadeout');
+            // 动画结束后隐藏元素（与 CSS 动画时间同步：100ms）
             this.hideTimeout = setTimeout(() => {
                 if (this.container) {
                     this.container.style.display = 'none';
+                    this.container.classList.remove('mowen-toolbar-fadeout');
                 }
-            }, 150);
+            }, 100);
         }
         this.currentSelection = null;
         this.state = 'idle';
+        this.hasBeenDragged = false; // 隐藏时重置拖动状态
     }
 
     /**
@@ -174,10 +192,106 @@ export class SelectionToolbar {
         // 阻止工具栏点击冒泡，避免触发外部点击隐藏
         this.container.addEventListener('mousedown', (e) => {
             e.stopPropagation();
+            // 启动拖动（整个区域都可拖动）
+            this.startDrag(e);
         });
 
         document.body.appendChild(this.container);
     }
+
+    // 记录拖动起始位置，用于区分点击和拖动
+    private dragStartPos = { x: 0, y: 0 };
+    private hasMoved = false;
+    private dragTarget: HTMLElement | null = null;
+
+    /**
+     * 启动拖动
+     */
+    private startDrag(e: MouseEvent): void {
+        if (!this.container) return;
+
+        // 记录点击目标，用于后续判断是否触发点击事件
+        this.dragTarget = e.target as HTMLElement;
+
+        this.isDragging = true;
+        this.hasMoved = false;
+        this.container.classList.add('mowen-toolbar-dragging');
+
+        // 记录起始位置
+        this.dragStartPos = { x: e.clientX, y: e.clientY };
+
+        // 记录鼠标在工具栏内的偏移位置
+        const rect = this.container.getBoundingClientRect();
+        this.dragOffset = {
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top
+        };
+
+        // 绑定全局事件
+        document.addEventListener('mousemove', this.handleDragMove);
+        document.addEventListener('mouseup', this.handleDragEnd);
+    }
+
+    /**
+     * 拖动移动处理
+     */
+    private handleDragMove = (e: MouseEvent): void => {
+        if (!this.isDragging || !this.container) return;
+
+        // 检测是否有实际移动（超过 5px 阈值）
+        const dx = e.clientX - this.dragStartPos.x;
+        const dy = e.clientY - this.dragStartPos.y;
+        if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+            this.hasMoved = true;
+            this.hasBeenDragged = true; // 标记用户已拖动过
+        }
+
+        if (!this.hasMoved) return; // 没有足够移动，不更新位置
+
+        e.preventDefault();
+
+        const padding = 10;
+        const containerRect = this.container.getBoundingClientRect();
+
+        // 计算新位置
+        let newLeft = e.clientX - this.dragOffset.x;
+        let newTop = e.clientY - this.dragOffset.y;
+
+        // 边界约束
+        newLeft = Math.max(padding, Math.min(newLeft, window.innerWidth - containerRect.width - padding));
+        newTop = Math.max(padding, Math.min(newTop, window.innerHeight - containerRect.height - padding));
+
+        this.container.style.left = `${newLeft}px`;
+        this.container.style.top = `${newTop}px`;
+    };
+
+    /**
+     * 拖动结束处理
+     */
+    private handleDragEnd = (): void => {
+        if (!this.container) return;
+
+        this.isDragging = false;
+        this.container.classList.remove('mowen-toolbar-dragging');
+
+        // 移除全局事件
+        document.removeEventListener('mousemove', this.handleDragMove);
+        document.removeEventListener('mouseup', this.handleDragEnd);
+
+        // 如果没有移动，视为点击，触发对应按钮的功能
+        if (!this.hasMoved && this.dragTarget) {
+            const saveBtn = this.dragTarget.closest('.mowen-toolbar-save-btn');
+            const closeBtn = this.dragTarget.closest('.mowen-toolbar-close-btn');
+
+            if (saveBtn && !saveBtn.hasAttribute('disabled')) {
+                this.handleSave();
+            } else if (closeBtn) {
+                this.showDisableMenu();
+            }
+        }
+
+        this.dragTarget = null;
+    };
 
     /**
      * 更新工具栏内容
@@ -195,12 +309,8 @@ export class SelectionToolbar {
                 <button class="mowen-toolbar-close-btn">${CLOSE_ICON_SVG}</button>
             `;
 
-            // 绑定配置按钮事件
-            const configBtn = this.container.querySelector('.mowen-toolbar-save-btn');
-            configBtn?.addEventListener('click', () => {
-                this.callbacks.onConfigureKey();
-                this.hide();
-            });
+            // 配置按钮的点击事件由 handleDragEnd 统一处理
+            // 保留引用以便后续可能需要
         } else {
             // 正常状态 - 胶囊按钮（图标 + 文案）
             const buttonContent = this.getButtonContent();
@@ -214,9 +324,7 @@ export class SelectionToolbar {
                 <button class="mowen-toolbar-close-btn">${CLOSE_ICON_SVG}</button>
             `;
 
-            // 绑定保存按钮事件
-            const saveBtn = this.container.querySelector('.mowen-toolbar-save-btn');
-            saveBtn?.addEventListener('click', () => this.handleSave());
+            // 保存按钮的点击事件由 handleDragEnd 统一处理（通过移动距离区分点击/拖动）
         }
 
         // 绑定关闭按钮事件（单击弹出菜单）
@@ -282,10 +390,9 @@ export class SelectionToolbar {
             item.addEventListener('click', (e) => {
                 const action = (e.target as HTMLElement).getAttribute('data-action') as 'session' | 'domain' | 'global';
                 if (action === 'session') {
-                    // 隐藏直到下次访问：直接关闭工具栏
-                    this.callbacks.onClose();
+                    // 隐藏直到下次访问：设置会话级别隐藏状态
+                    this.callbacks.onSessionHide();
                     this.hideDisableMenu();
-                    this.hide();
                 } else if (action) {
                     this.callbacks.onDisable(action);
                     this.hideDisableMenu();

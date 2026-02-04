@@ -7,7 +7,7 @@
  * 3. 与 Background 通信进行保存
  */
 
-import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult, HIGHLIGHT_STORAGE_KEYS } from '../../types';
+import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResult, HIGHLIGHT_STORAGE_KEYS, DEFAULT_EXCLUDED_URLS } from '../../types';
 import { SelectionToolbar, SelectionToolbarCallbacks } from './SelectionToolbar';
 import { SelectionInfo } from './types';
 
@@ -32,15 +32,22 @@ export class HighlightManager {
   private isEnabled: boolean = true;
   private isApiKeyConfigured: boolean = false;
   private styleElement: HTMLStyleElement | null = null;
+  // 会话级别隐藏标志：用于"隐藏直到下次访问"功能
+  // 用户刷新页面后会重置为 false
+  private sessionHidden: boolean = false;
   // 内存锁：防止并发创建多个笔记
-  // Key: pageKey, Value: Promise<{noteId, noteUrl} | null>
+  // Key: pageKey, Value: Promise<{noteId, noteUrl} | null> // 等待笔记创建的 Promise，用于并发控制
   private pendingNoteCreation: Map<string, Promise<{ noteId: string; noteUrl: string } | null>> = new Map();
+  // URL 变化检测
+  private lastUrl: string = '';
+  private urlCheckInterval: number | null = null;
 
   constructor() {
     // 创建工具栏回调
     const callbacks: SelectionToolbarCallbacks = {
       onSave: (selectionInfo) => this.handleSave(selectionInfo),
       onClose: () => this.clearSelection(),
+      onSessionHide: () => this.handleSessionHide(),
       onConfigureKey: () => this.openOptionsPage(),
       onDisable: (type) => this.handleDisable(type),
       onOpenSettings: () => this.openOptionsPage(),
@@ -54,6 +61,7 @@ export class HighlightManager {
     this.checkApiKey();
     this.checkDisableState();  // 检查禁用状态
     this.bindStorageListener();  // 监听存储变化（多标签页同步）
+    this.bindUrlChangeListener();  // 监听 URL 变化（SPA 路由切换）
   }
 
   /**
@@ -74,6 +82,7 @@ export class HighlightManager {
     this.removeStyles();
     this.unbindEvents();
     this.unbindStorageListener();
+    this.unbindUrlChangeListener();
   }
 
   /**
@@ -91,13 +100,48 @@ export class HighlightManager {
   }
 
   /**
+   * 绑定 URL 变化监听器（SPA 路由切换）
+   */
+  private bindUrlChangeListener(): void {
+    this.lastUrl = window.location.href;
+    // 使用定时器检测 URL 变化（兼容各种 SPA 路由方案）
+    this.urlCheckInterval = window.setInterval(() => {
+      const currentUrl = window.location.href;
+      if (currentUrl !== this.lastUrl) {
+        console.log('[Highlighter] 🔄 URL changed, re-checking disable state...');
+        this.lastUrl = currentUrl;
+        // SPA 路由切换时重置 sessionHidden 标志
+        // 这样从被排除的页面（如 editor）切换到正常页面（如 detail）后
+        // 划线功能能正常恢复，无需刷新页面
+        if (this.sessionHidden) {
+          console.log('[Highlighter] 🔄 Resetting sessionHidden due to URL change');
+          this.sessionHidden = false;
+        }
+        this.checkDisableState();
+      }
+    }, 500);  // 每 500ms 检查一次
+  }
+
+  /**
+   * 解绑 URL 变化监听器
+   */
+  private unbindUrlChangeListener(): void {
+    if (this.urlCheckInterval !== null) {
+      window.clearInterval(this.urlCheckInterval);
+      this.urlCheckInterval = null;
+    }
+  }
+
+  /**
    * 处理存储变化（多标签页同步禁用状态）
    */
   private handleStorageChange = (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string): void => {
     if (areaName !== 'local') return;
 
-    // 检查是否是禁用状态变化
-    if (changes[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] || changes[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS]) {
+    // 检查是否是禁用状态变化（包括排除网址变化）
+    if (changes[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] ||
+      changes[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] ||
+      changes[HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS]) {
       console.log('[Highlighter] 🔄 Storage changed, re-checking disable state...');
       this.checkDisableState();
     }
@@ -111,10 +155,13 @@ export class HighlightManager {
       const result = await chrome.storage.local.get([
         HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
         HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS,
+        HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS,
       ]);
 
       const globalDisabled = result[HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED] as boolean | undefined;
       const disabledDomains = result[HIGHLIGHT_STORAGE_KEYS.DISABLED_DOMAINS] as string[] | undefined;
+      // 排除的 URL 前缀列表，默认使用预设值
+      const excludedUrls = (result[HIGHLIGHT_STORAGE_KEYS.EXCLUDED_URLS] as string[] | undefined) ?? DEFAULT_EXCLUDED_URLS;
 
       // 全局禁用检查
       if (globalDisabled) {
@@ -128,6 +175,17 @@ export class HighlightManager {
         const currentDomain = window.location.hostname;
         if (disabledDomains.includes(currentDomain)) {
           console.log('[Highlighter] 🚫 Domain disabled:', currentDomain);
+          this.setEnabled(false);
+          return;
+        }
+      }
+
+      // URL 前缀排除检查
+      if (excludedUrls && excludedUrls.length > 0) {
+        const currentUrl = window.location.href;
+        const isExcluded = excludedUrls.some(url => currentUrl.startsWith(url));
+        if (isExcluded) {
+          console.log('[Highlighter] 🚫 URL excluded:', currentUrl);
           this.setEnabled(false);
           return;
         }
@@ -169,6 +227,18 @@ export class HighlightManager {
       console.error('[Highlighter] Failed to disable:', error);
       this.showToast('禁用失败，请重试', 'error');
     }
+  }
+
+  /**
+   * 处理"隐藏直到下次访问"操作
+   * 设置会话级别隐藏标志，刷新页面后重置
+   */
+  private handleSessionHide(): void {
+    this.sessionHidden = true;
+    this.toolbar.hide();
+    this.clearSelection();
+    console.log('[Highlighter] Session hidden until next visit');
+    this.showToast('已隐藏，刷新页面后恢复', 'success');
   }
 
   /**
@@ -226,17 +296,19 @@ export class HighlightManager {
         user-select: none !important;
         box-sizing: border-box !important;
         pointer-events: auto !important;
+        will-change: transform, opacity !important;
       }
       @keyframes mowen-toolbar-fadein {
         from { opacity: 0; transform: translateY(-4px); }
         to { opacity: 1; transform: translateY(-8px); }
       }
       .mowen-toolbar-fadeout {
-        animation: mowen-toolbar-fadeout 0.15s ease-in forwards !important;
+        animation: mowen-toolbar-fadeout 0.1s ease-out forwards !important;
+        pointer-events: none !important;
       }
       @keyframes mowen-toolbar-fadeout {
         from { opacity: 1; transform: translateY(-8px); }
-        to { opacity: 0; transform: translateY(-4px); }
+        to { opacity: 0; transform: translateY(-12px); }
       }
 
       /* ====== 主按钮（胶囊按钮）====== */
@@ -548,7 +620,8 @@ export class HighlightManager {
    * 处理鼠标抬起事件
    */
   private handleMouseUp = (event: MouseEvent): void => {
-    if (!this.isEnabled) return;
+    // 检查是否被禁用或会话级别隐藏
+    if (!this.isEnabled || this.sessionHidden) return;
 
     // 延迟执行，确保选区已更新（双击选中需要更长时间）
     setTimeout(() => {
@@ -726,6 +799,8 @@ export class HighlightManager {
     // 如果没有 existingNoteId，说明要创建新笔记，需要设置锁
     // 使用辅助函数封装释放逻辑，避免 TypeScript 类型推断问题
     let releaseLock: ((result: { noteId: string; noteUrl: string } | null) => void) | undefined;
+    // 标志位：确保锁只释放一次，避免 finally 中重复释放
+    let lockReleased = false;
 
     if (!existingNoteId) {
       const creationPromise = new Promise<{ noteId: string; noteUrl: string } | null>((resolve) => {
@@ -759,7 +834,10 @@ export class HighlightManager {
         console.error('[Highlighter] Save failed: No response from background');
         this.showToast('保存失败：后台服务无响应', 'error');
         // 释放锁
-        releaseLock?.(null);
+        if (releaseLock && !lockReleased) {
+          releaseLock(null);
+          lockReleased = true;
+        }
         return {
           success: false,
           error: '后台服务无响应',
@@ -771,6 +849,11 @@ export class HighlightManager {
         if (!response.noteId || !response.noteUrl) {
           console.error('[Highlighter] ❌ Missing noteId or noteUrl in success response');
           this.showToast('服务返回数据异常', 'error');
+          // 释放锁
+          if (releaseLock && !lockReleased) {
+            releaseLock(null);
+            lockReleased = true;
+          }
           return {
             success: false,
             error: '服务返回数据异常',
@@ -794,7 +877,10 @@ export class HighlightManager {
         await chrome.storage.local.set({ [cacheKey]: newCache });
 
         // 释放锁并传递结果
-        releaseLock?.({ noteId: response.noteId, noteUrl: response.noteUrl });
+        if (releaseLock && !lockReleased) {
+          releaseLock({ noteId: response.noteId, noteUrl: response.noteUrl });
+          lockReleased = true;
+        }
 
         // 显示 Toast（已保存/追加成功）
         this.showToast(
@@ -813,6 +899,11 @@ export class HighlightManager {
         if (response.errorCode === 'NOTE_NOT_FOUND') {
           await chrome.storage.local.remove(cacheKey);
           console.log('[Highlighter] 🗑️ Cache cleared due to note not found');
+        }
+        // 释放锁
+        if (releaseLock && !lockReleased) {
+          releaseLock(null);
+          lockReleased = true;
         }
         this.showToast(response.error || '保存失败', 'error');
         return {
@@ -835,9 +926,10 @@ export class HighlightManager {
         error: errorMsg,
       };
     } finally {
-      // 确保锁一定会被释放
-      if (releaseLock && this.pendingNoteCreation.has(pageKey)) {
+      // 确保锁一定会被释放（仅当尚未释放时）
+      if (releaseLock && !lockReleased && this.pendingNoteCreation.has(pageKey)) {
         releaseLock(null);
+        lockReleased = true;
       }
     }
   }
