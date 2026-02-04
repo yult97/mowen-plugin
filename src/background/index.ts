@@ -11,7 +11,7 @@ import {
   Highlight,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
-import { sleep } from '../utils/helpers';
+import { sleep, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 
 import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
@@ -165,27 +165,88 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'mowen-save-selection' && info.selectionText && tab?.id) {
     console.log('[墨问 Background] 📝 Context menu clicked, selection:', info.selectionText.substring(0, 50));
 
+    const pageUrl = info.pageUrl || tab.url || '';
+    const pageTitle = tab.title || 'Unknown';
+
     // 构造划线数据
     const highlight: Highlight = {
       id: `ctx-${Date.now()}`,
       text: info.selectionText,
-      sourceUrl: info.pageUrl || tab.url || '',
-      pageTitle: tab.title || 'Unknown',
+      sourceUrl: pageUrl,
+      pageTitle: pageTitle,
       createdAt: new Date().toISOString(),
     };
 
     // 获取设置
     const settings = await getSettings();
 
-    // 保存划线
+    // 查询已有笔记缓存（与 HighlightManager 保持一致的逻辑）
+    // 生成缓存 Key：使用 origin + pathname，忽略 hash 和 query
+    const getPageKey = (url: string): string => {
+      try {
+        const urlObj = new URL(url);
+        return `${urlObj.origin}${urlObj.pathname}`;
+      } catch {
+        return url;
+      }
+    };
+    const pageKey = getPageKey(pageUrl);
+    const cacheKey = `highlight_note_${pageKey}`;
+
+    let existingNoteId: string | undefined;
+    let existingBody: Record<string, unknown> | undefined;
+
+    try {
+      const cached = await chrome.storage.local.get([cacheKey]);
+      const existingCache = cached[cacheKey] as {
+        noteId?: string;
+        body?: Record<string, unknown>;
+        expiresAt?: string;
+      } | undefined;
+
+      if (existingCache?.noteId) {
+        // 缓存过期检查（24小时）
+        const isExpired = existingCache.expiresAt && new Date(existingCache.expiresAt) < new Date();
+        if (!isExpired) {
+          existingNoteId = existingCache.noteId;
+          existingBody = existingCache.body;
+          console.log('[墨问 Background] ✅ Found existing noteId for context menu:', existingNoteId);
+        } else {
+          console.log('[墨问 Background] ⚠️ Cache expired for context menu save');
+        }
+      }
+    } catch (error) {
+      console.error('[墨问 Background] Failed to get cache for context menu:', error);
+    }
+
+    // 保存划线（包含缓存信息以支持追加）
     const payload: SaveHighlightPayload = {
       highlight,
       isPublic: settings.defaultPublic,
       enableAutoTag: settings.enableAutoTag,
+      existingNoteId,
+      existingBody,
     };
 
     try {
       const result = await handleSaveHighlight(payload);
+
+      // 更新缓存（如果保存成功）
+      if (result.success && result.noteId) {
+        const newCache = {
+          noteId: result.noteId,
+          noteUrl: result.noteUrl,
+          pageUrl,
+          pageTitle,
+          createdAt: new Date().toISOString(),
+          lastUpdatedAt: new Date().toISOString(),
+          highlightCount: 1,
+          body: result.updatedBody,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        };
+        await chrome.storage.local.set({ [cacheKey]: newCache });
+        console.log('[墨问 Background] ✅ Cache updated for context menu save');
+      }
 
       // 通知 Content Script 显示结果
       if (tab.id) {
@@ -203,6 +264,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     }
   }
 });
+
 
 interface SaveNotePayload {
   extractResult: ExtractResult;
@@ -485,7 +547,7 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
   console.log('[墨问 Background] 📝 Creating new highlight note');
 
   // 构建划线内容 HTML（用于创建新笔记）
-  const highlightHtml = formatHighlightContent(highlight);
+  let highlightHtml = formatHighlightContent(highlight);
 
   // URL 安全验证：仅允许 http/https 协议
   const isValidUrl = (url: string): boolean => {
@@ -498,7 +560,25 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
   };
   const safeSourceUrl = isValidUrl(highlight.sourceUrl) ? highlight.sourceUrl : '';
 
-  const title = `划线笔记：${highlight.pageTitle.substring(0, 50)}`;
+  // 标题生成逻辑：
+  // 1. 如果页面标题有效，使用 "划线笔记：{页面标题（截取30字）}"
+  // 2. 如果页面标题无效，从划线内容中提取前 30 字作为标题
+  // 注意：正文始终保留原始 HTML 格式（包括链接），不再从正文中移除标题文本
+  let title: string;
+  if (isValidPageTitle(highlight.pageTitle)) {
+    // 页面标题有效，但也需要限制长度为30字
+    const truncatedTitle = highlight.pageTitle.length > 30
+      ? highlight.pageTitle.substring(0, 30) + '...'
+      : highlight.pageTitle;
+    title = `划线笔记：${truncatedTitle}`;
+    console.log('[墨问 Background] ✅ Using page title (truncated):', title);
+  } else {
+    // 从划线内容中提取标题
+    const { title: extractedTitle } = extractTitleFromText(highlight.text, 30);
+    title = `划线笔记：${extractedTitle || '未命名'}`;
+    console.log('[墨问 Background] 📝 Extracted title from content:', extractedTitle);
+  }
+
   // 格式：标题 + 来源链接（由 createNote 统一添加）+ 时间引用 + 👇划线内容 + 空行 + 划线内容
   // 注意：来源链接通过 sourceUrl 参数传递给 createNote，与剪藏笔记保持一致的处理方式
   const content = `

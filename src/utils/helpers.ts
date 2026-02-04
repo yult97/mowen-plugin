@@ -108,3 +108,82 @@ export function parseErrorCode(error: unknown): string {
   }
   return 'UNKNOWN';
 }
+
+/**
+ * 检查页面标题是否有效（非空、非通用、长度适中）
+ * 用于判断是否需要从正文中提取标题
+ */
+export function isValidPageTitle(title: string): boolean {
+  if (!title || title.trim().length <= 2) {
+    return false;
+  }
+
+  const trimmed = title.trim();
+
+  // 标题过长（超过 50 字）视为无效，可能是把正文当标题了
+  if (trimmed.length > 50) {
+    return false;
+  }
+
+  const lowerTrimmed = trimmed.toLowerCase();
+
+  // 通用/无效标题列表
+  const invalidTitles = [
+    'untitled',
+    '无标题',
+    '新建标签页',
+    'new tab',
+    'loading',
+    '加载中',
+    'undefined',
+    'null',
+  ];
+
+  return !invalidTitles.includes(lowerTrimmed);
+}
+
+/**
+ * 从文本中提取标题（第一句话，不超过指定长度）
+ * 用于划线笔记在页面标题不可用时的降级处理
+ * 
+ * @param text 原始文本
+ * @param maxLength 标题最大长度，默认 30
+ * @returns { title: 提取的标题, remainingText: 剩余文本 }
+ */
+export function extractTitleFromText(text: string, maxLength: number = 30): {
+  title: string;
+  remainingText: string;
+} {
+  if (!text || text.trim().length === 0) {
+    return { title: '', remainingText: '' };
+  }
+
+  const trimmedText = text.trim();
+
+  // 句子结束符（中英文句号、问号、感叹号、换行符）
+  const sentenceEndPattern = /[。.!！?？\n]/;
+  const match = trimmedText.match(sentenceEndPattern);
+
+  let firstSentence: string;
+  let remaining: string;
+
+  if (match && match.index !== undefined && match.index < maxLength) {
+    // 找到句子结束符，且在 maxLength 范围内
+    firstSentence = trimmedText.substring(0, match.index + 1).trim();
+    remaining = trimmedText.substring(match.index + 1).trim();
+  } else {
+    // 没找到句子结束符或超出范围，直接截取 maxLength 字符
+    if (trimmedText.length <= maxLength) {
+      firstSentence = trimmedText;
+      remaining = '';
+    } else {
+      firstSentence = trimmedText.substring(0, maxLength).trim() + '...';
+      remaining = trimmedText.substring(maxLength).trim();
+    }
+  }
+
+  return {
+    title: firstSentence,
+    remainingText: remaining,
+  };
+}
