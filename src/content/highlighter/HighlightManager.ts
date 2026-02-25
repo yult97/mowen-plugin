@@ -905,7 +905,9 @@ export class HighlightManager {
           releaseLock(null);
           lockReleased = true;
         }
-        this.showToast(response.error || '保存失败', 'error');
+        // 权限不足：使用 warning 类型 Toast（黄色图标），区别于系统错误
+        const toastType = response.errorCode === 'PERMISSION_DENIED' ? 'warning' : 'error';
+        this.showToast(response.error || '保存失败', toastType);
         return {
           success: false,
           error: response.error,

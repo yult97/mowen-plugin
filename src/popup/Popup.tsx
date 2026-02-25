@@ -1409,6 +1409,36 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // Regular P5_Failed (error state)
       const errorNeedsRefresh = progress.error?.includes('刷新页面');
       const isExtractionFailed = progress.error?.includes('提取失败') || progress.error?.includes('超时') || progress.error?.includes('未加载');
+      const isPermissionDenied = progress.errorCode === 'PERMISSION_DENIED';
+
+      // 权限不足：展示专用提示
+      if (isPermissionDenied) {
+        return (
+          <div className="card p-4 mb-3">
+            <h3 className="text-sm font-semibold text-text-primary mb-3">剪藏预览</h3>
+            <div className="text-center py-4">
+              <div className="w-12 h-12 bg-yellow-50 rounded-full flex items-center justify-center mx-auto mb-3 border border-yellow-200">
+                <Lock className="text-yellow-600" size={24} />
+              </div>
+              <p className="text-sm font-medium text-text-primary mb-1">权限不足</p>
+              <p className="text-xs text-text-secondary mb-4">
+                {progress.error || '该功能仅限 Pro 会员使用'}
+              </p>
+              <div className="flex flex-col gap-2">
+                <button
+                  className="btn-primary w-full"
+                  onClick={() => window.open('https://mowen.cn/pricing', '_blank')}
+                >
+                  了解 Pro 会员
+                </button>
+                <button className="btn-secondary w-full" onClick={handleRetry}>
+                  返回预览
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
 
       return (
         <div className="card p-4 mb-3">

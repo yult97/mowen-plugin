@@ -809,6 +809,11 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         } else {
           console.log(`[note] part ${part.index + 1} fail: ${result.error} code=${result.errorCode}`);
           logToContentScript(`⚠️ 第 ${part.index + 1} 部分失败: ${result.error}`, tabId);
+          // 权限不足（如 Pro 会员限制）：重试无意义，直接跳出
+          if (result.errorCode === 'PERMISSION_DENIED') {
+            console.log(`[note] part ${part.index + 1} PERMISSION_DENIED, skip retry`);
+            break;
+          }
           // If content too long, logic for splitting further would go here
           // Simplified: just wait and retry
           if (retryCount < MAX_RETRY_ROUNDS) {

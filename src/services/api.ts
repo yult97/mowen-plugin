@@ -122,6 +122,26 @@ async function apiRequest<T>(
       if (response.status === 429) {
         throw new ApiRequestError('RATE_LIMIT: Too many requests', { status: response.status, rawBody: responseBody });
       }
+      // 403: 解析服务端返回的 reason 字段，区分权限不足等具体原因
+      if (response.status === 403) {
+        let permMessage = '权限不足，请检查账户状态';
+        try {
+          const errorBody = JSON.parse(responseBody);
+          if (errorBody?.reason === 'PERM') {
+            // 服务端明确返回权限不足，记录原始技术信息供调试
+            console.warn('[apiRequest] 403 PERM:', errorBody.message);
+            // 为用户提供友好的中文提示，而非服务端的英文技术信息
+            permMessage = '该功能仅限 Pro 会员使用，请升级后再试';
+          }
+        } catch {
+          // JSON 解析失败，使用默认消息
+        }
+        throw new ApiRequestError(permMessage, {
+          status: response.status,
+          code: 403,
+          rawBody: responseBody,
+        });
+      }
       if (response.status === 503) {
         throw new ApiRequestError('SERVICE_UNAVAILABLE: 服务暂时不可用，请稍后再试', {
           status: response.status,
@@ -1249,6 +1269,16 @@ function getErrorCode(error: unknown): string {
       codeString.includes('SERVICE')
     ) {
       return 'SERVICE_UNAVAILABLE';
+    }
+
+    // 403 权限不足（Pro 会员限制等）
+    if (
+      error.status === 403 ||
+      error.code === 403 ||
+      codeString.includes('PERM') ||
+      error.message?.includes('仅限 Pro 会员')
+    ) {
+      return 'PERMISSION_DENIED';
     }
 
     if (error.status === 413 || codeString.includes('TOO LARGE')) {

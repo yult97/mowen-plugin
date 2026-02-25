@@ -160,6 +160,7 @@ export const ERROR_CODES = {
   RATE_LIMIT: 'RATE_LIMIT',
   CONTENT_TOO_LONG: 'CONTENT_TOO_LONG',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  PERMISSION_DENIED: 'PERMISSION_DENIED',
   UNKNOWN: 'UNKNOWN',
 } as const;
 
@@ -169,6 +170,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   RATE_LIMIT: '请求过于频繁，请稍后再试。',
   CONTENT_TOO_LONG: '内容超过长度限制。',
   SERVICE_UNAVAILABLE: '服务暂时不可用，请稍后再试。',
+  PERMISSION_DENIED: '该功能仅限 Pro 会员使用，请升级后再试。',
   UNKNOWN: '操作失败，请重试。',
 };
 
