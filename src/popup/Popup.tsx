@@ -19,8 +19,10 @@ import {
   Key,
   BookOpen,
   Tag,
+  Mic,
 } from 'lucide-react';
 import TutorialModal from '../components/TutorialModal';
+import { VoiceNotePage } from '../sidepanel/VoiceNote';
 
 // Card 4 state machine: P0-P5
 type PreviewState = 'P0_Idle' | 'P1_PreviewLoading' | 'P2_PreviewReady' | 'P3_Saving' | 'P4_Success' | 'P5_Failed';
@@ -43,6 +45,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [loading, setLoading] = useState(true);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
+  const [showVoiceNote, setShowVoiceNote] = useState(false);
 
   // State to trigger auto-fetch preview
   const [autoFetchTrigger, setAutoFetchTrigger] = useState(0);
@@ -973,6 +976,26 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           <span className="text-sm text-text-secondary">公开/私密可控,支持默认设置</span>
         </li>
       </ul>
+
+      {/* AI 语音笔记入口 */}
+      {isSidePanel && (
+        <div className="mt-3 pt-3 border-t border-border-default">
+          <button
+            className="w-full flex items-center gap-3 p-3 rounded-lg bg-gradient-to-r from-brand-soft to-purple-50 hover:from-brand-soft/80 hover:to-purple-100 transition-all group"
+            onClick={() => setShowVoiceNote(true)}
+          >
+            <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center shadow-sm group-hover:shadow">
+              <Mic className="text-brand-primary" size={16} />
+            </div>
+            <div className="text-left flex-1">
+              <div className="text-sm font-medium text-text-primary">AI 语音笔记</div>
+              <div className="text-xs text-text-secondary">说话即可记录，智能转写成文</div>
+            </div>
+            <span className="text-xs px-2 py-0.5 rounded-full bg-brand-primary/10 text-brand-primary">新</span>
+          </button>
+        </div>
+      )}
+
       {currentDomain && (
         <div className="mt-3 pt-3 border-t border-border-default">
           <div className="flex items-center gap-2 text-xs">
@@ -1521,6 +1544,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
   // Remove the hard exit if no API key is configured
   // This allows showing the guide card within the normal layout
+
+  // 如果正在显示语音笔记页面
+  if (showVoiceNote) {
+    return <VoiceNotePage onBack={() => setShowVoiceNote(false)} />;
+  }
 
   return (
     <div className={isSidePanel ? 'sidepanel-container p-4' : 'popup-container p-4'}>

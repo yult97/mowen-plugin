@@ -11,6 +11,21 @@ import { Highlight, HighlightNoteCache, SaveHighlightPayload, HighlightSaveResul
 import { SelectionToolbar, SelectionToolbarCallbacks } from './SelectionToolbar';
 import { SelectionInfo } from './types';
 
+/**
+ * 检查 chrome API 是否可用
+ * 在扩展重载后，Content Script 的 chrome 对象会失效
+ * 此函数用于在访问 chrome API 之前进行安全检查
+ */
+function isChromeApiValid(): boolean {
+  try {
+    // 检查 chrome 对象和 runtime 是否存在
+    // 如果扩展上下文失效，chrome.runtime.id 会是 undefined
+    return !!(chrome && chrome.runtime && chrome.runtime.id);
+  } catch {
+    return false;
+  }
+}
+
 // 生成 UUID
 function generateId(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -89,6 +104,7 @@ export class HighlightManager {
    * 绑定存储变化监听器（多标签页同步）
    */
   private bindStorageListener(): void {
+    if (!isChromeApiValid()) return;
     chrome.storage.onChanged.addListener(this.handleStorageChange);
   }
 
@@ -96,6 +112,7 @@ export class HighlightManager {
    * 解绑存储变化监听器
    */
   private unbindStorageListener(): void {
+    if (!isChromeApiValid()) return;
     chrome.storage.onChanged.removeListener(this.handleStorageChange);
   }
 
@@ -151,6 +168,11 @@ export class HighlightManager {
    * 检查禁用状态
    */
   private async checkDisableState(): Promise<void> {
+    // 检查 chrome API 是否可用（扩展可能已被重载）
+    if (!isChromeApiValid()) {
+      console.log('[Highlighter] Chrome API not available, skipping disable state check');
+      return;
+    }
     try {
       const result = await chrome.storage.local.get([
         HIGHLIGHT_STORAGE_KEYS.GLOBAL_DISABLED,
@@ -705,6 +727,13 @@ export class HighlightManager {
    * 检查 API Key 配置状态
    */
   private async checkApiKey(): Promise<void> {
+    // 检查 chrome API 是否可用（扩展可能已被重载）
+    if (!isChromeApiValid()) {
+      console.log('[Highlighter] Chrome API not available, skipping API key check');
+      this.isApiKeyConfigured = true;  // 默认认为已配置
+      this.toolbar.setApiKeyConfigured(true);
+      return;
+    }
     try {
       // API Key 存储在 'mowen_settings' 对象中，而不是单独的 'apiKey' key
       const result = await chrome.storage.sync.get('mowen_settings');

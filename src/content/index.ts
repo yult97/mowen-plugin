@@ -27,6 +27,304 @@ let observer: MutationObserver | null = null;
 let isObserving = false;
 let extractScheduled = false;
 
+// ============ 麦克风录音状态 ============
+let micStream: MediaStream | null = null;
+let micAudioChunks: Blob[] = [];
+
+/**
+ * 开始麦克风录音
+ * 使用 AudioContext 直接采集 PCM 数据（16kHz 16bit），绕过 MediaRecorder/WebM 编码
+ */
+async function startMicRecording(options: { timeslice?: number } = {}): Promise<void> {
+  // 清理之前的录音
+  micAudioChunks = [];
+
+  // 火山引擎要求 16kHz 采样率
+  const targetSampleRate = 16000;
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      sampleRate: targetSampleRate, // 尝试请求 16kHz（浏览器可能不支持）
+    }
+  });
+
+  // 创建 AudioContext（使用设备原生采样率）
+  const audioContext = new AudioContext();
+  const source = audioContext.createMediaStreamSource(micStream);
+
+  // 音频增强：高通滤波器（85Hz 截止频率，去除低频噪声如空调、风扇、电脑嗡鸣）
+  // 人声基频 F0 通常 > 85Hz（男性 ~85-180Hz，女性 ~165-255Hz），85Hz 不会损伤语音
+  const highPassFilter = audioContext.createBiquadFilter();
+  highPassFilter.type = 'highpass';
+  highPassFilter.frequency.value = 85;
+  highPassFilter.Q.value = 0.707; // Butterworth 响应，平坦通带
+
+  // 二级高通滤波器（级联两个 Butterworth = 4 阶滤波，衰减更陡峭 -24dB/oct）
+  const highPassFilter2 = audioContext.createBiquadFilter();
+  highPassFilter2.type = 'highpass';
+  highPassFilter2.frequency.value = 85;
+  highPassFilter2.Q.value = 0.707;
+
+  // 使用 ScriptProcessorNode 采集音频数据
+  // 缓冲区大小: 4096 samples (~85ms at 48kHz, ~256ms at 16kHz)
+  const bufferSize = 4096;
+  const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+  // 计算重采样比率
+  const resampleRatio = audioContext.sampleRate / targetSampleRate;
+
+  // VAD（语音活动检测）参数：基于 RMS 能量的静音检测
+  const vadRmsThreshold = 0.008; // RMS 阈值（提高灵敏度，过滤更多环境噪音）
+  let consecutiveSilentFrames = 0;
+  const maxSilentFrames = 15; // 连续静音帧数上限（~255ms at 48kHz），更快切断噪音
+  // 语音起始保护：检测到语音后至少保持 hangover 帧，避免语音间隙被误切
+  const vadHangoverFrames = 8; // ~136ms 的语音保持时间
+  let speechHangover = 0;
+
+  // 发送间隔（毫秒）- 降低到 100ms 以减少边界切断导致的漏字
+  const sendInterval = options.timeslice || 100;
+  let pcmBuffer: Int16Array[] = [];
+  let lastSendTime = Date.now();
+
+  processor.onaudioprocess = (event) => {
+    // 检查扩展上下文是否仍然有效
+    if (!chrome.runtime?.id) {
+      // 扩展上下文已失效，静默清理
+      console.log('[content] 扩展上下文已失效，停止音频处理');
+      processor.disconnect();
+      const win = window as unknown as {
+        __micAudioContext?: AudioContext;
+        __micHighPassFilter?: BiquadFilterNode;
+        __micHighPassFilter2?: BiquadFilterNode;
+        __micProcessor?: ScriptProcessorNode;
+      };
+      if (win.__micHighPassFilter2) {
+        win.__micHighPassFilter2.disconnect();
+        win.__micHighPassFilter2 = undefined;
+      }
+      if (win.__micHighPassFilter) {
+        win.__micHighPassFilter.disconnect();
+        win.__micHighPassFilter = undefined;
+      }
+      if (win.__micAudioContext) {
+        win.__micAudioContext.close().catch(() => { });
+        win.__micAudioContext = undefined;
+      }
+      win.__micProcessor = undefined;
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+        micStream = null;
+      }
+      return;
+    }
+
+    const inputData = event.inputBuffer.getChannelData(0);
+
+    // VAD：计算当前帧的 RMS 能量
+    let sumSquares = 0;
+    for (let i = 0; i < inputData.length; i++) {
+      sumSquares += inputData[i] * inputData[i];
+    }
+    const rms = Math.sqrt(sumSquares / inputData.length);
+
+    if (rms < vadRmsThreshold) {
+      consecutiveSilentFrames++;
+      // hangover 保护：语音刚结束后保持几帧，避免语音间隙被误切
+      if (speechHangover > 0) {
+        speechHangover--;
+      } else if (consecutiveSilentFrames > maxSilentFrames) {
+        // 持续静音且 hangover 已耗尽，跳过发送以节省带宽
+        return;
+      }
+    } else {
+      consecutiveSilentFrames = 0;
+      speechHangover = vadHangoverFrames; // 检测到语音，重置 hangover
+    }
+
+    // 重采样到 16kHz 并转换为 16bit PCM（使用线性插值，提高精度）
+    const outputLength = Math.floor(inputData.length / resampleRatio);
+    const pcm16 = new Int16Array(outputLength);
+
+    for (let i = 0; i < outputLength; i++) {
+      // 使用线性插值而非简单抽样，减少音频细节丢失
+      const srcIndex = i * resampleRatio;
+      const index0 = Math.floor(srcIndex);
+      const index1 = Math.min(index0 + 1, inputData.length - 1);
+      const fraction = srcIndex - index0;
+
+      // 线性插值：sample = sample0 * (1 - fraction) + sample1 * fraction
+      const sample0 = inputData[index0];
+      const sample1 = inputData[index1];
+      const sample = sample0 + (sample1 - sample0) * fraction;
+
+      // 将 -1.0 ~ 1.0 的浮点数转换为 -32768 ~ 32767 的整数
+      const clampedSample = Math.max(-1, Math.min(1, sample));
+      pcm16[i] = clampedSample < 0 ? clampedSample * 0x8000 : clampedSample * 0x7FFF;
+    }
+
+    pcmBuffer.push(pcm16);
+
+    // 定期发送数据
+    const now = Date.now();
+    if (now - lastSendTime >= sendInterval) {
+      // 合并缓冲区
+      const totalLength = pcmBuffer.reduce((sum, arr) => sum + arr.length, 0);
+      const mergedPcm = new Int16Array(totalLength);
+      let offset = 0;
+      for (const chunk of pcmBuffer) {
+        mergedPcm.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      // 转换为 Base64 发送
+      const uint8Array = new Uint8Array(mergedPcm.buffer);
+      let binary = '';
+      for (let i = 0; i < uint8Array.length; i++) {
+        binary += String.fromCharCode(uint8Array[i]);
+      }
+      const base64 = btoa(binary);
+
+      // 发送到 sidepanel（增强错误处理）
+      chrome.runtime.sendMessage({
+        type: 'MIC_AUDIO_DATA',
+        data: base64,  // 直接发送 Base64（不是 Data URL）
+        format: 'pcm_s16le_16k'  // 标记格式：PCM 16bit 小端 16kHz
+      }).catch((err) => {
+        // 检测 context invalidated 错误
+        if (err?.message?.includes('Extension context invalidated')) {
+          console.log('[content] 扩展上下文失效，停止音频处理');
+          processor.disconnect();
+        }
+      });
+
+      // 同时保存完整数据用于停止时导出
+      micAudioChunks.push(new Blob([mergedPcm.buffer], { type: 'audio/pcm' }));
+
+      pcmBuffer = [];
+      lastSendTime = now;
+    }
+  };
+
+  // 音频链路：麦克风 → 高通滤波器1 → 高通滤波器2（4阶级联）→ 处理器（采集 PCM）
+  source.connect(highPassFilter);
+  highPassFilter.connect(highPassFilter2);
+  highPassFilter2.connect(processor);
+  processor.connect(audioContext.destination);
+
+  // 保存引用以便停止
+  (window as unknown as { __micAudioContext?: AudioContext; __micHighPassFilter?: BiquadFilterNode; __micHighPassFilter2?: BiquadFilterNode }).__micAudioContext = audioContext;
+  (window as unknown as { __micHighPassFilter?: BiquadFilterNode }).__micHighPassFilter = highPassFilter;
+  (window as unknown as { __micHighPassFilter2?: BiquadFilterNode }).__micHighPassFilter2 = highPassFilter2;
+  (window as unknown as { __micProcessor?: ScriptProcessorNode }).__micProcessor = processor;
+}
+
+/**
+ * 停止麦克风录音
+ * 清理 AudioContext 和相关资源
+ */
+async function stopMicRecording(): Promise<string | null> {
+  // 清理 AudioContext
+  const win = window as unknown as {
+    __micAudioContext?: AudioContext;
+    __micHighPassFilter?: BiquadFilterNode;
+    __micHighPassFilter2?: BiquadFilterNode;
+    __micProcessor?: ScriptProcessorNode;
+  };
+
+  if (win.__micProcessor) {
+    win.__micProcessor.disconnect();
+    win.__micProcessor = undefined;
+  }
+
+  if (win.__micHighPassFilter2) {
+    win.__micHighPassFilter2.disconnect();
+    win.__micHighPassFilter2 = undefined;
+  }
+
+  if (win.__micHighPassFilter) {
+    win.__micHighPassFilter.disconnect();
+    win.__micHighPassFilter = undefined;
+  }
+
+  if (win.__micAudioContext) {
+    await win.__micAudioContext.close();
+    win.__micAudioContext = undefined;
+  }
+
+  // 停止媒体流
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+
+  // 合并所有 PCM 数据并返回
+  if (micAudioChunks.length === 0) {
+    return null;
+  }
+
+  // 合并 Blob
+  const allData = await Promise.all(
+    micAudioChunks.map(blob => blob.arrayBuffer())
+  );
+  const totalLength = allData.reduce((sum, buf) => sum + buf.byteLength, 0);
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const buf of allData) {
+    merged.set(new Uint8Array(buf), offset);
+    offset += buf.byteLength;
+  }
+
+  // 转换为 Base64
+  let binary = '';
+  for (let i = 0; i < merged.length; i++) {
+    binary += String.fromCharCode(merged[i]);
+  }
+  const base64 = btoa(binary);
+
+  micAudioChunks = [];
+  return base64;
+}
+
+/**
+ * 暂停麦克风录音
+ * 使用 AudioContext.suspend() 暂停音频处理
+ */
+async function pauseMicRecording(): Promise<void> {
+  const win = window as unknown as { __micAudioContext?: AudioContext };
+  if (win.__micAudioContext && win.__micAudioContext.state === 'running') {
+    await win.__micAudioContext.suspend();
+    console.log('[content] 麦克风录音已暂停');
+  }
+}
+
+/**
+ * 继续麦克风录音
+ * 使用 AudioContext.resume() 恢复音频处理
+ */
+async function resumeMicRecording(): Promise<void> {
+  const win = window as unknown as { __micAudioContext?: AudioContext };
+  const ctx = win.__micAudioContext;
+
+  if (!ctx) {
+    console.warn('[content] 无法恢复录音：AudioContext 不存在');
+    return;
+  }
+
+  console.log('[content] AudioContext 当前状态:', ctx.state);
+
+  if (ctx.state === 'suspended') {
+    await ctx.resume();
+    console.log('[content] 麦克风录音已恢复，当前状态:', ctx.state);
+  } else if (ctx.state === 'running') {
+    console.log('[content] AudioContext 已在运行中，无需恢复');
+  } else {
+    console.warn('[content] AudioContext 状态异常:', ctx.state);
+  }
+}
+
 // URL 变化检测（用于 SPA 路由）
 let lastKnownUrl = window.location.href;
 
@@ -213,6 +511,51 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const result = message.payload as { success: boolean; noteUrl?: string; isAppend?: boolean; error?: string };
     showHighlightResultToast(result);
     sendResponse({ success: true });
+    return false;
+  }
+
+  // ============ 麦克风录音相关消息 ============
+
+  // START_MIC_RECORDING: 开始麦克风录音
+  if (message.type === 'START_MIC_RECORDING') {
+    startMicRecording(message.options || {})
+      .then(() => sendResponse({ success: true }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // STOP_MIC_RECORDING: 停止麦克风录音
+  if (message.type === 'STOP_MIC_RECORDING') {
+    stopMicRecording()
+      .then(data => sendResponse({ success: true, data }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // PAUSE_MIC_RECORDING: 暂停录音
+  if (message.type === 'PAUSE_MIC_RECORDING') {
+    pauseMicRecording()
+      .then(() => sendResponse({ success: true }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // RESUME_MIC_RECORDING: 继续录音
+  if (message.type === 'RESUME_MIC_RECORDING') {
+    resumeMicRecording()
+      .then(() => sendResponse({ success: true }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // GET_MIC_STATE: 获取录音状态
+  if (message.type === 'GET_MIC_STATE') {
+    const win = window as unknown as { __micAudioContext?: AudioContext };
+    const isRecording = win.__micAudioContext && win.__micAudioContext.state === 'running';
+    sendResponse({
+      success: true,
+      state: isRecording ? 'recording' : 'inactive'
+    });
     return false;
   }
 

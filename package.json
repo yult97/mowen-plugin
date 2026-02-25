@@ -12,6 +12,7 @@
     "build:zip": "npm run build && cd dist && zip -r ../extension.zip ."
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@mozilla/readability": "^0.5.0",
     "dompurify": "^3.0.8",
     "lucide-react": "^0.312.0",

@@ -414,6 +414,94 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  // Tab 音频录制相关消息处理
+  if (message.type === 'ENSURE_OFFSCREEN_READY') {
+    ensureOffscreenDocument()
+      .then(() => sendResponse({ success: true }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.type === 'START_TAB_RECORDING') {
+    console.log('[墨问 Background] 🎙️ START_TAB_RECORDING received for tab:', message.tabId);
+    (async () => {
+      try {
+        await handleStartTabRecording(message.tabId);
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error('[墨问 Background] ❌ START_TAB_RECORDING failed:', error);
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    })();
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  if (message.type === 'STOP_TAB_RECORDING') {
+    console.log('[墨问 Background] 🛑 STOP_TAB_RECORDING received');
+    (async () => {
+      try {
+        const data = await handleStopTabRecording();
+        sendResponse({ success: true, data });
+      } catch (error) {
+        console.error('[墨问 Background] ❌ STOP_TAB_RECORDING failed:', error);
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    })();
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  if (message.type === 'PAUSE_TAB_RECORDING') {
+    console.log('[墨问 Background] ⏸️ PAUSE_TAB_RECORDING received, forwarding to offscreen');
+    (async () => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          target: 'offscreen',
+          type: 'PAUSE_TAB_RECORDING',
+        });
+        sendResponse(response);
+      } catch (error) {
+        console.error('[墨问 Background] ❌ PAUSE_TAB_RECORDING failed:', error);
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    })();
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  if (message.type === 'RESUME_TAB_RECORDING') {
+    console.log('[墨问 Background] ▶️ RESUME_TAB_RECORDING received, forwarding to offscreen');
+    (async () => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          target: 'offscreen',
+          type: 'RESUME_TAB_RECORDING',
+        });
+        sendResponse(response);
+      } catch (error) {
+        console.error('[墨问 Background] ❌ RESUME_TAB_RECORDING failed:', error);
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    })();
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  // TAB_AUDIO_DATA 消息不在 background 处理，直接忽略（由 SidePanel 接收）
+  if (message.type === 'TAB_AUDIO_DATA') {
+    // 不处理，让消息传递给其他监听器（SidePanel）
+    return false;
+  }
+
   return false;
 });
 // I will only replace the SAVE_NOTE handler part + handleSaveNote signature
@@ -1586,4 +1674,57 @@ function createIndexNoteAtom(
 
 function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^$${}()|[\]\\]/g, '\\$&');
+}
+
+// ============ Tab 音频录制 ============
+
+let offscreenCreated = false;
+
+async function ensureOffscreenDocument(): Promise<void> {
+  const existingContexts = await (chrome.runtime as any).getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+  });
+
+  if (existingContexts.length > 0) {
+    offscreenCreated = true;
+    return;
+  }
+
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: [chrome.offscreen.Reason.USER_MEDIA],
+    justification: 'Tab audio capture and PCM processing',
+  });
+  offscreenCreated = true;
+}
+
+async function handleStartTabRecording(tabId: number): Promise<void> {
+  const [streamId] = await Promise.all([
+    (chrome.tabCapture as any).getMediaStreamId({ targetTabId: tabId }),
+    ensureOffscreenDocument(),
+  ]);
+
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    type: 'START_TAB_RECORDING',
+    streamId,
+  });
+
+  if (!response?.success) {
+    throw new Error(response?.error || '启动标签页录音失败');
+  }
+}
+
+async function handleStopTabRecording(): Promise<string | null> {
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    type: 'STOP_TAB_RECORDING',
+  });
+
+  if (offscreenCreated) {
+    await chrome.offscreen.closeDocument().catch(() => {});
+    offscreenCreated = false;
+  }
+
+  return response?.data || null;
 }

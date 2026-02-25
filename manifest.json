@@ -32,7 +32,9 @@
     "scripting",
     "tabs",
     "sidePanel",
-    "contextMenus"
+    "contextMenus",
+    "offscreen",
+    "tabCapture"
   ],
   "host_permissions": [
     "<all_urls>"

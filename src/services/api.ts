@@ -480,6 +480,12 @@ export async function createNoteWithBody(
     // 与 createNote 保持一致的 fallback 逻辑：
     // 即使 API 返回错误，也检查 error.data 中是否有 noteId
     if (error instanceof ApiRequestError) {
+      console.error('[sw] createNoteWithBody: ApiRequestError detail', {
+        status: error.status,
+        code: error.code,
+        data: error.data,
+        rawBody: error.rawBody?.substring(0, 1000),
+      });
       const errorData = error.data as { noteId?: string } | undefined;
       const fallbackNoteId = errorData?.noteId;
 
@@ -796,7 +802,7 @@ async function fetchImageDirectFromSW(imageUrl: string): Promise<Blob | null> {
  * Per official docs: https://mowen.apifox.cn/304801589e0
  * 
  * Request: POST /upload/prepare
- * Body: { fileType: 0, fileName: "string" }
+ * Body: { fileType: 1|2|3, fileName: "string" }
  * 
  * ACTUAL Response structure from API:
  * { form: { endpoint, callback, key, policy, ... } }
@@ -805,16 +811,17 @@ async function fetchImageDirectFromSW(imageUrl: string): Promise<Blob | null> {
  */
 export async function uploadPrepare(
   apiKey: string,
-  fileName: string
+  fileName: string,
+  fileType: number = 1
 ): Promise<{ success: boolean; endpoint?: string; form?: Record<string, string>; error?: string }> {
-  console.log(`[img] local prepare start fileName=${fileName}`);
+  console.log(`[img] local prepare start fileName=${fileName} fileType=${fileType}`);
 
   try {
     // Acquire rate limit before API call
     await waitForRateLimit();
 
     const data = await apiRequest<{ form: Record<string, string> }>('/upload/prepare', apiKey, {
-      fileType: 1,  // API expects 1 for image
+      fileType,
       fileName: fileName,
     });
 
