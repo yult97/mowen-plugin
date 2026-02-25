@@ -1,0 +1,28 @@
+# ASR Proxy Docker Compose 配置
+# 使用方法: docker compose up -d
+#
+# 配置说明：
+# 所有配置项统一在 .env 文件中设置，此文件不定义默认值
+
+services:
+  asr-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: asr-proxy:latest
+    container_name: asr-proxy
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    # 唯一配置来源：从 .env 文件加载所有环境变量
+    env_file:
+      - .env
+    # 开发模式：挂载本地代码，修改即时生效
+    volumes:
+      - ./src:/app/src
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 8765)); s.close()" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
