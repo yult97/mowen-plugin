@@ -137,6 +137,7 @@ export type MessageType =
   | 'SAVE_SETTINGS'
   | 'FETCH_IMAGE'
   | 'FETCH_IMAGE_RESULT'
+  | 'FETCH_IMAGE_AS_DATA_URL'
   // 划线功能消息类型
   | 'SAVE_HIGHLIGHT'
   | 'HIGHLIGHT_RESULT'
@@ -275,3 +276,80 @@ export const DEFAULT_EXCLUDED_URLS: string[] = [
   'https://note.mowen.cn/editor',
   'https://dev-note.mowen.cn/editor',
 ];
+
+// ============================================
+// PDF 导出 & 笔记列表管理类型定义
+// ============================================
+
+/**
+ * 笔记列表项（来自 workbench API）
+ */
+export interface MowenNoteItem {
+  uuid: string;
+  title: string;
+  digest: string;
+  createdAt: string | number;
+  tags?: string[];
+  coverImage?: string;
+  isCollection?: boolean;   // 是否为合集笔记
+  canExpandChildren?: boolean; // 是否可展开子笔记
+  isTop?: boolean;           // 是否为置顶笔记
+  childNoteIds?: string[];  // 合集子笔记 UUID 列表（展开后填充）
+}
+
+/**
+ * 笔记详情（来自 show API）
+ */
+export interface MowenNoteDetail {
+  uuid: string;
+  title: string;
+  htmlContent: string;  // 完整 HTML 正文
+  tags?: string[];
+  childNoteIds?: string[];
+}
+
+/**
+ * PDF 导出进度状态
+ */
+export type PdfExportStatus = 'idle' | 'fetching' | 'converting' | 'downloading' | 'success' | 'failed';
+
+/**
+ * PDF 导出进度信息
+ */
+export interface PdfExportProgress {
+  status: PdfExportStatus;
+  current?: number;      // 当前处理的序号
+  total?: number;        // 总数
+  currentTitle?: string; // 当前处理的笔记标题
+  error?: string;
+}
+
+/**
+ * 批量导出上限
+ */
+export const PDF_EXPORT_MAX_COUNT = 10;
+
+/**
+ * PDF 导出设置
+ */
+export interface PdfExportSettings {
+  /** 导出方式：合并为单个 PDF / 分别导出多个 PDF */
+  exportMode: 'merged' | 'separate';
+  /** 是否保留图片（关闭后仅导出文本与基础元信息） */
+  includeImages: boolean;
+}
+
+/**
+ * 笔记列表分页参数
+ */
+export interface NoteListPaging {
+  hint: string;  // 游标，首页为空字符串
+  size: number;  // 每页数量
+}
+
+/**
+ * 笔记列表过滤参数
+ */
+export interface NoteListFilter {
+  benchType: number;  // 1=我的笔记
+}

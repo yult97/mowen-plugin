@@ -46,6 +46,30 @@ interface ConvertStats {
   code: number;
 }
 
+interface MowenNoteImageAsset {
+  fileUuid?: string;
+  url?: string;
+  scale?: Record<string, string | undefined>;
+  uuid?: string;
+}
+
+interface MowenNoteFileLike {
+  images?: Record<string, MowenNoteImageAsset | undefined>;
+}
+
+interface MowenNoteFileTreeLike {
+  imageAttach?: unknown[];
+}
+
+interface NoteAtomToHtmlOptions {
+  resolveImageUrl?: (uuid: string) => string;
+}
+
+interface NormalizeMowenHtmlOptions {
+  noteFile?: MowenNoteFileLike;
+  noteFileTree?: MowenNoteFileTreeLike;
+}
+
 // Block-level tags are handled inline in parseBlockContent
 
 /**
@@ -63,18 +87,6 @@ export function htmlToNoteAtom(html: string): NoteAtom {
   };
 
   try {
-    console.log('[noteAtom] Starting block-aware conversion, input length:', html.length);
-
-    // 检查输入 HTML 是否包含 blockquote
-    const blockquoteCount = (html.match(/<blockquote/gi) || []).length;
-    console.log(`[noteAtom] 🔍 输入 HTML 包含 ${blockquoteCount} 个 <blockquote> 标签`);
-    if (blockquoteCount > 0) {
-      const blockquoteMatch = html.match(/<blockquote[^>]*>[\s\S]*?<\/blockquote>/i);
-      if (blockquoteMatch) {
-        console.log(`[noteAtom] 📋 第一个 blockquote 内容预览: "${blockquoteMatch[0].substring(0, 200)}..."`);
-      }
-    }
-
     // 1. Clean script/style/comments
     let processed = html
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, '')
@@ -94,15 +106,9 @@ export function htmlToNoteAtom(html: string): NoteAtom {
 
     // 3. Parse blocks
     const blocks = parseBlockContent(processed, images, stats);
-
-    // 4. Log structure summary
     stats.total = blocks.length;
-    const first10Types = blocks.slice(0, 10).map(b => b.type).join(', ');
-    console.log(`[convert] source=${stats.source}`);
-    console.log(`[convert] blocks_total=${stats.total}, paragraph=${stats.paragraph}, quote=${stats.quote}, image=${stats.image}, list=${stats.list}, code=${stats.code}`);
-    console.log(`[convert] first10Types=${first10Types}`);
 
-    // 5. Ensure at least one block
+    // 4. Ensure at least one block
     if (blocks.length === 0) {
       blocks.push({ type: 'paragraph', content: [{ type: 'text', text: ' ' }] });
     }
@@ -144,14 +150,6 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
     quoteBlocks.push({ placeholder, content });
     return `\n${placeholder}\n`;
   });
-
-  // 调试日志：打印识别到的 blockquote 数量
-  if (quoteBlocks.length > 0) {
-    console.log(`[noteAtom] 🔍 识别到 ${quoteBlocks.length} 个 blockquote 块`);
-    quoteBlocks.forEach((q, i) => {
-      console.log(`[noteAtom] 📋 blockquote #${i + 1} 内容预览: ${q.content.substring(0, 100)}...`);
-    });
-  }
 
   // 3. Handle code blocks (pre/code)
   const codeBlocks: Array<{ placeholder: string; content: string }> = [];
@@ -237,8 +235,6 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
           // Split by <br>, <p>, and newlines to maintain structure
           let quoteContent = quoteData.content;
 
-          console.log(`[noteAtom] 🔍 处理引用块原始内容: "${quoteContent.substring(0, 200)}..."`);
-
           // Normalize various line break patterns to a consistent marker
           quoteContent = quoteContent
             .replace(/<br\s*\/?>/gi, '\n')
@@ -247,12 +243,8 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
             .replace(/<\/?(?:p|div)[^>]*>/gi, '\n')
             .replace(/\n\s*\n/g, '\n'); // Collapse multiple newlines
 
-          console.log(`[noteAtom] 🔍 引用块换行处理后: "${quoteContent.substring(0, 200)}..."`);
-
           // Split into lines and process each
           const lines = quoteContent.split('\n').filter(line => line.trim());
-
-          console.log(`[noteAtom] 🔍 引用块分割后行数: ${lines.length}, 行内容: ${JSON.stringify(lines.slice(0, 3))}`);
 
           if (lines.length > 0) {
             // Build content array with text nodes and explicit newlines
@@ -260,7 +252,6 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
 
             for (let i = 0; i < lines.length; i++) {
               const lineContent = parseInlineContent(lines[i].trim());
-              console.log(`[noteAtom] 🔍 引用块第 ${i + 1} 行 parseInlineContent 结果: ${JSON.stringify(lineContent).substring(0, 150)}`);
               if (lineContent.length > 0) {
                 quoteContentNodes.push(...lineContent);
                 // Add newline after each line except the last
@@ -270,16 +261,10 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
               }
             }
 
-            console.log(`[noteAtom] 🔍 引用块最终节点数: ${quoteContentNodes.length}`);
-
             if (quoteContentNodes.length > 0) {
               blocks.push({ type: 'quote', content: quoteContentNodes });
               stats.quote++;
-            } else {
-              console.log(`[noteAtom] ⚠️ 引用块内容为空，跳过创建 quote 节点`);
             }
-          } else {
-            console.log(`[noteAtom] ⚠️ 引用块分割后无有效行，跳过创建 quote 节点`);
           }
         }
         continue;
@@ -969,7 +954,7 @@ function createImageBlock(imgData: ImageData): NoteAtom | null {
   } else {
     // No UUID means image upload failed - skip this image entirely
     // User preference: do not show images as links
-    console.warn('[noteAtom] Skipping image without UUID:', imgData.src?.substring(0, 60));
+    console.warn('[noteAtom] Skipping image without UUID');
     return null;
   }
 }
@@ -1000,17 +985,12 @@ function extractImageData(imgTag: string): ImageData | null {
 
   if (dataUidMatch?.[1] && uuidRegex.test(dataUidMatch[1])) {
     uuid = dataUidMatch[1];
-    console.log('[noteAtom] extractImageData using data-mowen-uid:', uuid);
   } else if (dataIdMatch?.[1] && uuidRegex.test(dataIdMatch[1])) {
     uuid = dataIdMatch[1];
-    console.log('[noteAtom] extractImageData using data-mowen-id:', uuid);
   } else {
     const mowenCdnMatch = srcMatch[1].match(/(?:mowen\.cn|mw-assets)\/([a-zA-Z0-9_-]{10,})/);
     if (mowenCdnMatch) {
       uuid = mowenCdnMatch[1];
-      console.log('[noteAtom] extractImageData using CDN UUID:', uuid);
-    } else {
-      console.log('[noteAtom] extractImageData NO UUID found for:', srcMatch[1].substring(0, 50));
     }
   }
 
@@ -1071,4 +1051,450 @@ function decodeHtmlEntities(text: string): string {
 export function ensureDocWrapper(atom: NoteAtom): NoteAtom {
   if (atom.type === 'doc') return atom;
   return { type: 'doc', content: [atom] };
+}
+
+// ============================================
+// NoteAtom JSON → HTML 反向转换（用于 PDF 导出）
+// ============================================
+
+/**
+ * 墨问图片 CDN 基础地址
+ */
+const MOWEN_IMAGE_CDN = 'https://image.mowen.cn/mowen';
+
+/**
+ * HTML 特殊字符转义（防 XSS）
+ */
+function escapeHtmlForAtom(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * 安全校验 URL：仅允许 http / https 协议
+ */
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function getDirectFigureCaption(figure: HTMLElement): string {
+  for (const child of Array.from(figure.children)) {
+    if (child.tagName === 'FIGCAPTION') {
+      return child.textContent?.trim() || '';
+    }
+  }
+  return '';
+}
+
+function syncFigureCaption(figure: HTMLElement, doc: Document, caption: string): void {
+  const figureChildren = Array.from(figure.children);
+  for (const child of figureChildren) {
+    if (child.tagName === 'FIGCAPTION') {
+      figure.removeChild(child);
+    }
+  }
+
+  if (!caption) return;
+
+  const figcaption = doc.createElement('figcaption');
+  figcaption.textContent = caption;
+  figure.appendChild(figcaption);
+}
+
+function getImageCaption(image: HTMLImageElement): string {
+  const attributeCandidates = [
+    'caption',
+    'data-caption',
+    'data-mowen-caption',
+    'image-caption',
+    'title',
+  ];
+
+  for (const attributeName of attributeCandidates) {
+    const value = image.getAttribute(attributeName)?.trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  const parent = image.parentElement;
+  if (parent?.tagName === 'FIGURE') {
+    return getDirectFigureCaption(parent);
+  }
+
+  return '';
+}
+
+function getMowenImageUuid(image: HTMLImageElement): string {
+  return (
+    image.getAttribute('uuid') ||
+    image.getAttribute('image-uuid') ||
+    image.getAttribute('data-mowen-uid') ||
+    image.getAttribute('data-mowen-id') ||
+    image.getAttribute('data-uuid') ||
+    image.getAttribute('data-file-uuid') ||
+    ''
+  ).trim();
+}
+
+function normalizeUuidList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+}
+
+export function resolveMowenImageUrl(uuid: string, noteFile?: MowenNoteFileLike): string {
+  const imageInfo = noteFile?.images?.[uuid];
+  const preferredUrl = imageInfo?.scale?.w_1200 || imageInfo?.url;
+
+  if (preferredUrl && isSafeUrl(preferredUrl)) {
+    return preferredUrl;
+  }
+
+  return `${MOWEN_IMAGE_CDN}/${uuid}`;
+}
+
+function createExportFigure(
+  doc: Document,
+  uuid: string,
+  noteFile?: MowenNoteFileLike,
+  caption = '',
+  alt = ''
+): HTMLElement {
+  const figure = doc.createElement('figure');
+  const image = doc.createElement('img');
+  const resolvedAlt = alt.trim();
+  const resolvedCaption = caption.trim();
+
+  image.setAttribute('src', resolveMowenImageUrl(uuid, noteFile));
+  image.setAttribute('alt', resolvedAlt);
+  image.setAttribute('crossorigin', 'anonymous');
+  image.setAttribute('style', 'max-width:100%;height:auto;');
+  image.setAttribute('data-mowen-uuid', uuid);
+
+  figure.appendChild(image);
+  syncFigureCaption(figure, doc, resolvedCaption);
+
+  return figure;
+}
+
+function normalizeMowenImages(
+  root: HTMLElement,
+  doc: Document,
+  noteFile?: MowenNoteFileLike
+): Set<string> {
+  const renderedUuids = new Set<string>();
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>(
+    'img[uuid], img[image-uuid], img[data-mowen-uid], img[data-mowen-id], img[data-uuid], img[data-file-uuid]'
+  ));
+
+  for (const image of images) {
+    const uuid = getMowenImageUuid(image);
+    if (!uuid) continue;
+
+    renderedUuids.add(uuid);
+
+    const alt = (image.getAttribute('alt') || '').trim();
+    const caption = getImageCaption(image);
+    const figureParent = image.parentElement?.tagName === 'FIGURE'
+      ? image.parentElement as HTMLElement
+      : null;
+
+    const normalizedImage = doc.createElement('img');
+    normalizedImage.setAttribute('src', resolveMowenImageUrl(uuid, noteFile));
+    normalizedImage.setAttribute('alt', alt);
+    normalizedImage.setAttribute('crossorigin', 'anonymous');
+    normalizedImage.setAttribute('style', 'max-width:100%;height:auto;');
+    normalizedImage.setAttribute('data-mowen-uuid', uuid);
+
+    if (figureParent) {
+      figureParent.replaceChild(normalizedImage, image);
+      syncFigureCaption(figureParent, doc, caption);
+      continue;
+    }
+
+    const figure = doc.createElement('figure');
+    figure.appendChild(normalizedImage);
+    syncFigureCaption(figure, doc, caption);
+    image.replaceWith(figure);
+  }
+
+  return renderedUuids;
+}
+
+function normalizeQuoteParagraphs(root: HTMLElement, doc: Document): void {
+  const quoteParagraphs = Array.from(root.querySelectorAll('p[type="quote"]'));
+
+  for (const paragraph of quoteParagraphs) {
+    const blockquote = doc.createElement('blockquote');
+    const quoteParagraph = doc.createElement('p');
+
+    while (paragraph.firstChild) {
+      quoteParagraph.appendChild(paragraph.firstChild);
+    }
+
+    if (!quoteParagraph.hasChildNodes()) {
+      quoteParagraph.appendChild(doc.createElement('br'));
+    }
+
+    blockquote.appendChild(quoteParagraph);
+    paragraph.replaceWith(blockquote);
+  }
+}
+
+function expandAttachImages(
+  root: HTMLElement,
+  doc: Document,
+  noteFile?: MowenNoteFileLike,
+  noteFileTree?: MowenNoteFileTreeLike,
+  renderedUuids?: Set<string>
+): void {
+  const rendered = renderedUuids || new Set<string>();
+  const attachedUuids = new Set<string>();
+  const placeholders = Array.from(root.querySelectorAll('attach-img'));
+
+  for (const placeholder of placeholders) {
+    const uuidList = (placeholder.getAttribute('uuid-list') || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    const fragment = doc.createDocumentFragment();
+
+    for (const uuid of uuidList) {
+      if (attachedUuids.has(uuid)) continue;
+      fragment.appendChild(createExportFigure(doc, uuid, noteFile));
+      attachedUuids.add(uuid);
+      rendered.add(uuid);
+    }
+
+    placeholder.replaceWith(fragment);
+  }
+
+  const trailingAttachImages = normalizeUuidList(noteFileTree?.imageAttach).filter(
+    (uuid) => !rendered.has(uuid) && !attachedUuids.has(uuid)
+  );
+
+  if (trailingAttachImages.length === 0) return;
+
+  for (const uuid of trailingAttachImages) {
+    root.appendChild(createExportFigure(doc, uuid, noteFile));
+    rendered.add(uuid);
+  }
+}
+
+export function normalizeMowenHtmlForExport(
+  html: string,
+  options: NormalizeMowenHtmlOptions = {}
+): string {
+  if (!html || typeof DOMParser === 'undefined') {
+    return html;
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(
+    `<div data-mowen-export-root="true">${html}</div>`,
+    'text/html'
+  );
+  const root = doc.body.firstElementChild as HTMLElement | null;
+
+  if (!root) {
+    return html;
+  }
+
+  normalizeQuoteParagraphs(root, doc);
+  const renderedUuids = normalizeMowenImages(root, doc, options.noteFile);
+  expandAttachImages(root, doc, options.noteFile, options.noteFileTree, renderedUuids);
+
+  return root.innerHTML;
+}
+
+/**
+ * 将 marks 数组转换为 HTML 开标签 + 闭标签对
+ * 返回 [openTags, closeTags]
+ */
+function marksToHtml(marks?: NoteAtomMark[]): [string, string] {
+  if (!marks || marks.length === 0) return ['', ''];
+
+  let open = '';
+  let close = '';
+
+  for (const mark of marks) {
+    switch (mark.type) {
+      case 'bold':
+        open += '<strong>';
+        close = '</strong>' + close;
+        break;
+      case 'italic':
+        open += '<em>';
+        close = '</em>' + close;
+        break;
+      case 'highlight':
+        open += '<mark>';
+        close = '</mark>' + close;
+        break;
+      case 'code':
+        open += '<code>';
+        close = '</code>' + close;
+        break;
+      case 'link': {
+        const href = mark.attrs?.href || '';
+        if (href && isSafeUrl(href)) {
+          open += `<a href="${escapeHtmlForAtom(href)}" target="_blank" rel="noopener noreferrer">`;
+        } else {
+          open += '<a>';
+        }
+        close = '</a>' + close;
+        break;
+      }
+    }
+  }
+
+  return [open, close];
+}
+
+/**
+ * 将单个 NoteAtom 节点转换为 HTML 字符串（递归）
+ */
+function atomNodeToHtml(node: NoteAtom, options: NoteAtomToHtmlOptions = {}): string {
+  switch (node.type) {
+    case 'doc':
+      // 根节点：递归渲染所有子节点
+      return (node.content || []).map(child => atomNodeToHtml(child, options)).join('\n');
+
+    case 'paragraph': {
+      // 段落节点
+      if (!node.content || node.content.length === 0) {
+        // 空段落 → 空行
+        return '<p><br></p>';
+      }
+      const inner = node.content.map(child => atomNodeToHtml(child, options)).join('');
+      return `<p>${inner}</p>`;
+    }
+
+    case 'text': {
+      // 文本节点，处理 marks
+      const text = escapeHtmlForAtom(node.text || '');
+      // 保留换行符，转换为 <br>
+      const htmlText = text.replace(/\n/g, '<br>');
+      const [open, close] = marksToHtml(node.marks);
+      return `${open}${htmlText}${close}`;
+    }
+
+    case 'quote': {
+      // 引用块
+      if (!node.content || node.content.length === 0) {
+        return '<blockquote><p></p></blockquote>';
+      }
+      // 引用块的 content 可能直接是 text 节点（而非 paragraph 包裹）
+      // 需要判断并适当包裹
+      const hasBlockChildren = node.content.some(
+        c => c.type === 'paragraph' || c.type === 'quote'
+      );
+      if (hasBlockChildren) {
+        const inner = node.content.map(child => atomNodeToHtml(child, options)).join('\n');
+        return `<blockquote>${inner}</blockquote>`;
+      } else {
+        // 直接是 text 节点，包裹在 <p> 中
+        const inner = node.content.map(child => atomNodeToHtml(child, options)).join('');
+        return `<blockquote><p>${inner}</p></blockquote>`;
+      }
+    }
+
+    case 'image': {
+      // 图片节点：UUID → CDN URL
+      const uuid = node.attrs?.uuid as string;
+      if (!uuid) return '';
+      const alt = escapeHtmlForAtom(String(node.attrs?.alt || ''));
+      const src = options.resolveImageUrl?.(uuid) || resolveMowenImageUrl(uuid);
+      // crossorigin="anonymous" 确保 html2canvas 能跨域渲染图片
+      if (alt) {
+        return `<figure><img src="${escapeHtmlForAtom(src)}" alt="${alt}" crossorigin="anonymous" style="max-width:100%;height:auto;" /><figcaption>${alt}</figcaption></figure>`;
+      }
+      return `<figure><img src="${escapeHtmlForAtom(src)}" alt="" crossorigin="anonymous" style="max-width:100%;height:auto;" /></figure>`;
+    }
+
+    case 'note': {
+      // 内链笔记节点
+      const noteUuid = node.attrs?.uuid as string;
+      if (!noteUuid) return '';
+      const noteTitle = node.content
+        ? node.content.map(c => c.text || '').join('')
+        : '查看笔记';
+      const noteUrl = `https://note.mowen.cn/detail/${escapeHtmlForAtom(noteUuid)}`;
+      return `<p class="mowen-note-ref" data-note-uuid="${escapeHtmlForAtom(noteUuid)}"><a href="${noteUrl}" target="_blank" rel="noopener noreferrer">📄 ${escapeHtmlForAtom(noteTitle)}</a></p>`;
+    }
+
+    case 'audio':
+    case 'pdf': {
+      // 音频/PDF 节点：导出为占位提示
+      const fileUuid = node.attrs?.uuid as string;
+      const typeLabel = node.type === 'audio' ? '🎵 音频文件' : '📎 PDF 文件';
+      return `<p>${typeLabel}${fileUuid ? ` (${escapeHtmlForAtom(String(fileUuid))})` : ''}</p>`;
+    }
+
+    default:
+      // 未知节点类型：尝试递归子内容，或跳过
+      if (node.content && node.content.length > 0) {
+        return node.content.map(child => atomNodeToHtml(child, options)).join('');
+      }
+      return '';
+  }
+}
+
+/**
+ * 将 NoteAtom JSON 结构转换为标准 HTML
+ *
+ * 用于 PDF 导出场景：show API 返回的 content 可能是 NoteAtom JSON，
+ * 需要先转换为浏览器可渲染的 HTML 再交给 html2pdf.js。
+ *
+ * @param atom NoteAtom 根节点（type: 'doc'）
+ * @returns 标准 HTML 字符串
+ */
+export function noteAtomToHtml(atom: NoteAtom, options: NoteAtomToHtmlOptions = {}): string {
+  return atomNodeToHtml(atom, options);
+}
+
+/**
+ * 检测字符串是否为 NoteAtom JSON 格式
+ *
+ * 判断条件：
+ * 1. 字符串能被 JSON.parse 解析
+ * 2. 解析后的对象顶层 type === 'doc'
+ * 3. 存在 content 数组
+ *
+ * @param content 原始内容字符串
+ * @returns 如果是 NoteAtom JSON 返回解析后的对象，否则返回 null
+ */
+export function parseNoteAtomJson(content: string): NoteAtom | null {
+  // 快速预检：NoteAtom JSON 必须以 { 开头
+  const trimmed = content.trim();
+  if (!trimmed.startsWith('{')) return null;
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      parsed.type === 'doc' &&
+      Array.isArray(parsed.content)
+    ) {
+      return parsed as NoteAtom;
+    }
+  } catch {
+    // JSON.parse 失败说明不是 JSON，是 HTML
+  }
+
+  return null;
 }

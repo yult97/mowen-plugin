@@ -203,7 +203,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   // LOG_DEBUG: Debug logging proxy from background
   if (message.type === 'LOG_DEBUG') {
-    console.log(`[🔍 Extension Log] ${message.payload}`);
     sendResponse({ success: true });
     return false;
   }

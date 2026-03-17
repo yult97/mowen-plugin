@@ -3,6 +3,8 @@ import { Settings, ExtractResult, SaveProgress, DEFAULT_SETTINGS } from '../type
 import { getSettings } from '../utils/storage';
 import { TaskStore, TaskState } from '../utils/taskStore';
 import { injectContentScript } from '../utils/contentScriptHelper';
+import { exportSinglePdf } from '../utils/pdfExporter';
+import { formatErrorForLog } from '../utils/helpers';
 import {
   Settings as SettingsIcon,
   X,
@@ -19,6 +21,7 @@ import {
   Key,
   BookOpen,
   Tag,
+  Download,
 } from 'lucide-react';
 import TutorialModal from '../components/TutorialModal';
 
@@ -43,6 +46,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [loading, setLoading] = useState(true);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
+  const [isPdfExporting, setIsPdfExporting] = useState(false);
 
   // State to trigger auto-fetch preview
   const [autoFetchTrigger, setAutoFetchTrigger] = useState(0);
@@ -366,7 +370,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         }
 
       } catch (error) {
-        console.error('[墨问 Popup] Auto-fetch exception:', error);
+        console.error(`[墨问 Popup] Auto-fetch exception: ${formatErrorForLog(error)}`);
         setPreviewState('P0_Idle');
       }
     };
@@ -391,7 +395,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         }
       }
     } catch (error) {
-      console.error('Failed to update current tab:', error);
+      console.error(`Failed to update current tab: ${formatErrorForLog(error)}`);
     }
   };
 
@@ -518,7 +522,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         console.log('[墨问 Popup] ⚠️ Page not clippable or no tab ID, skipping auto-load');
       }
     } catch (error) {
-      console.error('[墨问 Popup] ❌ Failed to initialize popup:', error);
+      console.error(`[墨问 Popup] Failed to initialize popup: ${formatErrorForLog(error)}`);
       setLoading(false);
     }
   };
@@ -556,7 +560,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         return false; // 返回 false 让 initializePopup 继续正常流程
       }
     } catch (e) {
-      console.error('[墨问 Popup] Failed to restore state:', e);
+      console.error(`[墨问 Popup] Failed to restore state: ${formatErrorForLog(e)}`);
     }
     return false;
   };
@@ -678,7 +682,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         throw new Error(response?.error || '提取失败');
       }
     } catch (error) {
-      console.error('[墨问] Failed to extract content:', error);
+      console.error(`[墨问 Popup] Failed to extract content: ${formatErrorForLog(error)}`);
 
       // Provide more specific error messages
       let errorMessage = '提取失败，请重试';
@@ -713,7 +717,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
   const handleSave = async () => {
     if (!extractResult) {
-      console.error('[墨问 Popup] ❌ No extract result to save');
       setProgress({
         status: 'failed',
         error: '没有可保存的内容，请先获取预览',
@@ -723,7 +726,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     }
 
     if (!settings.apiKey) {
-      console.error('[墨问 Popup] ❌ No API key configured');
       setProgress({
         status: 'failed',
         error: 'API Key 未配置，请前往设置页面配置',
@@ -765,24 +767,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       currentPart: 0,
     });
 
-    // Helper to proxy log
-    const logProxy = async (msg: string) => {
-      try {
-        const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (t?.id) chrome.tabs.sendMessage(t.id, { type: 'LOG_DEBUG', payload: msg }).catch(() => { });
-      } catch {
-        void 0;
-      }
-    };
-
     try {
       // 1. Connectivity Check
-      await logProxy('Popup: Checking connectivity (PING)...');
       try {
-        const pingRes = await chrome.runtime.sendMessage({ type: 'PING' });
-        await logProxy(`Popup: PING success, status: ${pingRes?.status}`);
+        await chrome.runtime.sendMessage({ type: 'PING' });
       } catch (pingErr) {
-        await logProxy(`Popup: ❌ PING FAILED: ${pingErr}`);
         throw new Error(`无法连接后台服务 (${String(pingErr)})`);
       }
 
@@ -791,17 +780,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       const payloadStr = JSON.stringify({ extractResult, isPublic, includeImages, maxImages: settings.maxImages });
       const payloadSize = (payloadStr.length / 1024).toFixed(2);
       console.log(`[墨问 Popup] Payload size: ${payloadSize} KB`);
-
-      // Proxy log to content script for user visibility preference
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab?.id) {
-          chrome.tabs.sendMessage(activeTab.id, {
-            type: 'LOG_DEBUG',
-            payload: `Popup: Clicking Save. Payload size: ${payloadSize} KB. Sending to Background...`
-          }).catch(() => { });
-        }
-      } catch (e) { console.error('Proxy log failed', e); }
 
       // Get tab ID before sending to ensure correct task binding
       const [saveTab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -826,8 +804,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         )
       ]);
 
-      // Immediately log that we got a response
-      await logProxy(`Popup: ✅ Got response from background: ${JSON.stringify(response)}`);
       console.log('[墨问 Popup] 📥 Received response from background:', response);
 
       // Check if background acknowledged the request
@@ -846,21 +822,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // If acknowledged, we'll wait for SAVE_NOTE_COMPLETE message
       // The completion will be handled by the message listener
     } catch (error) {
-      console.error('[墨问 Popup] ❌ Save request failed:', error);
-
-      // Proxy error to content script
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab?.id) {
-          const errMsg = error instanceof Error ? error.message : String(error);
-          chrome.tabs.sendMessage(activeTab.id, {
-            type: 'LOG_DEBUG',
-            payload: `Popup: ❌ Save failed: ${errMsg}`
-          }).catch(() => { });
-        }
-      } catch (e) {
-        void e;
-      }
+      console.error(`[墨问 Popup] Save request failed: ${formatErrorForLog(error)}`);
 
       let errorMessage = '保存失败，请重试';
       if (error instanceof Error) {
@@ -922,7 +884,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         console.log('[墨问 Popup] 🧹 Cleared TaskStore for tab:', tab.id);
       }
     } catch (err) {
-      console.error('[墨问 Popup] Failed to send cancel message:', err);
+      console.error(`[墨问 Popup] Failed to send cancel message: ${formatErrorForLog(err)}`);
     }
     setPreviewState('P5_Failed');
     setProgress({ status: 'cancelled' });
@@ -1032,12 +994,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                 payload: { enableAutoTag: newValue }
               }).then((response) => {
                 if (!response?.success) {
-                  console.error('[墨问 Popup] SAVE_SETTING failed:', response?.error);
+                  console.error(`[墨问 Popup] SAVE_SETTING failed: ${formatErrorForLog(response?.error || 'Unknown error')}`);
                   // 恢复 UI 状态以反映保存失败
                   setEnableAutoTag(!newValue);
                 }
               }).catch((err) => {
-                console.error('[墨问 Popup] Failed to save enableAutoTag:', err);
+                console.error(`[墨问 Popup] Failed to save enableAutoTag: ${formatErrorForLog(err)}`);
                 // 恢复 UI 状态以反映保存失败
                 setEnableAutoTag(!newValue);
               });
@@ -1231,6 +1193,27 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             <div className="flex gap-2">
               <button className="btn-primary flex-1" onClick={handleSave}>
                 保存到墨问
+              </button>
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  if (extractResult && !isPdfExporting) {
+                    setIsPdfExporting(true);
+                    try {
+                      await exportSinglePdf(extractResult.title, extractResult.contentHtml, {
+                        sourceUrl: currentUrl,
+                      });
+                    } catch (e) {
+                      console.error(`[Popup] PDF export error: ${formatErrorForLog(e)}`);
+                    } finally {
+                      setIsPdfExporting(false);
+                    }
+                  }
+                }}
+                disabled={isPdfExporting}
+                title="导出 PDF"
+              >
+                {isPdfExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
               </button>
               <button className="btn-secondary" onClick={handleGetPreview}>
                 <RefreshCw size={16} />
@@ -1604,6 +1587,23 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
               openOptions();
             }}
           />
+
+          {/* 我的笔记入口 */}
+          <div className="card p-3 mb-3">
+            <button
+              className="w-full flex items-center justify-between px-3 py-2 text-sm text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
+              onClick={() => {
+                const url = chrome.runtime.getURL('notesExport.html');
+                chrome.tabs.create({ url });
+              }}
+            >
+              <span className="flex items-center gap-2">
+                <BookOpen size={16} />
+                我的笔记
+              </span>
+              <ExternalLink size={14} />
+            </button>
+          </div>
         </>
       )}
     </div>
@@ -1611,4 +1611,3 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 };
 
 export default Popup;
-

@@ -109,6 +109,21 @@ export function parseErrorCode(error: unknown): string {
   return 'UNKNOWN';
 }
 
+export function formatErrorForLog(error: unknown, maxLength: number = 160): string {
+  const rawMessage = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : 'Unknown error';
+
+  return rawMessage
+    .replace(/https?:\/\/\S+/gi, '[url]')
+    .replace(/\b[a-f0-9]{24,}\b/gi, '[id]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
 /**
  * 检查页面标题是否有效（非空、非通用、长度适中）
  * 用于判断是否需要从正文中提取标题

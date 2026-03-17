@@ -9,9 +9,20 @@ export default defineConfig({
     react(),
     crx({ manifest }),
   ],
+  esbuild: {
+    drop: ['console', 'debugger'],
+  },
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+    },
+  },
+  build: {
+    rollupOptions: {
+      // 添加 notesExport.html 为额外的多页入口
+      input: {
+        notesExport: resolve(__dirname, 'notesExport.html'),
+      },
     },
   },
   server: {

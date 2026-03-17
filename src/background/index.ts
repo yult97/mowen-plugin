@@ -11,7 +11,7 @@ import {
   Highlight,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
-import { sleep, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
+import { sleep, isValidPageTitle, extractTitleFromText, formatErrorForLog } from '../utils/helpers';
 
 import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
@@ -58,11 +58,11 @@ async function removeSidePanelTab(tabId: number): Promise<void> {
 
 // 1. 禁用自动打开（需要手动控制以确保 enabled 先设置好）
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false })
-  .catch((error) => console.error('[墨问 Background] ❌ Failed to set side panel behavior:', error));
+  .catch((error) => console.error(`[墨问 Background] Failed to set side panel behavior: ${formatErrorForLog(error)}`));
 
 // 2. 默认在全局禁用 Side Panel（仅在特定 tab 启用）
 chrome.sidePanel.setOptions({ enabled: false })
-  .catch((error) => console.error('[墨问 Background] ❌ Failed to set global side panel options:', error));
+  .catch((error) => console.error(`[墨问 Background] Failed to set global side panel options: ${formatErrorForLog(error)}`));
 
 // 3. 当用户点击 Action 时，为当前 tab 启用并打开 Side Panel
 // 关键：先同步调用 setOptions（不 await），然后立即 await open()
@@ -85,7 +85,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 
       console.log(`[墨问 Background] ✅ Side Panel opened for tab ${tab.id}`);
     } catch (error) {
-      console.error('[墨问 Background] ❌ Failed to open side panel:', error);
+      console.error(`[墨问 Background] Failed to open side panel: ${formatErrorForLog(error)}`);
     }
   }
 });
@@ -195,7 +195,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         }
       }
     } catch (error) {
-      console.error('[墨问 Background] Failed to get cache for context menu:', error);
+      console.error(`[墨问 Background] Failed to get cache for context menu: ${formatErrorForLog(error)}`);
     }
 
     // 保存划线（包含缓存信息以支持追加）
@@ -239,7 +239,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
       console.log('[墨问 Background] ✅ Context menu save result:', result.success);
     } catch (error) {
-      console.error('[墨问 Background] ❌ Context menu save failed:', error);
+      console.error(`[墨问 Background] Context menu save failed: ${formatErrorForLog(error)}`);
     }
   }
 });
@@ -257,11 +257,8 @@ interface SaveNotePayload {
 
 // Helper to proxy logs to Content Script
 function logToContentScript(msg: string, tabId?: number): void {
-  if (tabId) {
-    chrome.tabs.sendMessage(tabId, { type: 'LOG_DEBUG', payload: `[BG] ${msg}` }).catch(() => {
-      // Content script 可能未加载，忽略错误
-    });
-  }
+  void msg;
+  void tabId;
 }
 
 // Listen for messages from popup
@@ -300,7 +297,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         console.log('[墨问 Background] ✅ Settings saved successfully');
         sendResponse({ success: true });
       } catch (error) {
-        console.error('[墨问 Background] ❌ Failed to save settings:', error);
+        console.error(`[墨问 Background] Failed to save settings: ${formatErrorForLog(error)}`);
         sendResponse({ success: false, error: String(error) });
       }
     })();
@@ -365,7 +362,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             }).catch(() => { });
           })
           .catch((error) => {
-            console.error('[墨问 Background] ❌ Save process failed:', error);
+            console.error(`[墨问 Background] Save process failed: ${formatErrorForLog(error)}`);
             chrome.runtime.sendMessage({
               type: 'SAVE_NOTE_COMPLETE',
               result: {
@@ -375,7 +372,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             }).catch(() => { });
           });
       } catch (e) {
-        console.error('[墨问 Background] ❌ CRITICAL: Synchronous error calling handleSaveNote:', e);
+        console.error(`[墨问 Background] Synchronous error calling handleSaveNote: ${formatErrorForLog(e)}`);
       }
     })();
 
@@ -395,7 +392,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse(result);
       })
       .catch((error) => {
-        console.error('[墨问 Background] ❌ SAVE_HIGHLIGHT error:', error);
+        console.error(`[墨问 Background] SAVE_HIGHLIGHT error: ${formatErrorForLog(error)}`);
         const errorResult: HighlightSaveResult = {
           success: false,
           isAppend: false,
@@ -405,6 +402,116 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse(errorResult);
       });
     return true; // 保持消息通道开放以便异步响应
+  }
+
+  // 墨问 Web 内部 API 代理请求
+  // 扩展页面（chrome-extension:// 协议）无法携带第三方网站 Cookie，
+  // 因此通过 Background Service Worker 代理请求（host_permissions 已覆盖 <all_urls>）
+  if (message.type === 'MOWEN_WEB_API_REQUEST') {
+    const { path, body } = message.payload || {};
+    console.log('[墨问 Background] 🌐 MOWEN_WEB_API_REQUEST:', path);
+
+    if (!path) {
+      sendResponse({ success: false, error: '缺少请求路径', errorCode: 'INVALID_REQUEST' });
+      return false;
+    }
+
+    const WEB_API_BASE = 'https://note.mowen.cn';
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    (async () => {
+      try {
+        const response = await fetch(`${WEB_API_BASE}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          credentials: 'include',
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const isAuthError = response.status === 401 || response.status === 403;
+          sendResponse({
+            success: false,
+            error: isAuthError ? '请先在浏览器中登录墨问' : `请求失败 (HTTP ${response.status})`,
+            errorCode: isAuthError ? 'NOT_LOGGED_IN' : 'REQUEST_FAILED',
+            status: response.status,
+          });
+          return;
+        }
+
+        const data = await response.json();
+        sendResponse({ success: true, data });
+      } catch (error) {
+        clearTimeout(timeoutId);
+        const isAbort = error instanceof Error && error.name === 'AbortError';
+        sendResponse({
+          success: false,
+          error: isAbort ? '请求超时，请检查网络连接' : (error instanceof Error ? error.message : '未知错误'),
+          errorCode: isAbort ? 'TIMEOUT' : 'UNKNOWN',
+          status: 0,
+        });
+      }
+    })();
+
+    return true; // 保持消息通道开放以便异步响应
+  }
+
+  // PDF 导出：通过 Background SW 代理下载图片并转为 data URL
+  // 扩展页面（chrome-extension:// 协议）受 CORS 限制无法直接加载跨域图片到 Canvas，
+  // 但 Background SW 拥有 host_permissions: <all_urls>，可以绕过
+  if (message.type === 'FETCH_IMAGE_AS_DATA_URL') {
+    const { url } = message.payload || {};
+    if (!url) {
+      sendResponse({ success: false, error: '缺少图片 URL' });
+      return false;
+    }
+
+    (async () => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 秒超时
+
+        const response = await fetch(url, {
+          method: 'GET',
+          credentials: 'include', // 携带 Cookie（墨问 CDN 可能需要）
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          sendResponse({ success: false, error: `HTTP ${response.status}` });
+          return;
+        }
+
+        const blob = await response.blob();
+        const mimeType = blob.type || 'image/jpeg';
+
+        // Blob → base64
+        const arrayBuffer = await blob.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64 = btoa(binary);
+        const dataUrl = `data:${mimeType};base64,${base64}`;
+
+        sendResponse({ success: true, dataUrl });
+      } catch (error) {
+        const isAbort = error instanceof Error && error.name === 'AbortError';
+        sendResponse({
+          success: false,
+          error: isAbort ? '图片下载超时' : (error instanceof Error ? error.message : '未知错误'),
+        });
+      }
+    })();
+
+    return true; // 保持消息通道开放
   }
 
   // 打开设置页
@@ -509,7 +616,7 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
         console.log(`[墨问 Background] ⚠️ No valid body found, falling back to create new note`);
       }
     } catch (error) {
-      console.error('[墨问 Background] ❌ Append failed:', error);
+      console.error(`[墨问 Background] Append failed: ${formatErrorForLog(error)}`);
       // 降级为创建新笔记
     }
   }
@@ -518,7 +625,7 @@ async function handleSaveHighlight(payload: SaveHighlightPayload): Promise<Highl
   console.log('[墨问 Background] 📝 Creating new highlight note');
 
   // 构建划线内容 HTML（用于创建新笔记）
-  let highlightHtml = formatHighlightContent(highlight);
+  const highlightHtml = formatHighlightContent(highlight);
 
   // URL 安全验证：仅允许 http/https 协议
   const isValidUrl = (url: string): boolean => {
@@ -668,7 +775,7 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
     console.log('[墨问 Background] ✅ Settings loaded');
     logToContentScript('✅ Settings loaded', tabId);
   } catch (err) {
-    console.error('[墨问 Background] ❌ Failed to load settings:', err);
+    console.error(`[墨问 Background] Failed to load settings: ${formatErrorForLog(err)}`);
     return { success: false, error: '无法加载设置', errorCode: 'SETTINGS_ERROR' };
   }
 
@@ -863,7 +970,7 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         logToContentScript('✅ 合集笔记创建成功', tabId);
       } else {
         // 合集创建失败不阻断整体流程，但要记录错误
-        console.error('[墨问 Background] ❌ 合集笔记创建失败:', indexResult.error);
+        console.error(`[墨问 Background] 合集笔记创建失败: ${formatErrorForLog(indexResult.error || 'Unknown error')}`);
         logToContentScript(`⚠️ 合集笔记创建失败: ${indexResult.error || '未知错误'}`, tabId);
       }
     }
@@ -902,7 +1009,7 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
   } catch (error) {
     // Also clean up on error
     runningTasks.delete(tabId);
-    console.error('[墨问 Background] ❌ Save process failed with exception:', error);
+    console.error(`[墨问 Background] Save process failed with exception: ${formatErrorForLog(error)}`);
     const errorResult = {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
@@ -938,7 +1045,7 @@ function sendProgressUpdate(progress: {
     TaskStore.updateProgress(tabId, {
       ...progress,
       status: progress.type === 'uploading_images' ? 'uploading_images' : 'creating_note',
-    }).catch(e => console.error('Failed to persist progress:', e));
+    }).catch((error) => console.error(`Failed to persist progress: ${formatErrorForLog(error)}`));
   }
 }
 
@@ -1047,7 +1154,7 @@ async function processImages(
       const data = await fetchBlobFn();
       fetchResults[index] = data; // Store result
     } catch (e) {
-      console.error(`[img] Fetch blob ${imageIndex} error:`, e);
+      console.error(`[img] Fetch blob ${imageIndex} error: ${formatErrorForLog(e)}`);
       fetchResults[index] = null;
     }
 
@@ -1100,7 +1207,7 @@ async function processImages(
         logToContentScript(`❌ [${imageIndex}/${totalImages}] 上传失败: ${result.failureReason}`, tabId);
       }
     } catch (err) {
-      console.error(`[img] Upload ${imageIndex} exception:`, err);
+      console.error(`[img] Upload ${imageIndex} exception: ${formatErrorForLog(err)}`);
       results[i] = {
         id: image.id,
         originalUrl: image.url,

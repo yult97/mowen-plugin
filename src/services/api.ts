@@ -1,5 +1,5 @@
 import { NoteCreateResult } from '../types';
-import { formatDate, parseErrorCode } from '../utils/helpers';
+import { formatDate, formatErrorForLog, parseErrorCode } from '../utils/helpers';
 import { htmlToNoteAtom } from '../utils/noteAtom';
 
 const API_BASE_URL = 'https://open.mowen.cn/api/open/api/v1';
@@ -128,8 +128,7 @@ async function apiRequest<T>(
         try {
           const errorBody = JSON.parse(responseBody);
           if (errorBody?.reason === 'PERM') {
-            // 服务端明确返回权限不足，记录原始技术信息供调试
-            console.warn('[apiRequest] 403 PERM:', errorBody.message);
+            console.warn('[apiRequest] 403 PERM');
             // 为用户提供友好的中文提示，而非服务端的英文技术信息
             permMessage = '该功能仅限 Pro 会员使用，请升级后再试';
           }
@@ -208,11 +207,9 @@ async function apiRequest<T>(
     const isErrorCode = hasCode && !Number.isNaN(normalizedCode) && normalizedCode !== 0;
 
     if (isErrorCode) {
-      console.error(`[apiRequest] ${endpoint} error response:`, {
-        code: parsed?.code,
-        message: parsed?.message,
-        data: parsed?.data,
-      });
+      console.error(
+        `[apiRequest] ${endpoint} error response: code=${String(parsed?.code ?? 'unknown')}, message=${formatErrorForLog(parsed?.message ?? 'unknown')}`
+      );
       throw new ApiRequestError(parsed?.message || 'Unknown error', {
         status: response.status,
         code: parsed?.code,
@@ -283,7 +280,7 @@ export async function createNote(
       log(`createNote: NoteAtom conversion done, content items = ${body?.content?.length || 0}`);
       // Log full object depth for debugging
     } catch (convErr) {
-      console.error('[sw] createNote: NoteAtom conversion FAILED:', convErr);
+      console.error(`[sw] createNote: NoteAtom conversion failed: ${formatErrorForLog(convErr)}`);
       log(`❌ NoteAtom conversion FAILED: ${convErr}`);
       return {
         success: false,
@@ -309,7 +306,7 @@ export async function createNote(
     // Check if data and noteId exist (safe access)
     const noteId = data?.noteId;
     if (!noteId) {
-      console.error('[sw] createNote: Missing noteId in response:', data);
+      console.error('[sw] createNote: Missing noteId in response');
       log('❌ createNote: Missing noteId in response');
       return {
         success: false,
@@ -354,13 +351,9 @@ export async function createNote(
       }
 
       // Log for debugging
-      console.error('[createNote] API Error:', {
-        status: error.status,
-        code: error.code,
-        message: error.message,
-        data: error.data,
-        rawBody: error.rawBody,
-      });
+      console.error(
+        `[createNote] API Error: status=${error.status}, code=${String(error.code ?? 'unknown')}, message=${formatErrorForLog(error)}`
+      );
       log(`❌ API Error: Status=${error.status}, Msg=${error.message}`);
       if (error.rawBody) {
         log(`❌ Server Response Body: ${error.rawBody.substring(0, 500)}`);
@@ -404,7 +397,7 @@ export async function createNoteWithBody(
 
     const noteId = data?.noteId;
     if (!noteId) {
-      console.error('[sw] createNoteWithBody: Missing noteId in response:', data);
+      console.error('[sw] createNoteWithBody: Missing noteId in response');
       return {
         success: false,
         error: 'API 返回数据格式异常，缺少 noteId',
@@ -443,7 +436,7 @@ export async function createNoteWithBody(
       }
     }
 
-    console.error('[sw] createNoteWithBody: error', error);
+    console.error(`[sw] createNoteWithBody: error: ${formatErrorForLog(error)}`);
     const errorCode = getErrorCode(error);
     return {
       success: false,
@@ -1209,7 +1202,7 @@ export async function editNote(
       noteId: data?.noteId || noteId,
     };
   } catch (error) {
-    console.error('[sw] editNote error:', error);
+    console.error(`[sw] editNote error: ${formatErrorForLog(error)}`);
 
     // 检查是否为笔记不存在的错误
     if (error instanceof ApiRequestError) {

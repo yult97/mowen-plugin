@@ -1,0 +1,765 @@
+/* ============================================
+ * 笔记导出管理页面样式
+ * PRD 改版：选中态/hover/禁用态优化 + 导出设置区 + 已选内容区
+ * ============================================ */
+
+.notes-export-page {
+  min-height: 100vh;
+  background: #FBF5EF;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+/* 加载与登录状态 */
+.notes-export-loading,
+.notes-export-login {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  gap: 16px;
+  color: #6B7280;
+}
+
+.notes-export-login h2 {
+  font-size: 22px;
+  color: #1F2937;
+  margin: 0;
+}
+
+.notes-export-login p {
+  font-size: 14px;
+  color: #9CA3AF;
+  margin: 0;
+}
+
+/* ============================================
+ * 顶部任务区（PRD 第 7 节：导出工作台式布局）
+ * ============================================ */
+.notes-export-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 24px 32px 20px;
+  background: white;
+  border-bottom: 1px solid #E8E0DA;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.header-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-left h1 {
+  font-size: 20px;
+  font-weight: 600;
+  color: #1F2937;
+  margin: 0;
+}
+
+.header-subtitle {
+  font-size: 13px;
+  color: #9CA3AF;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.note-count {
+  font-size: 13px;
+  color: #9CA3AF;
+  background: #F3F4F6;
+  padding: 2px 10px;
+  border-radius: 12px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* ============================================
+ * 工具栏
+ * ============================================ */
+.notes-export-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 32px;
+  background: white;
+  border-bottom: 1px solid #E8E0DA;
+  gap: 16px;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex: 1;
+  max-width: 400px;
+  color: #9CA3AF;
+}
+
+.search-box input {
+  border: none;
+  background: none;
+  outline: none;
+  width: 100%;
+  font-size: 14px;
+  color: #1F2937;
+}
+
+.search-box input::placeholder {
+  color: #D1D5DB;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ============================================
+ * 按钮样式
+ * ============================================ */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 20px;
+  background: #BF4045;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s;
+  text-decoration: none;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #A8383D;
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-outline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: white;
+  color: #BF4045;
+  border: 1px solid #BF4045;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-decoration: none;
+}
+
+.btn-outline:hover:not(:disabled) {
+  background: rgba(191, 64, 69, 0.05);
+}
+
+.btn-outline:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-text {
+  background: none;
+  border: none;
+  color: #6B7280;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: color 0.2s;
+}
+
+.btn-text:hover:not(:disabled) {
+  color: #BF4045;
+}
+
+.btn-text:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-icon {
+  background: none;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  padding: 6px;
+  cursor: pointer;
+  color: #6B7280;
+  display: flex;
+  align-items: center;
+  transition: all 0.2s;
+}
+
+.btn-icon:hover {
+  background: #F3F4F6;
+  color: #BF4045;
+}
+
+.btn-expand {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #6B7280;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.btn-expand:hover:not(:disabled) {
+  background: #F3F4F6;
+  color: #BF4045;
+  border-color: #BF4045;
+}
+
+.btn-expand:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* ============================================
+ * 上限提示（PRD 第 9 节：超限处理规则）
+ * ============================================ */
+.limit-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 32px;
+  padding: 10px 14px;
+  background: #FFF7ED;
+  border: 1px solid #FED7AA;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #C2410C;
+  line-height: 1.5;
+}
+
+/* ============================================
+ * 已选内容区（PRD 第 11.3 节）
+ * ============================================ */
+.selected-summary {
+  margin: 12px 32px;
+  background: white;
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.selected-summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+
+.selected-summary-header:hover {
+  background: #FAFAFA;
+}
+
+.selected-summary-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #4B5563;
+}
+
+.selected-summary-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #9CA3AF;
+}
+
+.selected-summary-list {
+  border-top: 1px solid #F3F4F6;
+  padding: 4px 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.selected-summary-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  font-size: 13px;
+  color: #374151;
+  transition: background 0.1s;
+}
+
+.selected-summary-item:hover {
+  background: #FBF5EF;
+}
+
+.selected-summary-item .item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-summary-item .btn-remove {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: #D1D5DB;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s;
+}
+
+.selected-summary-item .btn-remove:hover {
+  color: #EF4444;
+}
+
+/* ============================================
+ * 导出设置区（PRD 第 10 节）
+ * ============================================ */
+.export-settings {
+  margin: 12px 32px;
+  padding: 14px 18px;
+  background: white;
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+}
+
+.export-settings-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: #6B7280;
+  margin-bottom: 12px;
+}
+
+.export-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+}
+
+.export-settings-label {
+  font-size: 13px;
+  color: #374151;
+}
+
+.export-settings-label .label-hint {
+  font-size: 12px;
+  color: #6B7280;
+  margin-left: 6px;
+}
+
+.export-settings-hint {
+  font-size: 12px;
+  color: #6B7280;
+  margin: 2px 0 6px;
+  padding-left: 2px;
+  line-height: 1.4;
+}
+
+/* 切换开关样式 */
+.toggle-switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: #D1D5DB;
+  border-radius: 22px;
+  transition: background-color 0.2s;
+}
+
+.toggle-slider:before {
+  content: "";
+  position: absolute;
+  height: 16px;
+  width: 16px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: #BF4045;
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(18px);
+}
+
+/* 分段选择器 */
+.segmented-control {
+  display: flex;
+  background: #F3F4F6;
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.segmented-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #6B7280;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+
+.segmented-btn.active {
+  background: #FFF8F8;
+  color: #BF4045;
+  font-weight: 500;
+  border: 1px solid #F0D0D1;
+  box-shadow: none;
+}
+
+/* ============================================
+ * 导出进度
+ * ============================================ */
+.export-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 32px;
+  padding: 12px 16px;
+  background: white;
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+  font-size: 13px;
+  color: #4B5563;
+}
+
+.export-progress.success {
+  border-color: #86EFAC;
+  background: #F0FDF4;
+  color: #166534;
+}
+
+.export-progress.partial-fail {
+  border-color: #FED7AA;
+  background: #FFFBEB;
+  color: #92400E;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  background: #E5E7EB;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #BF4045;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.export-progress.success .progress-fill {
+  background: #22C55E;
+}
+
+.progress-actions {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+/* ============================================
+ * 错误提示
+ * ============================================ */
+.list-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 32px;
+  padding: 12px 16px;
+  background: #FEF2F2;
+  border: 1px solid #FECACA;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #DC2626;
+}
+
+/* ============================================
+ * 笔记列表（PRD 第 8 节：选中态与交互样式优化）
+ * ============================================ */
+.notes-list {
+  padding: 16px 32px 32px;
+}
+
+.note-item-wrapper {
+  margin-bottom: 2px;
+}
+
+/* 笔记卡片：默认态（PRD 8.1：白底 + 浅灰边 #E9E4E4） */
+.note-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  background: white;
+  border: 1px solid #E9E4E4;
+  border-left: 3px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-bottom: 8px;
+}
+
+/* Hover 态（PRD 8.1：背景 #FCF6F6，提示可点击但不接近选中态） */
+.note-item:hover {
+  background: #FCF6F6;
+}
+
+/* 选中态（PRD 8.1：浅红底 #FFF4F4 + 左侧红条 + 淡红边框） */
+.note-item.selected {
+  background: #FFF4F4;
+  border-color: #F5D5D6;
+  border-left-color: #BF4045;
+}
+
+/* 禁用态（PRD 8.1：整体降饱和 + 禁止勾选） */
+.note-item.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.note-item.disabled:hover {
+  background: white;
+}
+
+.note-checkbox {
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.note-checkbox input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #BF4045;
+  cursor: pointer;
+}
+
+.note-checkbox input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.note-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.note-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.note-title {
+  font-size: 15px;
+  font-weight: 500;
+  color: #1F2937;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 摘要：PRD 8.2 要求 1 行摘要，避免过长 */
+.note-digest {
+  font-size: 13px;
+  color: #9CA3AF;
+  margin: 4px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+}
+
+.note-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.note-date {
+  font-size: 12px;
+  color: #D1D5DB;
+}
+
+.note-tags {
+  display: flex;
+  gap: 4px;
+}
+
+.tag {
+  font-size: 11px;
+  padding: 1px 8px;
+  background: #F3F4F6;
+  color: #6B7280;
+  border-radius: 10px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+/* 合集 badge：PRD 8.3 明确显示"合集"标识 */
+.badge-collection {
+  background: rgba(191, 64, 69, 0.08);
+  color: #BF4045;
+}
+
+.badge-top {
+  background: rgba(59, 130, 246, 0.08);
+  color: #3B82F6;
+}
+
+.badge-child-count {
+  background: #F3F4F6;
+  color: #9CA3AF;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+}
+
+/* ============================================
+ * 子笔记（PRD 8.3：合集卡片结构）
+ * ============================================ */
+.child-notes {
+  margin-left: 44px;
+  margin-bottom: 8px;
+  border-left: 2px solid #E8E0DA;
+  padding-left: 12px;
+}
+
+.child-note-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #FAFAF9;
+  border: 1px solid #E8E0DA;
+  border-left: 3px solid transparent;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.child-note-item:hover {
+  background: #FCF6F6;
+}
+
+.child-note-item.selected {
+  background: #FFF4F4;
+  border-color: #F5D5D6;
+  border-left-color: #BF4045;
+}
+
+.child-note-item.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.child-notes-empty {
+  margin-left: 44px;
+  padding: 12px;
+  font-size: 13px;
+  color: #D1D5DB;
+  margin-bottom: 8px;
+}
+
+/* 加载更多 */
+.load-more {
+  text-align: center;
+  padding: 24px 0;
+}
+
+/* 空状态 */
+.empty-state {
+  text-align: center;
+  padding: 60px 0;
+  color: #D1D5DB;
+}
+
+.empty-state p {
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+/* 动画 */
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
