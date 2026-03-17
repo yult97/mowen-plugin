@@ -17,6 +17,7 @@
     "html2pdf.js": "^0.14.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.312.0",
+    "pdf-lib": "^1.17.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

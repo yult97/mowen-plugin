@@ -22,9 +22,82 @@ import { htmlToNoteAtom } from '../utils/noteAtom';
 const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
 const MAX_RETRY_ROUNDS = LIMITS.MAX_RETRY_ROUNDS;
 const IMAGE_TIMEOUT = LIMITS.IMAGE_UPLOAD_TIMEOUT;
+const EXTENSION_PAGE_PREFIX = chrome.runtime.getURL('');
+const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
+const ALLOWED_MOWEN_WEB_API_PATHS = new Set([
+  '/api/note/entry/v1/note/workbench',
+  '/api/note/entry/v1/note/tops',
+  '/api/note/wxa/v1/note/show',
+  '/api/note/wxa/v1/gallery/infos',
+  '/api/note/entry/v1/note/ref/infos',
+]);
 
 // Running Tasks Map: tabId -> AbortController
 const runningTasks = new Map<number, AbortController>();
+
+function isTrustedExtensionPageSender(sender: chrome.runtime.MessageSender): boolean {
+  return typeof sender.url === 'string' && sender.url.startsWith(EXTENSION_PAGE_PREFIX);
+}
+
+function isAllowedMowenWebApiPath(path: string): boolean {
+  return ALLOWED_MOWEN_WEB_API_PATHS.has(path);
+}
+
+function isPrivateOrLocalHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  if (!normalized) return true;
+
+  if (
+    normalized === 'localhost' ||
+    normalized === '0.0.0.0' ||
+    normalized === '::1' ||
+    normalized === '[::1]' ||
+    normalized.endsWith('.local')
+  ) {
+    return true;
+  }
+
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(normalized)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(normalized)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(normalized)) return true;
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(normalized)) return true;
+
+  const private172 = normalized.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (private172) {
+    const secondOctet = Number(private172[1]);
+    if (secondOctet >= 16 && secondOctet <= 31) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isAllowedImageProxyUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+
+    if (parsed.username || parsed.password) {
+      return false;
+    }
+
+    return !isPrivateOrLocalHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function shouldIncludeImageProxyCredentials(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return /(^|\.)mowen\.cn$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
 
 // ============================================
 // Side Panel 配置：Tab 级别可见性控制
@@ -262,7 +335,7 @@ function logToContentScript(msg: string, tabId?: number): void {
 }
 
 // Listen for messages from popup
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   logger.log('Received message:', message.type);
 
   if (message.type === 'PING') {
@@ -411,8 +484,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const { path, body } = message.payload || {};
     console.log('[墨问 Background] 🌐 MOWEN_WEB_API_REQUEST:', path);
 
+    if (!isTrustedExtensionPageSender(sender)) {
+      sendResponse({ success: false, error: '非法请求来源', errorCode: 'UNTRUSTED_SENDER' });
+      return false;
+    }
+
     if (!path) {
       sendResponse({ success: false, error: '缺少请求路径', errorCode: 'INVALID_REQUEST' });
+      return false;
+    }
+
+    if (!isAllowedMowenWebApiPath(path)) {
+      sendResponse({ success: false, error: '不支持的接口路径', errorCode: 'PATH_NOT_ALLOWED' });
       return false;
     }
 
@@ -465,19 +548,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // 但 Background SW 拥有 host_permissions: <all_urls>，可以绕过
   if (message.type === 'FETCH_IMAGE_AS_DATA_URL') {
     const { url } = message.payload || {};
+
+    if (!isTrustedExtensionPageSender(sender)) {
+      sendResponse({ success: false, error: '非法请求来源' });
+      return false;
+    }
+
     if (!url) {
       sendResponse({ success: false, error: '缺少图片 URL' });
       return false;
     }
 
-    (async () => {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 秒超时
+    if (!isAllowedImageProxyUrl(url)) {
+      sendResponse({ success: false, error: '不允许代理该图片地址' });
+      return false;
+    }
 
+    (async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 秒超时
+
+      try {
         const response = await fetch(url, {
           method: 'GET',
-          credentials: 'include', // 携带 Cookie（墨问 CDN 可能需要）
+          credentials: shouldIncludeImageProxyCredentials(url) ? 'include' : 'omit',
           signal: controller.signal,
         });
 
@@ -488,8 +582,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
 
+        const responseType = (response.headers.get('content-type') || '').toLowerCase();
+        if (responseType && !responseType.startsWith('image/')) {
+          sendResponse({ success: false, error: '仅支持图片资源' });
+          return;
+        }
+
+        const responseLength = Number(response.headers.get('content-length') || '0');
+        if (Number.isFinite(responseLength) && responseLength > MAX_PROXY_IMAGE_BYTES) {
+          sendResponse({ success: false, error: '图片过大，无法导出' });
+          return;
+        }
+
         const blob = await response.blob();
         const mimeType = blob.type || 'image/jpeg';
+        if (!mimeType.toLowerCase().startsWith('image/')) {
+          sendResponse({ success: false, error: '仅支持图片资源' });
+          return;
+        }
+
+        if (blob.size > MAX_PROXY_IMAGE_BYTES) {
+          sendResponse({ success: false, error: '图片过大，无法导出' });
+          return;
+        }
 
         // Blob → base64
         const arrayBuffer = await blob.arrayBuffer();
@@ -503,6 +618,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         sendResponse({ success: true, dataUrl });
       } catch (error) {
+        clearTimeout(timeoutId);
         const isAbort = error instanceof Error && error.name === 'AbortError';
         sendResponse({
           success: false,

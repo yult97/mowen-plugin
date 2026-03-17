@@ -5,14 +5,33 @@
  * 支持单篇导出和批量导出，内置打印友好的 CSS 样式。
  */
 
+import DOMPurify from 'dompurify';
+import { downloadAndPreviewPdf } from './pdfPreview';
+
 // html2pdf.js 没有官方的 TypeScript 类型声明
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let html2pdfModule: any = null;
+let pdfLibModule: typeof import('pdf-lib') | null = null;
+let html2pdfOverlayPatched = false;
 
 const PDF_PAGE_WIDTH_MM = 210;
-const PDF_MARGIN_MM = 15;
+const PDF_PAGE_HEIGHT_MM = 297;
+const PDF_MARGIN_VERTICAL_MM = 10;
+const PDF_MARGIN_HORIZONTAL_MM = 15;
 const CSS_PX_PER_MM = 96 / 25.4;
-const PDF_RENDER_WIDTH_PX = Math.floor((PDF_PAGE_WIDTH_MM - PDF_MARGIN_MM * 2) * CSS_PX_PER_MM);
+const PDF_HTML2CANVAS_SCALE = 2;
+const PDF_PAGE_INNER_WIDTH_MM = PDF_PAGE_WIDTH_MM - PDF_MARGIN_HORIZONTAL_MM * 2;
+const PDF_PAGE_INNER_HEIGHT_MM = PDF_PAGE_HEIGHT_MM - PDF_MARGIN_VERTICAL_MM * 2;
+const PDF_PAGE_INNER_RATIO = PDF_PAGE_INNER_HEIGHT_MM / PDF_PAGE_INNER_WIDTH_MM;
+const DEFAULT_PDF_RENDER_METRICS = computeCanvasAlignedPageMetricsFromExactCssWidth(
+  PDF_PAGE_INNER_WIDTH_MM * CSS_PX_PER_MM,
+  PDF_PAGE_INNER_RATIO,
+  PDF_HTML2CANVAS_SCALE
+);
+const PDF_RENDER_WIDTH_PX = DEFAULT_PDF_RENDER_METRICS.renderWidthPx;
+const PDF_RENDER_CONTENT_HEIGHT_PX = DEFAULT_PDF_RENDER_METRICS.pageHeightPx;
+const PDF_RENDER_ROOT_ATTRIBUTE = 'data-pdf-render-root';
+const PDF_FORCE_PAGE_BREAK_CLASS = 'pdf-force-page-break';
 const INTERNAL_NOTE_LINK_REGEX = /^(?:https?:\/\/(?:note|d-note|dev-note)\.mowen\.cn)?\/detail\/([^/?#]+)/i;
 const INLINE_NOTE_REFERENCE_REGEX = /(?:<note\b[^>]*uuid=|data-note-uuid=|data-mowen-note-uuid=|<q\b[^>]*(?:uuid=|cite=)|<a\b[^>]*href="(?:https?:\/\/(?:note|d-note|dev-note)\.mowen\.cn)?\/detail\/[^"]+)/i;
 
@@ -31,7 +50,311 @@ async function getHtml2Pdf() {
     const module = await import('html2pdf.js');
     html2pdfModule = module.default || module;
   }
+  if (!html2pdfOverlayPatched) {
+    patchHtml2PdfOverlayBehavior(html2pdfModule);
+    html2pdfOverlayPatched = true;
+  }
   return html2pdfModule;
+}
+
+async function getPdfLib() {
+  if (!pdfLibModule) {
+    const module = await import('pdf-lib');
+    pdfLibModule = module;
+  }
+
+  return pdfLibModule;
+}
+
+function toUint8Array(
+  data: ArrayBuffer | Uint8Array | ArrayBufferView
+): Uint8Array {
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+
+  throw new Error('Unsupported PDF binary payload type');
+}
+
+function toArrayBuffer(data: ArrayBuffer | Uint8Array | ArrayBufferView): ArrayBuffer {
+  if (data instanceof ArrayBuffer) {
+    return data;
+  }
+
+  const bytes = toUint8Array(data);
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+async function normalizePdfForViewerCompatibility(
+  pdfBinary: ArrayBuffer | Uint8Array | ArrayBufferView
+): Promise<Blob> {
+  const { PDFDocument, PDFName } = await getPdfLib();
+  const sourceBytes = toUint8Array(pdfBinary);
+  const pdfDocument = await PDFDocument.load(sourceBytes, {
+    updateMetadata: false,
+  });
+  const catalog = pdfDocument.catalog;
+
+  for (const key of ['OpenAction', 'PageLayout', 'PageMode', 'ViewerPreferences']) {
+    catalog.delete(PDFName.of(key));
+  }
+
+  const normalizedBytes = await pdfDocument.save({
+    useObjectStreams: false,
+    updateFieldAppearances: false,
+  });
+
+  return new Blob([toArrayBuffer(normalizedBytes)], { type: 'application/pdf' });
+}
+
+async function outputCompatiblePdfBlob(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  worker: any
+): Promise<Blob> {
+  const rawPdfBinary = await worker.outputPdf('arraybuffer');
+
+  try {
+    return await normalizePdfForViewerCompatibility(rawPdfBinary);
+  } catch (error) {
+    console.warn('[pdfExporter] normalizePdfForViewerCompatibility failed:', error);
+    return new Blob([toArrayBuffer(rawPdfBinary)], { type: 'application/pdf' });
+  }
+}
+
+function resolveHtml2CanvasScale(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  workerContext?: any
+): number {
+  const configuredScale = Number(workerContext?.opt?.html2canvas?.scale);
+  if (Number.isFinite(configuredScale) && configuredScale > 0) {
+    return configuredScale;
+  }
+
+  if (typeof window !== 'undefined' && Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0) {
+    return window.devicePixelRatio;
+  }
+
+  return 1;
+}
+
+function computeCanvasAlignedPageMetricsFromExactCssWidth(
+  exactCssWidth: number,
+  exactRatio: number,
+  scale: number
+): {
+  renderWidthPx: number;
+  pageHeightPx: number;
+  canvasPageHeightPx: number;
+  ratio: number;
+} {
+  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const safeExactWidth = Number.isFinite(exactCssWidth) && exactCssWidth > 0 ? exactCssWidth : 1;
+  const safeExactRatio = Number.isFinite(exactRatio) && exactRatio > 0 ? exactRatio : 1;
+  const renderWidthPx = Math.max(1, Math.ceil(safeExactWidth));
+  const canvasWidthPx = Math.max(1, Math.floor(renderWidthPx * safeScale));
+  const canvasPageHeightPx = Math.max(1, Math.floor(canvasWidthPx * safeExactRatio));
+
+  return {
+    renderWidthPx,
+    pageHeightPx: canvasPageHeightPx / safeScale,
+    canvasPageHeightPx,
+    ratio: canvasPageHeightPx / canvasWidthPx,
+  };
+}
+
+function syncWorkerPageMetricsToCanvasPipeline(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  workerContext: any
+): void {
+  const pageSize = workerContext?.prop?.pageSize;
+  const innerWidth = Number(pageSize?.inner?.width);
+  const innerHeight = Number(pageSize?.inner?.height);
+  const unitScale = Number(pageSize?.k);
+
+  if (!Number.isFinite(innerWidth) || !Number.isFinite(innerHeight) || !Number.isFinite(unitScale)) {
+    return;
+  }
+
+  const exactCssWidth = innerWidth * unitScale / 72 * 96;
+  const metrics = computeCanvasAlignedPageMetricsFromExactCssWidth(
+    exactCssWidth,
+    innerHeight / innerWidth,
+    resolveHtml2CanvasScale(workerContext)
+  );
+
+  pageSize.inner.px = pageSize.inner.px || {};
+  pageSize.inner.px.width = metrics.renderWidthPx;
+  pageSize.inner.px.height = metrics.pageHeightPx;
+  pageSize.inner.ratio = metrics.ratio;
+}
+
+function getPdfRenderRootFromWorkerContext(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  workerContext: any
+): HTMLElement | null {
+  const source = workerContext?.prop?.src;
+  if (!(source instanceof Element)) {
+    return null;
+  }
+
+  return source.closest<HTMLElement>(`[${PDF_RENDER_ROOT_ATTRIBUTE}="true"]`);
+}
+
+function applyDetachedOverlayStyles(overlay: HTMLElement): void {
+  overlay.style.position = 'absolute';
+  overlay.style.left = '0';
+  overlay.style.top = '0';
+  overlay.style.right = 'auto';
+  overlay.style.bottom = 'auto';
+  overlay.style.width = '100%';
+  overlay.style.height = 'auto';
+  overlay.style.minHeight = '100%';
+  overlay.style.opacity = '0';
+  overlay.style.pointerEvents = 'none';
+  overlay.style.overflow = 'hidden';
+  overlay.style.zIndex = '-1';
+}
+
+function attachWorkerCleanup(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  workerResult: any,
+  cleanup: () => void
+): void {
+  let cleanedUp = false;
+  const runCleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    cleanup();
+  };
+
+  if (workerResult && typeof workerResult.thenExternal === 'function') {
+    workerResult.thenExternal(runCleanup, runCleanup);
+    return;
+  }
+
+  if (workerResult && typeof workerResult.finally === 'function') {
+    workerResult.finally(runCleanup);
+    return;
+  }
+
+  runCleanup();
+}
+
+function patchHtml2PdfOverlayBehavior(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  html2pdf: any
+): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const workerPrototype = html2pdf?.Worker?.prototype as Record<string, any> | undefined;
+  if (!workerPrototype || workerPrototype.__mowenDetachedOverlayPatched) {
+    return;
+  }
+
+  const originalSetPageSize = workerPrototype.setPageSize;
+  const originalToContainer = workerPrototype.toContainer;
+  const originalToCanvas = workerPrototype.toCanvas;
+
+  if (typeof originalSetPageSize === 'function') {
+    workerPrototype.setPageSize = function patchedSetPageSize(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this: any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...args: any[]
+    ) {
+      return originalSetPageSize.apply(this, args).then(function afterSetPageSize(this: any) {
+        syncWorkerPageMetricsToCanvasPipeline(this);
+      });
+    };
+  }
+
+  if (typeof originalToContainer === 'function') {
+    workerPrototype.toContainer = function patchedToContainer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this: any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...args: any[]
+    ) {
+      const body = document.body;
+      const originalAppendChild = body.appendChild;
+
+      body.appendChild = (<T extends Node>(node: T): T => {
+        if (node instanceof HTMLElement && node.classList.contains('html2pdf__overlay')) {
+          const renderRoot = getPdfRenderRootFromWorkerContext(this);
+          if (renderRoot) {
+            applyDetachedOverlayStyles(node);
+            return renderRoot.appendChild(node) as T;
+          }
+        }
+
+        return originalAppendChild.call(body, node) as T;
+      }) as typeof body.appendChild;
+
+      try {
+        return originalToContainer.apply(this, args);
+      } finally {
+        body.appendChild = originalAppendChild;
+      }
+    };
+  }
+
+  if (typeof originalToCanvas === 'function') {
+    workerPrototype.toCanvas = function patchedToCanvas(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this: any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...args: any[]
+    ) {
+      const body = document.body;
+      const originalContains = body.contains;
+      const originalRemoveChild = body.removeChild;
+
+      body.contains = ((node: Node | null): boolean => {
+        if (node) {
+          const overlayParent = this?.prop?.overlay?.parentNode;
+          if (overlayParent instanceof Element && overlayParent.contains(node)) {
+            return true;
+          }
+        }
+
+        return originalContains.call(body, node);
+      }) as typeof body.contains;
+
+      body.removeChild = (<T extends Node>(child: T): T => {
+        if (child === this?.prop?.overlay && child.parentNode && child.parentNode !== body) {
+          child.parentNode.removeChild(child);
+          return child;
+        }
+
+        return originalRemoveChild.call(body, child) as T;
+      }) as typeof body.removeChild;
+
+      const restoreBodyMethods = () => {
+        body.contains = originalContains;
+        body.removeChild = originalRemoveChild;
+      };
+
+      try {
+        const workerResult = originalToCanvas.apply(this, args);
+        attachWorkerCleanup(workerResult, restoreBodyMethods);
+        return workerResult;
+      } catch (error) {
+        restoreBodyMethods();
+        throw error;
+      }
+    };
+  }
+
+  workerPrototype.__mowenDetachedOverlayPatched = true;
 }
 
 /**
@@ -65,24 +388,28 @@ const PDF_STYLES = `
       font-size: 22px;
       font-weight: 700;
       color: #111827;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
       line-height: 1.4;
     }
     .pdf-meta {
       font-size: 12px;
       color: #9CA3AF;
-      margin-bottom: 20px;
-      padding-bottom: 16px;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
       border-bottom: 1px solid #E5E7EB;
     }
     .pdf-content.pdf-page-break {
       break-before: page;
       page-break-before: always;
     }
+    .${PDF_FORCE_PAGE_BREAK_CLASS} {
+      break-before: page;
+      page-break-before: always;
+    }
     /* 标题 */
     .pdf-body h1, .pdf-body h2, .pdf-body h3, .pdf-body h4, .pdf-body h5, .pdf-body h6 {
-      margin-top: 1.2em;
-      margin-bottom: 0.6em;
+      margin-top: 1em;
+      margin-bottom: 0.45em;
       font-weight: 600;
       color: #111827;
       line-height: 1.4;
@@ -97,8 +424,8 @@ const PDF_STYLES = `
     .pdf-body h6 { font-size: 13px; color: #4B5563; }
     /* 段落 */
     .pdf-body p {
-      margin: 0.6em 0;
-      line-height: 1.9;
+      margin: 0.4em 0;
+      line-height: 1.8;
       break-inside: avoid;
       page-break-inside: avoid;
     }
@@ -128,10 +455,44 @@ const PDF_STYLES = `
     .pdf-body figure,
     .pdf-body table,
     .pdf-body blockquote,
-    .pdf-body pre,
-    .pdf-body img {
+    .pdf-body pre {
       break-inside: avoid;
       page-break-inside: avoid;
+    }
+    .pdf-body .mowen-gallery-stack,
+    .pdf-body .gallery-flattened {
+      display: block;
+      margin: 12px 0;
+      max-width: 100% !important;
+      break-inside: auto;
+      page-break-inside: auto;
+    }
+    .pdf-body figure.mowen-gallery-figure,
+    .pdf-body .gallery-flattened figure {
+      margin: 0 0 4px 0 !important;
+      padding: 0 !important;
+      background: transparent !important;
+      line-height: 0;
+      max-width: 100% !important;
+    }
+    .pdf-body img.mowen-gallery-image,
+    .pdf-body .gallery-flattened figure img {
+      display: block !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      height: auto !important;
+      margin: 0 !important;
+      border-radius: 0 !important;
+      background: transparent !important;
+    }
+    .pdf-body figure.mowen-gallery-figure figcaption,
+    .pdf-body .gallery-flattened figure figcaption {
+      line-height: 1.6;
+      margin-top: 6px;
+    }
+    .pdf-body figure.mowen-gallery-figure:last-child,
+    .pdf-body .gallery-flattened figure:last-child {
+      margin-bottom: 0 !important;
     }
     /* 引用块 - 增强样式确保可见 */
     .pdf-body blockquote {
@@ -402,6 +763,33 @@ function hasInlineNoteReferenceMarkers(html: string): boolean {
   return INLINE_NOTE_REFERENCE_REGEX.test(html);
 }
 
+function sanitizePdfHtmlContent(html: string): string {
+  return DOMPurify.sanitize(html, {
+    ADD_TAGS: ['note', 'attach-img'],
+    ADD_ATTR: [
+      'uuid',
+      'uuid-list',
+      'type',
+      'cite',
+      'data-note-uuid',
+      'data-mowen-note-uuid',
+      'image-uuid',
+      'data-mowen-uid',
+      'data-mowen-id',
+      'data-uuid',
+      'data-file-uuid',
+      'data-caption',
+      'data-mowen-caption',
+      'image-caption',
+      'caption',
+      'crossorigin',
+    ],
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea', 'select', 'option'],
+    FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onpointerenter'],
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+  });
+}
+
 function encodeNoteRefsAttributeValue(noteRefs?: PdfChildNote[]): string {
   if (!noteRefs || noteRefs.length === 0) {
     return '';
@@ -504,6 +892,29 @@ function extractNoteReferenceTitleFromElement(element: HTMLElement): string {
   return normalizeReferenceText(element.textContent || '') || '查看笔记';
 }
 
+function removeFirstOccurrence(text: string, search: string): string {
+  const index = text.indexOf(search);
+  if (index === -1) return text;
+  return `${text.slice(0, index)}${text.slice(index + search.length)}`;
+}
+
+function hasAdditionalReferenceContext(
+  containerText: string,
+  referenceText: string
+): boolean {
+  const normalizedContainer = normalizeReferenceText(containerText);
+  const normalizedReference = normalizeReferenceText(referenceText);
+  if (!normalizedContainer || !normalizedReference) {
+    return false;
+  }
+
+  const remaining = removeFirstOccurrence(normalizedContainer, normalizedReference)
+    .replace(/\s+/g, '')
+    .trim();
+
+  return remaining.length > 0;
+}
+
 function isLikelyNoteReferenceElement(element: HTMLElement): boolean {
   if (element.classList.contains('mowen-note-ref')) {
     return true;
@@ -599,6 +1010,19 @@ function normalizeNoteReferenceElements(container: HTMLElement): void {
 }
 
 function resolveNoteReferenceRenderBlock(element: HTMLElement, pdfBody: HTMLElement): HTMLElement | null {
+  const candidateUuid = extractNoteReferenceUuidFromElement(element);
+  const inlineLikeTags = new Set(['A', 'NOTE', 'Q', 'SPAN']);
+  if (candidateUuid && inlineLikeTags.has(element.tagName)) {
+    const blockParent = element.closest<HTMLElement>('p, blockquote, div, li, section, article');
+    if (
+      blockParent &&
+      pdfBody.contains(blockParent) &&
+      hasAdditionalReferenceContext(blockParent.textContent || '', element.textContent || '')
+    ) {
+      return element;
+    }
+  }
+
   const directBlock = element.closest<HTMLElement>('blockquote, p, div, li, section, article, note, q');
   const baseBlock = directBlock && pdfBody.contains(directBlock) ? directBlock : element;
 
@@ -624,7 +1048,22 @@ function resolveNoteReferenceRenderBlock(element: HTMLElement, pdfBody: HTMLElem
   return baseBlock;
 }
 
-function createNoteReferenceCard(
+function createInlineNoteReferenceLink(
+  doc: Document,
+  note: PdfChildNote
+): HTMLAnchorElement {
+  const link = doc.createElement('a');
+  link.className = 'mowen-note-ref-link';
+  link.href = `https://note.mowen.cn/detail/${note.uuid}`;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = note.title;
+  link.setAttribute('data-note-uuid', note.uuid);
+  link.setAttribute('data-note-title', note.title);
+  return link;
+}
+
+function createBlockNoteReference(
   doc: Document,
   note: PdfChildNote
 ): HTMLElement {
@@ -633,13 +1072,7 @@ function createNoteReferenceCard(
   wrapper.setAttribute('data-note-uuid', note.uuid);
   wrapper.setAttribute('data-note-title', note.title);
 
-  const link = doc.createElement('a');
-  link.className = 'mowen-note-ref-link';
-  link.href = `https://note.mowen.cn/detail/${note.uuid}`;
-  link.target = '_blank';
-  link.rel = 'noopener noreferrer';
-  link.textContent = note.title;
-  wrapper.appendChild(link);
+  wrapper.appendChild(createInlineNoteReferenceLink(doc, note));
   return wrapper;
 }
 
@@ -687,8 +1120,10 @@ function renderNoteReferenceCards(container: HTMLElement): void {
         title: extractNoteReferenceTitleFromElement(block),
       };
 
-      const card = createNoteReferenceCard(container.ownerDocument, note);
-      block.replaceWith(card);
+      const replacement = ['A', 'NOTE', 'Q', 'SPAN'].includes(block.tagName)
+        ? createInlineNoteReferenceLink(container.ownerDocument, note)
+        : createBlockNoteReference(container.ownerDocument, note);
+      block.replaceWith(replacement);
       renderedUuids.add(uuid);
     }
 
@@ -699,7 +1134,7 @@ function renderNoteReferenceCards(container: HTMLElement): void {
       fallbackSection.className = 'child-notes-section';
 
       for (const note of missingRefs) {
-        fallbackSection.appendChild(createNoteReferenceCard(container.ownerDocument, note));
+        fallbackSection.appendChild(createBlockNoteReference(container.ownerDocument, note));
       }
 
       pdfBody.appendChild(fallbackSection);
@@ -739,14 +1174,14 @@ function buildPdfHtml(
   const noteRefsAttribute = noteRefsAttributeValue
     ? ` data-note-refs="${noteRefsAttributeValue}"`
     : '';
-  const noteRefsFallbackAttribute = noteRefsAttributeValue && !hasInlineNoteReferenceMarkers(htmlContent)
-    ? ' data-note-refs-fallback="append"'
-    : '';
-
   // 不保留图片模式：从 HTML 中移除所有 img 标签
-  const processedContent = options?.skipImages
+  const rawProcessedContent = options?.skipImages
     ? stripImagesFromHtml(htmlContent)
     : htmlContent;
+  const processedContent = sanitizePdfHtmlContent(rawProcessedContent);
+  const noteRefsFallbackAttribute = noteRefsAttributeValue && !hasInlineNoteReferenceMarkers(processedContent)
+    ? ' data-note-refs-fallback="append"'
+    : '';
 
   return `
     ${PDF_STYLES}
@@ -767,6 +1202,7 @@ function createPdfRenderContainer(fullHtml: string): {
   // 使用离屏宿主容器，避免导出时把当前页面布局撑动或触发滚动抖动。
   // 真正参与渲染的内容仍保持普通文档流，降低 html2canvas 克隆时的异常概率。
   const host = document.createElement('div');
+  host.setAttribute(PDF_RENDER_ROOT_ATTRIBUTE, 'true');
   host.style.cssText = [
     'position: fixed',
     'top: 0',
@@ -776,6 +1212,9 @@ function createPdfRenderContainer(fullHtml: string): {
     'pointer-events: none',
     'z-index: -1',
     'overflow: hidden',
+    'contain: layout paint style',
+    'isolation: isolate',
+    'transform: translateZ(0)',
   ].join('; ');
 
   const container = document.createElement('div');
@@ -881,6 +1320,99 @@ async function waitForImages(container: HTMLElement, timeout = 8000): Promise<vo
   ]);
 }
 
+function stabilizeImageLayoutForPdf(container: HTMLElement): void {
+  const images = Array.from(container.querySelectorAll<HTMLImageElement>('img'));
+
+  for (const image of images) {
+    if (!image.naturalWidth || !image.naturalHeight) {
+      continue;
+    }
+
+    image.setAttribute('width', String(image.naturalWidth));
+    image.setAttribute('height', String(image.naturalHeight));
+    image.style.setProperty('aspect-ratio', `${image.naturalWidth} / ${image.naturalHeight}`);
+  }
+}
+
+function alignWorkerPageSlicesToCanvas(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  worker: any,
+  canvas: HTMLCanvasElement
+): void {
+  const pageSize = worker?.prop?.pageSize;
+  const innerWidth = Number(pageSize?.inner?.width);
+  const innerHeight = Number(pageSize?.inner?.height);
+  if (!Number.isFinite(innerWidth) || !Number.isFinite(innerHeight) || !canvas.width) {
+    return;
+  }
+
+  const exactRatio = innerHeight / innerWidth;
+  const alignedPxPageHeight = Math.max(1, Math.floor(canvas.width * exactRatio));
+  pageSize.inner.ratio = alignedPxPageHeight / canvas.width;
+}
+
+function getElementTopWithinAncestor(element: HTMLElement, ancestor: HTMLElement): number {
+  const elementRect = element.getBoundingClientRect();
+  const ancestorRect = ancestor.getBoundingClientRect();
+  return elementRect.top - ancestorRect.top;
+}
+
+function applyGalleryFigurePageBreaks(container: HTMLElement): void {
+  const sections = Array.from(container.querySelectorAll<HTMLElement>('.pdf-content'));
+
+  for (const section of sections) {
+    const galleries = Array.from(section.querySelectorAll<HTMLElement>('.mowen-gallery-stack, .gallery-flattened'));
+
+    for (const gallery of galleries) {
+      const figures = Array.from(gallery.children).filter(
+        (child): child is HTMLElement => child instanceof HTMLElement && child.tagName === 'FIGURE'
+      );
+      if (figures.length === 0) {
+        continue;
+      }
+
+      for (const figure of figures) {
+        figure.classList.remove(PDF_FORCE_PAGE_BREAK_CLASS);
+      }
+
+      const metrics = figures
+        .map((figure) => ({
+          figure,
+          top: getElementTopWithinAncestor(figure, section),
+          height: figure.getBoundingClientRect().height,
+        }))
+        .filter((metric) => metric.height > 0);
+
+      if (metrics.length === 0) {
+        continue;
+      }
+
+      let logicalTop = metrics[0].top;
+
+      for (let index = 0; index < metrics.length; index++) {
+        const current = metrics[index];
+        const next = metrics[index + 1];
+        const positionInPage = logicalTop % PDF_RENDER_CONTENT_HEIGHT_PX;
+
+        if (
+          current.height <= PDF_RENDER_CONTENT_HEIGHT_PX &&
+          positionInPage + current.height > PDF_RENDER_CONTENT_HEIGHT_PX + 1
+        ) {
+          current.figure.classList.add(PDF_FORCE_PAGE_BREAK_CLASS);
+          logicalTop = (Math.floor(logicalTop / PDF_RENDER_CONTENT_HEIGHT_PX) + 1) * PDF_RENDER_CONTENT_HEIGHT_PX;
+        }
+
+        if (!next) {
+          continue;
+        }
+
+        const gapToNext = Math.max(0, next.top - current.top - current.height);
+        logicalTop += current.height + gapToNext;
+      }
+    }
+  }
+}
+
 /**
  * 等待两个渲染帧，确保浏览器完成 style 标签解析和样式计算
  */
@@ -892,11 +1424,115 @@ function waitForRender(): Promise<void> {
   });
 }
 
+function getGalleryImageSource(image: HTMLImageElement): string {
+  return (
+    image.currentSrc ||
+    image.getAttribute('src') ||
+    image.getAttribute('data-src') ||
+    image.getAttribute('data-original') ||
+    image.getAttribute('data-lazy-src') ||
+    ''
+  ).trim();
+}
+
+function getGalleryImageCaption(image: HTMLImageElement): string {
+  const directCaption = (
+    image.getAttribute('data-caption') ||
+    image.getAttribute('data-mowen-caption') ||
+    image.getAttribute('image-caption') ||
+    image.getAttribute('caption') ||
+    image.getAttribute('title') ||
+    image.getAttribute('alt') ||
+    ''
+  ).trim();
+
+  if (directCaption) {
+    return directCaption;
+  }
+
+  const figure = image.closest('figure');
+  const figcaption = figure?.querySelector('figcaption');
+  return (figcaption?.textContent || '').trim();
+}
+
+function createFlattenedGalleryFigure(
+  doc: Document,
+  source: string,
+  caption: string
+): HTMLElement {
+  const figure = doc.createElement('figure');
+  figure.className = 'mowen-gallery-figure';
+
+  const newImg = doc.createElement('img');
+  newImg.className = 'mowen-gallery-image';
+  newImg.setAttribute('src', source);
+  newImg.setAttribute('alt', caption);
+  newImg.setAttribute('crossorigin', 'anonymous');
+  newImg.style.cssText = 'display:block;width:100%;max-width:100%;height:auto;margin:0;';
+  figure.appendChild(newImg);
+
+  if (caption) {
+    const figcaption = doc.createElement('figcaption');
+    figcaption.textContent = caption;
+    figure.appendChild(figcaption);
+  }
+
+  return figure;
+}
+
+/**
+ * 将画廊（Swiper 轮播）中的图片展开为平铺的 figure 列表
+ * 画廊结构：.gallery.block → .swiper-container → .swiper-wrapper → .swiper-slide → img
+ * 因为 Swiper 的 overflow:hidden 会导致 html2canvas 裁剪非活动 slide 的图片
+ */
+function flattenGalleries(container: HTMLElement): void {
+  // 匹配画廊容器：class 包含 gallery，或包含 swiper 结构的容器
+  const galleries = Array.from(container.querySelectorAll<HTMLElement>(
+    '.gallery, [class*="gallery"], .swiper-container'
+  ));
+
+  for (const gallery of galleries) {
+    if (!gallery.isConnected) continue;
+    if (gallery.classList.contains('gallery-flattened') || gallery.classList.contains('mowen-gallery-stack')) {
+      continue;
+    }
+
+    // 提取画廊内所有图片
+    const images = Array.from(gallery.querySelectorAll<HTMLImageElement>('img'));
+    if (images.length === 0) continue;
+
+    // 创建平铺容器
+    const flatContainer = container.ownerDocument.createElement('div');
+    flatContainer.className = 'gallery-flattened mowen-gallery-stack';
+    flatContainer.style.cssText = 'width: 100%;';
+    const seenSources = new Set<string>();
+
+    for (const img of images) {
+      const src = getGalleryImageSource(img);
+      if (!src || src === 'about:blank') continue;
+      if (seenSources.has(src)) continue;
+      seenSources.add(src);
+
+      const caption = getGalleryImageCaption(img);
+      flatContainer.appendChild(createFlattenedGalleryFigure(container.ownerDocument, src, caption));
+    }
+
+    if (!flatContainer.childElementCount) {
+      continue;
+    }
+
+    // 用平铺容器替换原画廊
+    gallery.replaceWith(flatContainer);
+  }
+}
+
 async function prepareContainerForPdf(
   container: HTMLElement,
   options?: { skipImages?: boolean }
 ): Promise<void> {
   await waitForRender();
+  // 画廊展开：将 Swiper 轮播图片平铺，避免被裁剪
+  flattenGalleries(container);
   normalizeNoteReferenceElements(container);
   renderNoteReferenceCards(container);
   normalizeWideContentForPdf(container);
@@ -905,16 +1541,71 @@ async function prepareContainerForPdf(
   if (!options?.skipImages) {
     await preloadImagesViaBackground(container);
     await waitForImages(container);
+    stabilizeImageLayoutForPdf(container);
+    await waitForRender();
+    applyGalleryFigurePageBreaks(container);
+    await waitForRender();
   }
+}
+
+function configurePdfDisplayMode(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  _pdf: any
+): void {
+  // 导出文件的阅读器兼容性由后处理阶段统一保证，这里不再写入阅读器偏好。
 }
 
 /**
  * 导出单篇文章为 PDF
  *
  * @param title 文章标题
- * @param htmlContent HTML 正文内容
- * @param options 可选参数（来源 URL、合集子笔记等）
+/**
+ * 为 PDF 添加大纲书签
+ * 扫描容器中的标题元素（h1~h6），根据位置计算页码并添加到 jsPDF 的 outline 中
  */
+function addPdfOutline(pdf: any, container: HTMLElement): void {
+  try {
+    // jsPDF 的 outline API 可能不存在（取决于版本）
+    if (!pdf?.outline?.add) return;
+
+    const headings = Array.from(
+      container.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6')
+    );
+    if (headings.length === 0) return;
+
+    // 计算 PDF 页面的像素高度（可用内容区域）
+    // A4 = 297mm 高，减去上下 margin
+    const pageHeightPx = PDF_RENDER_CONTENT_HEIGHT_PX;
+
+    // 容器的渲染宽度对应的缩放比例
+    const containerWidth = container.scrollWidth || container.offsetWidth || PDF_RENDER_WIDTH_PX;
+    const scale = PDF_RENDER_WIDTH_PX / containerWidth;
+
+    for (const heading of headings) {
+      const text = (heading.textContent || '').trim();
+      if (!text) continue;
+
+      // 获取标题在容器中的垂直位置
+      const offsetTop = heading.offsetTop;
+      const scaledTop = offsetTop * scale;
+
+      // 计算页码（从 1 开始）
+      const pageNumber = Math.floor(scaledTop / pageHeightPx) + 1;
+
+      // 确保页码在有效范围内
+      const totalPages = pdf.internal.getNumberOfPages();
+      const safePage = Math.min(pageNumber, totalPages);
+
+      if (safePage > 0) {
+        pdf.outline.add(null, text, { pageNumber: safePage });
+      }
+    }
+  } catch {
+    // 大纲添加失败不影响 PDF 导出
+    console.warn('[pdfExporter] addPdfOutline failed');
+  }
+}
+
 export async function exportSinglePdf(
   title: string,
   htmlContent: string,
@@ -926,7 +1617,7 @@ export async function exportSinglePdf(
 ): Promise<void> {
   const html2pdf = await getHtml2Pdf();
 
-  const fileName = sanitizeFileName(title) || '导出笔记';
+  const fileName = `${sanitizeFileName(title) || '导出笔记'}.pdf`;
   const fullHtml = buildPdfHtml(title, htmlContent, options);
 
   // 创建离屏渲染容器，避免导出时影响当前页面滚动和布局。
@@ -935,15 +1626,15 @@ export async function exportSinglePdf(
   try {
     await prepareContainerForPdf(container, options);
 
-    await html2pdf()
+    const worker = html2pdf()
       .set({
-        margin: [PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM],
-        filename: `${fileName}.pdf`,
+        margin: [PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM, PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM],
+        filename: fileName,
         image: { type: 'jpeg', quality: 0.92 },
         html2canvas: {
-          scale: 2,            // 提高清晰度
-          useCORS: true,       // 尝试以 CORS 方式加载跨域图片
-          allowTaint: true,    // 允许跨域图片污染 canvas（确保图片可见）
+          scale: PDF_HTML2CANVAS_SCALE,
+          useCORS: true,
+          allowTaint: true,
           logging: false,
           windowWidth: PDF_RENDER_WIDTH_PX,
         },
@@ -954,11 +1645,39 @@ export async function exportSinglePdf(
         },
         pagebreak: {
           mode: ['css', 'legacy'],
-          avoid: ['img', 'figure', 'table', 'blockquote', 'pre', 'p', 'li', '.mowen-note-ref', '.mowen-note-ref-link'],
+          before: `.${PDF_FORCE_PAGE_BREAK_CLASS}`,
+          avoid: [
+            'figure',
+            '.mowen-gallery-figure',
+            '.gallery-flattened figure',
+            'img.mowen-gallery-image',
+            'table',
+            'blockquote',
+            'pre',
+            'p',
+            'li',
+            '.mowen-note-ref',
+            '.mowen-note-ref-link',
+          ],
         },
       })
       .from(container)
-      .save();
+      .toCanvas();
+
+    await worker.get('canvas').then((canvas: HTMLCanvasElement) => {
+      alignWorkerPageSlicesToCanvas(worker, canvas);
+    });
+
+    await worker.toPdf();
+
+    // 添加 PDF 大纲书签
+    await worker.get('pdf').then((pdf: any) => {
+      configurePdfDisplayMode(pdf);
+      addPdfOutline(pdf, container);
+    });
+
+    const blob = await outputCompatiblePdfBlob(worker);
+    await downloadAndPreviewPdf(fileName, blob);
   } finally {
     // 无论成功还是失败，都清理 DOM 容器
     if (host.parentNode) {
@@ -989,14 +1708,13 @@ export async function generatePdfBlob(
   try {
     await prepareContainerForPdf(container, options);
 
-    // 使用 outputPdf('blob') 获取 Blob 而非直接下载
-    const blob: Blob = await html2pdf()
+    const worker = html2pdf()
       .set({
-        margin: [PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM],
+        margin: [PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM, PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM],
         filename: 'temp.pdf',
         image: { type: 'jpeg', quality: 0.92 },
         html2canvas: {
-          scale: 2,
+          scale: PDF_HTML2CANVAS_SCALE,
           useCORS: true,
           allowTaint: true,
           logging: false,
@@ -1009,11 +1727,37 @@ export async function generatePdfBlob(
         },
         pagebreak: {
           mode: ['css', 'legacy'],
-          avoid: ['img', 'figure', 'table', 'blockquote', 'pre', 'p', 'li', '.mowen-note-ref', '.mowen-note-ref-link'],
+          before: `.${PDF_FORCE_PAGE_BREAK_CLASS}`,
+          avoid: [
+            'figure',
+            '.mowen-gallery-figure',
+            '.gallery-flattened figure',
+            'img.mowen-gallery-image',
+            'table',
+            'blockquote',
+            'pre',
+            'p',
+            'li',
+            '.mowen-note-ref',
+            '.mowen-note-ref-link',
+          ],
         },
       })
       .from(container)
-      .outputPdf('blob');
+      .toCanvas();
+
+    await worker.get('canvas').then((canvas: HTMLCanvasElement) => {
+      alignWorkerPageSlicesToCanvas(worker, canvas);
+    });
+
+    await worker.toPdf();
+
+    await worker.get('pdf').then((pdf: any) => {
+      configurePdfDisplayMode(pdf);
+      addPdfOutline(pdf, container);
+    });
+
+    const blob = await outputCompatiblePdfBlob(worker);
 
     return blob;
   } finally {
@@ -1085,14 +1829,15 @@ export async function exportMergedPdf(
 
   // 构建合并后的 HTML：每篇之间用分页符分隔
   const mergedSections = notes.map((note, index) => {
-    const processedContent = options?.skipImages
+    const rawProcessedContent = options?.skipImages
       ? stripImagesFromHtml(note.htmlContent)
       : note.htmlContent;
+    const processedContent = sanitizePdfHtmlContent(rawProcessedContent);
     const noteRefsAttributeValue = encodeNoteRefsAttributeValue(note.childNotes);
     const noteRefsAttribute = noteRefsAttributeValue
       ? ` data-note-refs="${noteRefsAttributeValue}"`
       : '';
-    const noteRefsFallbackAttribute = noteRefsAttributeValue && !hasInlineNoteReferenceMarkers(note.htmlContent)
+    const noteRefsFallbackAttribute = noteRefsAttributeValue && !hasInlineNoteReferenceMarkers(processedContent)
       ? ' data-note-refs-fallback="append"'
       : '';
 
@@ -1117,9 +1862,10 @@ export async function exportMergedPdf(
   // 文件名：使用自定义名称或默认名称
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-  const fileName = options?.fileName
+  const baseFileName = options?.fileName
     ? sanitizeFileName(options.fileName)
     : `笔记导出_${dateStr}`;
+  const fileName = `${baseFileName}.pdf`;
 
   // 创建 DOM 容器
   const { host, container } = createPdfRenderContainer(fullHtml);
@@ -1127,13 +1873,13 @@ export async function exportMergedPdf(
   try {
     await prepareContainerForPdf(container, options);
 
-    await html2pdf()
+    const worker = html2pdf()
       .set({
-        margin: [PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM, PDF_MARGIN_MM],
-        filename: `${fileName}.pdf`,
+        margin: [PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM, PDF_MARGIN_VERTICAL_MM, PDF_MARGIN_HORIZONTAL_MM],
+        filename: fileName,
         image: { type: 'jpeg', quality: 0.92 },
         html2canvas: {
-          scale: 2,
+          scale: PDF_HTML2CANVAS_SCALE,
           useCORS: true,
           allowTaint: true,
           logging: false,
@@ -1146,12 +1892,39 @@ export async function exportMergedPdf(
         },
         pagebreak: {
           mode: ['css', 'legacy'],
-          before: '.pdf-page-break',
-          avoid: ['img', 'figure', 'table', 'blockquote', 'pre', 'p', 'li', '.mowen-note-ref', '.mowen-note-ref-link'],
+          before: `.pdf-page-break, .${PDF_FORCE_PAGE_BREAK_CLASS}`,
+          avoid: [
+            'figure',
+            '.mowen-gallery-figure',
+            '.gallery-flattened figure',
+            'img.mowen-gallery-image',
+            'table',
+            'blockquote',
+            'pre',
+            'p',
+            'li',
+            '.mowen-note-ref',
+            '.mowen-note-ref-link',
+          ],
         },
       })
       .from(container)
-      .save();
+      .toCanvas();
+
+    await worker.get('canvas').then((canvas: HTMLCanvasElement) => {
+      alignWorkerPageSlicesToCanvas(worker, canvas);
+    });
+
+    await worker.toPdf();
+
+    // 添加 PDF 大纲书签
+    await worker.get('pdf').then((pdf: any) => {
+      configurePdfDisplayMode(pdf);
+      addPdfOutline(pdf, container);
+    });
+
+    const blob = await outputCompatiblePdfBlob(worker);
+    await downloadAndPreviewPdf(fileName, blob);
   } finally {
     if (host.parentNode) {
       document.body.removeChild(host);

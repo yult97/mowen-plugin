@@ -144,6 +144,10 @@ interface ShowResponse {
         all?: string[];
       };
     };
+    // 画廊数据：每个画廊包含的图片 UUID 列表
+    noteGallery?: {
+      gallerys?: Record<string, { fileUuids?: string[] } | undefined>;
+    };
   };
 }
 
@@ -445,6 +449,7 @@ export async function fetchNoteDetail(uuid: string): Promise<MowenNoteDetail> {
 
   const noteFile = data.detail?.noteFile;
   const noteFileTree = data.detail?.noteFileTree;
+  const noteGallery = data.detail?.noteGallery;
   const resolveImageUrl = (imageUuid: string) => resolveMowenImageUrl(imageUuid, noteFile);
 
   // 检测内容格式并统一转换为 HTML
@@ -493,7 +498,55 @@ export async function fetchNoteDetail(uuid: string): Promise<MowenNoteDetail> {
   }
 
   if (shouldNormalizeHtml) {
-    htmlContent = normalizeMowenHtmlForExport(htmlContent, { noteFile, noteFileTree });
+    // 画廊图片数据补全：note/show API 的 noteFile.images 可能只包含
+    // 画廊中前几张图片的元数据，其余需要通过 gallery/infos 接口获取
+    if (noteGallery?.gallerys) {
+      const galleryUuids = Object.keys(noteGallery.gallerys);
+      if (galleryUuids.length > 0) {
+        try {
+          const galleryInfos = await webApiRequest<{
+            images?: Record<string, {
+              fileUuid?: string;
+              url?: string;
+              scale?: Record<string, string | undefined>;
+              uuid?: string;
+            }>;
+          }>('/api/note/wxa/v1/gallery/infos', {
+            galleryUuids,
+            noteUuid: uuid,
+          });
+
+          // 合并画廊图片元数据到 noteFile.images
+          if (galleryInfos?.images && noteFile) {
+            if (!noteFile.images) {
+              noteFile.images = {};
+            }
+            for (const [imgUuid, imgData] of Object.entries(galleryInfos.images)) {
+              if (!imgData) {
+                continue;
+              }
+
+              const candidateKeys = new Set(
+                [imgUuid, imgData.fileUuid, imgData.uuid]
+                  .map((value) => value?.trim() || '')
+                  .filter(Boolean)
+              );
+
+              for (const key of candidateKeys) {
+                if (!noteFile.images[key]) {
+                  noteFile.images[key] = imgData;
+                }
+              }
+            }
+          }
+        } catch (error) {
+          // 画廊数据补全失败不阻塞导出，降级为 CDN URL
+          console.warn('[mowenWebApi] gallery/infos failed, fallback to CDN:', error);
+        }
+      }
+    }
+
+    htmlContent = normalizeMowenHtmlForExport(htmlContent, { noteFile, noteFileTree, noteGallery });
   }
 
   extractChildNoteIdsFromHtml(htmlContent, childNoteIds);

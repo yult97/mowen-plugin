@@ -22,6 +22,7 @@ export default defineConfig({
       // 添加 notesExport.html 为额外的多页入口
       input: {
         notesExport: resolve(__dirname, 'notesExport.html'),
+        pdfPreview: resolve(__dirname, 'pdfPreview.html'),
       },
     },
   },

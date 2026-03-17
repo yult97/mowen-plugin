@@ -68,6 +68,13 @@ interface NoteAtomToHtmlOptions {
 interface NormalizeMowenHtmlOptions {
   noteFile?: MowenNoteFileLike;
   noteFileTree?: MowenNoteFileTreeLike;
+  /** API 返回的 noteGallery 数据，包含画廊图片 UUID 列表 */
+  noteGallery?: MowenNoteGalleryLike;
+}
+
+/** 画廊数据结构（从 API response.detail.noteGallery 中提取） */
+interface MowenNoteGalleryLike {
+  gallerys?: Record<string, { fileUuids?: string[] } | undefined>;
 }
 
 // Block-level tags are handled inline in parseBlockContent
@@ -1155,14 +1162,19 @@ function normalizeUuidList(value: unknown): string[] {
 }
 
 export function resolveMowenImageUrl(uuid: string, noteFile?: MowenNoteFileLike): string {
-  const imageInfo = noteFile?.images?.[uuid];
+  const normalizedUuid = uuid.trim();
+  const directImageInfo = noteFile?.images?.[normalizedUuid];
+  const imageInfo = directImageInfo || Object.values(noteFile?.images || {}).find((asset) => {
+    if (!asset) return false;
+    return asset.fileUuid?.trim() === normalizedUuid || asset.uuid?.trim() === normalizedUuid;
+  });
   const preferredUrl = imageInfo?.scale?.w_1200 || imageInfo?.url;
 
   if (preferredUrl && isSafeUrl(preferredUrl)) {
     return preferredUrl;
   }
 
-  return `${MOWEN_IMAGE_CDN}/${uuid}`;
+  return `${MOWEN_IMAGE_CDN}/${normalizedUuid}`;
 }
 
 function createExportFigure(
@@ -1170,18 +1182,29 @@ function createExportFigure(
   uuid: string,
   noteFile?: MowenNoteFileLike,
   caption = '',
-  alt = ''
+  alt = '',
+  variant: 'default' | 'gallery' = 'default'
 ): HTMLElement {
   const figure = doc.createElement('figure');
   const image = doc.createElement('img');
   const resolvedAlt = alt.trim();
   const resolvedCaption = caption.trim();
+  const isGallery = variant === 'gallery';
+
+  if (isGallery) {
+    figure.className = 'mowen-gallery-figure';
+  }
 
   image.setAttribute('src', resolveMowenImageUrl(uuid, noteFile));
   image.setAttribute('alt', resolvedAlt);
   image.setAttribute('crossorigin', 'anonymous');
-  image.setAttribute('style', 'max-width:100%;height:auto;');
+  image.setAttribute('style', isGallery
+    ? 'display:block;width:100%;max-width:100%;height:auto;margin:0;'
+    : 'max-width:100%;height:auto;');
   image.setAttribute('data-mowen-uuid', uuid);
+  if (isGallery) {
+    image.className = 'mowen-gallery-image';
+  }
 
   figure.appendChild(image);
   syncFigureCaption(figure, doc, resolvedCaption);
@@ -1294,6 +1317,68 @@ function expandAttachImages(
   }
 }
 
+/**
+ * 将 <gallery uuid="..."> 自定义标签展开为平铺的图片列表
+ *
+ * 墨问的画廊在 API 返回的 HTML 中表现为 <gallery uuid="xxx"></gallery>，
+ * 对应的图片 UUID 列表在 noteGallery.gallerys[uuid].fileUuids 中，
+ * 图片 URL 在 noteFile.images[fileUuid] 中。
+ */
+function expandGalleryElements(
+  root: HTMLElement,
+  doc: Document,
+  noteFile?: MowenNoteFileLike,
+  noteGallery?: MowenNoteGalleryLike,
+  renderedUuids?: Set<string>
+): void {
+  const rendered = renderedUuids || new Set<string>();
+  const galleryElements = Array.from(root.querySelectorAll('gallery'));
+
+  if (galleryElements.length === 0) return;
+
+  for (const galleryEl of galleryElements) {
+    const galleryUuid = galleryEl.getAttribute('uuid')?.trim();
+    if (!galleryUuid) {
+      // 无 uuid 的画廊标签，直接移除
+      galleryEl.remove();
+      continue;
+    }
+
+    // 从 noteGallery 中获取该画廊包含的图片 UUID 列表
+    const galleryData = noteGallery?.gallerys?.[galleryUuid];
+    const fileUuids = galleryData?.fileUuids || [];
+
+    if (fileUuids.length === 0) {
+      // 画廊无图片数据，移除空标签
+      galleryEl.remove();
+      continue;
+    }
+
+    // 创建平铺容器
+    const galleryContainer = doc.createElement('div');
+    galleryContainer.className = 'mowen-gallery-stack';
+
+    for (const fileUuid of fileUuids) {
+      if (!fileUuid?.trim()) continue;
+      const uuid = fileUuid.trim();
+
+      // 跳过已渲染的图片（避免重复）
+      if (rendered.has(uuid)) continue;
+
+      galleryContainer.appendChild(createExportFigure(doc, uuid, noteFile, '', '', 'gallery'));
+      rendered.add(uuid);
+    }
+
+    // 用平铺图片列表替换 <gallery> 标签
+    if (galleryContainer.childElementCount === 0) {
+      galleryEl.remove();
+      continue;
+    }
+
+    galleryEl.replaceWith(galleryContainer);
+  }
+}
+
 export function normalizeMowenHtmlForExport(
   html: string,
   options: NormalizeMowenHtmlOptions = {}
@@ -1316,6 +1401,7 @@ export function normalizeMowenHtmlForExport(
   normalizeQuoteParagraphs(root, doc);
   const renderedUuids = normalizeMowenImages(root, doc, options.noteFile);
   expandAttachImages(root, doc, options.noteFile, options.noteFileTree, renderedUuids);
+  expandGalleryElements(root, doc, options.noteFile, options.noteGallery, renderedUuids);
 
   return root.innerHTML;
 }
@@ -1432,8 +1518,7 @@ function atomNodeToHtml(node: NoteAtom, options: NoteAtomToHtmlOptions = {}): st
       const noteTitle = node.content
         ? node.content.map(c => c.text || '').join('')
         : '查看笔记';
-      const noteUrl = `https://note.mowen.cn/detail/${escapeHtmlForAtom(noteUuid)}`;
-      return `<p class="mowen-note-ref" data-note-uuid="${escapeHtmlForAtom(noteUuid)}"><a href="${noteUrl}" target="_blank" rel="noopener noreferrer">📄 ${escapeHtmlForAtom(noteTitle)}</a></p>`;
+      return `<note uuid="${escapeHtmlForAtom(noteUuid)}">${escapeHtmlForAtom(noteTitle)}</note>`;
     }
 
     case 'audio':
