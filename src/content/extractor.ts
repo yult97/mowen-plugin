@@ -8,11 +8,12 @@
 import { Readability } from '@mozilla/readability';
 import { ExtractResult, ContentBlock } from '../types';
 import { generateId, isWeixinArticle, getDomain, stripHtml, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
-import { extractImages } from './images';
+import { extractImages, removeLinkedBadgeImages } from './images';
 import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
 // import { normalizeReadabilityHtml } from './extractor-utils'; // Defined internally
 
 import { extractCaptionForImage } from './captionExtractor';
+import { detectCodeLanguage } from '../utils/shikiLanguages';
 import {
     ARTICLE_SELECTORS,
     AUTHOR_SELECTORS,
@@ -398,6 +399,149 @@ function extractWithFallback(url: string, domain: string): ExtractResult {
 
 // --- Adapters & Helpers ---
 
+function serializeElementAttributes(element: Element | null | undefined): string {
+    if (!element) return '';
+
+    return Array.from(element.attributes)
+        .map(attr => `${attr.name}="${attr.value.replace(/"/g, '&quot;')}"`)
+        .join(' ');
+}
+
+function detectCodeLanguageFromElements(
+    pre: Element | null,
+    code: Element | null,
+    extraElements: Array<Element | null | undefined> = []
+): string | null {
+    const candidateElements = [pre, code, ...extraElements].filter((element): element is Element => Boolean(element));
+    const seen = new Set<Element>();
+    const extras: string[] = [];
+
+    let preAttrs = '';
+    let codeAttrs = '';
+
+    for (const element of candidateElements) {
+        if (seen.has(element)) continue;
+        seen.add(element);
+
+        const attrs = serializeElementAttributes(element);
+        if (!attrs) continue;
+
+        if (element === pre) {
+            preAttrs += ` ${attrs}`;
+        } else if (element === code) {
+            codeAttrs += ` ${attrs}`;
+        } else {
+            extras.push(attrs);
+        }
+    }
+
+    return detectCodeLanguage(`${preAttrs} ${extras.join(' ')}`, codeAttrs);
+}
+
+function syncCodeLanguageMetadata(pre: HTMLElement, code: HTMLElement | null): void {
+    const wrapperSelector = '[data-language], [data-lang], [class*="language-"], [class*="lang-"], [class*="hljs"]';
+    const language = detectCodeLanguageFromElements(
+        pre,
+        code,
+        [
+            pre.parentElement,
+            pre.closest(wrapperSelector),
+            code?.parentElement,
+            code?.closest(wrapperSelector),
+        ]
+    );
+
+    if (!language) return;
+
+    pre.setAttribute('data-language', language);
+    if (code) {
+        code.setAttribute('data-language', language);
+    }
+}
+
+function normalizeStandaloneCodeBlocks(doc: Document, body: HTMLElement): void {
+    const standaloneCodes = Array.from(body.querySelectorAll('code')).filter(code => !code.closest('pre'));
+
+    for (const code of standaloneCodes) {
+        const parent = code.parentElement;
+        if (!parent) continue;
+
+        const text = code.textContent || '';
+        const hasLanguageHint = Boolean(
+            detectCodeLanguageFromElements(
+                null,
+                code,
+                [
+                    parent,
+                    parent.closest('[data-language], [data-lang], [class*="language-"], [class*="lang-"], [class*="hljs"]'),
+                ]
+            )
+        );
+        const hasOnlyCodeContent = Array.from(parent.childNodes).every(node => {
+            if (node === code) return true;
+            if (node.nodeType === Node.TEXT_NODE) {
+                return !(node.textContent || '').trim();
+            }
+            const element = node as Element;
+            return element.tagName === 'BUTTON' || element.classList.contains('copy-code-btn');
+        });
+        const looksLikeBlockCode = hasOnlyCodeContent && (hasLanguageHint || /\n/.test(text) || text.length > 120);
+
+        if (!looksLikeBlockCode) continue;
+
+        const clonedCode = code.cloneNode(true) as HTMLElement;
+        const pre = doc.createElement('pre');
+        pre.appendChild(clonedCode);
+        syncCodeLanguageMetadata(pre, clonedCode);
+        pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
+
+        if (['P', 'DIV', 'SECTION', 'ARTICLE', 'LI'].includes(parent.tagName) && hasOnlyCodeContent) {
+            parent.replaceWith(pre);
+        } else {
+            code.replaceWith(pre);
+        }
+    }
+}
+
+/**
+ * 强制元素及其祖先链可见
+ * 解决 Milvus 等站点使用 Tab 切换代码块时，非激活代码块被 CSS 隐藏（display:none），
+ * Readability 的 isElementVisible 检查会彻底删除不可见元素的问题。
+ */
+function forceElementVisible(el: HTMLElement): void {
+    // 常见的隐藏 class 名（不包含通用词以避免误伤）
+    const HIDDEN_CLASSES = ['hidden', 'hide', 'is-hidden', 'd-none', 'display-none', 'invisible'];
+    let current: HTMLElement | null = el;
+
+    while (current && current.tagName !== 'BODY' && current.tagName !== 'HTML') {
+        // 移除 hidden 属性
+        if (current.hasAttribute('hidden')) {
+            current.removeAttribute('hidden');
+        }
+
+        // 修复 style 中的隐藏
+        const style = current.style;
+        if (style.display === 'none') {
+            style.setProperty('display', 'block', 'important');
+        }
+        if (style.visibility === 'hidden') {
+            style.setProperty('visibility', 'visible', 'important');
+        }
+        if (style.opacity === '0') {
+            style.setProperty('opacity', '1', 'important');
+        }
+
+        // 移除常见隐藏 class
+        for (const cls of HIDDEN_CLASSES) {
+            if (current.classList.contains(cls)) {
+                current.classList.remove(cls);
+            }
+        }
+
+        current = current.parentElement;
+    }
+}
+
 /**
  * Pre-process DOM before Readability: Clean noise, fix lazy loading, absolute URLs.
  */
@@ -463,6 +607,28 @@ function preprocessDom(doc: Document, baseUrl: string) {
             img.setAttribute('data-mowen-caption', caption);
         }
     });
+
+    // 6. 【新增】代码块语言信息提升 + 可见性修复（Code Language Promotion & Visibility Fix）
+    // 在 Readability 解析前：
+    //   a) 强制显示所有 <pre> 标签及其被隐藏的祖先容器
+    //      原因：Milvus 等站点使用多语言 Tab，非激活代码块被 CSS 隐藏（display:none），
+    //      Readability 的 isElementVisible 检查会彻底删除不可见元素
+    //   b) 将 <code> 标签上的语言信息提升到父级 <pre> 上
+    doc.querySelectorAll('pre').forEach(pre => {
+        // a) 强制显示 <pre> 及其被隐藏的祖先容器
+        forceElementVisible(pre as HTMLElement);
+
+        // b) 语言信息提升
+        const code = pre.querySelector('code');
+        syncCodeLanguageMetadata(pre as HTMLElement, code as HTMLElement | null);
+
+        // c) 清除代码块内的干扰元素（复制按钮、行号等）
+        pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
+    });
+
+    // 7. 过滤文档顶部的 badge/CTA 图片（如 Open in Colab / View on GitHub）
+    // 这类图片不是正文内容，保留会导致被当作普通文章配图剪藏。
+    removeLinkedBadgeImages(doc.body);
 }
 
 // function extractHeroImage removed
@@ -564,6 +730,9 @@ function normalizeReadabilityHtml(html: string): string {
     const doc = parser.parseFromString(html, 'text/html');
     const body = doc.body;
 
+    // 清理链接型 badge/按钮图片，避免它们出现在正文与图片候选中。
+    removeLinkedBadgeImages(body);
+
     // 1. Unwrap layout divs (divs that just contain other block elements or text)
     // simple logic: if a div has no attributes (cleaned by Readability?) or just class,
     // and contains block elements, maybe unwrap?
@@ -625,17 +794,49 @@ function normalizeReadabilityHtml(html: string): string {
         }
     });
 
+    // 2.6【新增】将被 Readability 打散成独立 <code> 的块级代码重新包装成 <pre>
+    normalizeStandaloneCodeBlocks(doc, body);
+
+    // 2.7【新增】在属性清理前再次同步代码块语言元数据
+    body.querySelectorAll('pre').forEach(pre => {
+        const code = pre.querySelector('code');
+        syncCodeLanguageMetadata(pre, code);
+        pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
+    });
+
     // 3. 【新增】清理冗余 HTML 属性，大幅减少 HTML 体积
     // 保留必要属性：href, src, alt, data-mowen-uid, width, height, target, rel, style
     // 注意：保留 style 属性以便 noteAtom 处理其他样式（如斜体）
     // 注意：保留 data-mowen-caption 以传递提取到的图片注释
     // 移除：class, id, data-* (除白名单外), contenteditable 等
-    const KEEP_ATTRS = new Set(['href', 'src', 'alt', 'data-mowen-uid', 'data-mowen-caption', 'width', 'height', 'target', 'rel', 'srcset', 'data-src', 'data-original', 'style']);
+    const BASE_KEEP_ATTRS = new Set([
+        'href',
+        'src',
+        'alt',
+        'data-mowen-uid',
+        'data-mowen-caption',
+        'width',
+        'height',
+        'target',
+        'rel',
+        'srcset',
+        'data-src',
+        'data-original',
+        'style',
+    ]);
 
     body.querySelectorAll('*').forEach(el => {
+        const keepAttrs = new Set(BASE_KEEP_ATTRS);
+        if (el.tagName === 'PRE' || el.tagName === 'CODE') {
+            keepAttrs.add('class');
+            keepAttrs.add('data-language');
+            keepAttrs.add('data-lang');
+            keepAttrs.add('translate');
+        }
+
         const attrsToRemove: string[] = [];
         for (const attr of Array.from(el.attributes)) {
-            if (!KEEP_ATTRS.has(attr.name)) {
+            if (!keepAttrs.has(attr.name)) {
                 attrsToRemove.push(attr.name);
             }
         }
@@ -758,6 +959,8 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
         // Always remove script and style even in non-aggressive mode
         element.querySelectorAll('script, style').forEach((el) => el.remove());
     }
+
+    removeLinkedBadgeImages(element);
 
     // Remove hidden elements
     element.querySelectorAll('*').forEach((el) => {

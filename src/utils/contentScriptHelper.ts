@@ -14,6 +14,16 @@ import { TIMEOUT, popupLogger as logger } from './constants';
  */
 export async function injectContentScript(tabId: number): Promise<boolean> {
     try {
+        const [{ result: isAlreadyInjected } = { result: false }] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => Boolean((globalThis as { __mowenContentScriptLoaded__?: boolean }).__mowenContentScriptLoaded__),
+        });
+
+        if (isAlreadyInjected) {
+            logger.debug('Content script already injected, skipping executeScript');
+            return true;
+        }
+
         const manifest = chrome.runtime.getManifest();
         const contentScriptFile = manifest.content_scripts?.[0]?.js?.[0];
 

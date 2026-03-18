@@ -10,7 +10,7 @@
  * - /note/ref/infos：获取合集子笔记信息
  */
 
-import { MowenNoteItem, MowenNoteDetail, NoteListPaging, NoteListFilter } from '../types';
+import { MowenNoteItem, MowenNoteDetail, NoteListPaging, NoteListFilter, MowenLoginStatusResult } from '../types';
 import {
   normalizeMowenHtmlForExport,
   noteAtomToHtml,
@@ -597,16 +597,20 @@ export async function fetchNoteRefInfos(uuids: string[]): Promise<MowenNoteItem[
  * 检测墨问登录状态
  * 发送一个最小的 workbench 请求，如果返回 401/403 则未登录
  */
-export async function checkLoginStatus(): Promise<boolean> {
+export async function checkLoginStatus(): Promise<MowenLoginStatusResult> {
   try {
     await fetchNoteList({ hint: '', size: 1 }, { benchType: 1 });
-    return true;
+    return { status: 'logged_in' };
   } catch (error) {
     if (error instanceof MowenWebApiError && error.code === 'NOT_LOGGED_IN') {
-      return false;
+      return { status: 'logged_out' };
     }
-    // 其他错误（网络/超时等）也视为可能已登录但有其他问题
+
     console.warn('[mowenWebApi] checkLoginStatus error:', error);
-    return false;
+    return {
+      status: 'error',
+      error: error instanceof Error ? error.message : '登录状态检查失败',
+      errorCode: error instanceof MowenWebApiError ? error.code : 'UNKNOWN',
+    };
   }
 }

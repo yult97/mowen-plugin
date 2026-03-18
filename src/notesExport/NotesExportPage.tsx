@@ -5,6 +5,7 @@ import {
   PdfExportProgress,
   PdfExportSettings,
   PDF_EXPORT_MAX_COUNT,
+  MowenLoginStatusResult,
 } from '../types';
 import {
   fetchNoteList,
@@ -299,7 +300,8 @@ function mergeNotesByUuid(existingNotes: MowenNoteItem[], incomingNotes: MowenNo
 
 const NotesExportPage: React.FC = () => {
   // 登录状态
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
+  const [loginStatus, setLoginStatus] = useState<MowenLoginStatusResult['status'] | null>(null);
+  const [loginStatusError, setLoginStatusError] = useState('');
   const [loginChecking, setLoginChecking] = useState(true);
 
   // 笔记列表
@@ -497,23 +499,28 @@ const NotesExportPage: React.FC = () => {
     }
   }, [verifyCollectionCandidates]);
 
+  const runLoginCheck = useCallback(async () => {
+    setLoginChecking(true);
+    setLoginStatusError('');
+
+    const result = await checkLoginStatus();
+    if (!isMountedRef.current) {
+      return;
+    }
+
+    setLoginStatus(result.status);
+    setLoginStatusError(result.error || '');
+    setLoginChecking(false);
+
+    if (result.status === 'logged_in') {
+      loadNotes();
+    }
+  }, [loadNotes]);
+
   // 检查登录态
   useEffect(() => {
-    const check = async () => {
-      setLoginChecking(true);
-      const loggedIn = await checkLoginStatus();
-      if (!isMountedRef.current) {
-        return;
-      }
-
-      setIsLoggedIn(loggedIn);
-      setLoginChecking(false);
-      if (loggedIn) {
-        loadNotes();
-      }
-    };
-    check();
-  }, [loadNotes]);
+    void runLoginCheck();
+  }, [runLoginCheck]);
 
   // 加载更多
   const loadMore = useCallback(() => {
@@ -851,8 +858,24 @@ const NotesExportPage: React.FC = () => {
     );
   }
 
+  if (loginStatus === 'error') {
+    return (
+      <div className="notes-export-page">
+        <div className="notes-export-login">
+          <AlertCircle size={48} strokeWidth={1.5} />
+          <h2>登录状态检查失败</h2>
+          <p>{loginStatusError || '无法确认当前登录状态，请检查网络或稍后重试。'}</p>
+          <button onClick={runLoginCheck} className="btn-primary">
+            <RefreshCw size={16} />
+            重试检查
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // 未登录
-  if (!isLoggedIn) {
+  if (loginStatus === 'logged_out') {
     return (
       <div className="notes-export-page">
         <div className="notes-export-login">
@@ -867,7 +890,7 @@ const NotesExportPage: React.FC = () => {
           >
             前往登录
           </a>
-          <button onClick={() => window.location.reload()} className="btn-outline" style={{ marginTop: 12 }}>
+          <button onClick={runLoginCheck} className="btn-outline" style={{ marginTop: 12 }}>
             <RefreshCw size={16} />
             重新检查
           </button>

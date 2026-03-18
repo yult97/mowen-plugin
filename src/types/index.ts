@@ -93,6 +93,11 @@ export interface NoteCreateResult {
   noteId?: string;
   noteUrl?: string;      // URL for jumping (based on public/private setting)
   shareUrl?: string;     // URL for sharing/collection (always /detail/)
+  notes?: Array<{
+    partIndex: number;
+    noteUrl: string;
+    isIndex?: boolean;
+  }>;
   error?: string;
   errorCode?: string;
 }
@@ -105,6 +110,8 @@ export type SaveStatus =
   | 'uploading_images'
   | 'creating'
   | 'creating_note'
+  | 'paused'
+  | 'cancelling'
   | 'success'
   | 'failed'
   | 'cancelled';
@@ -158,6 +165,7 @@ export interface ApiError {
 export const ERROR_CODES = {
   UNAUTHORIZED: 'UNAUTHORIZED',
   NETWORK: 'NETWORK',
+  AMBIGUOUS_CREATE: 'AMBIGUOUS_CREATE',
   RATE_LIMIT: 'RATE_LIMIT',
   CONTENT_TOO_LONG: 'CONTENT_TOO_LONG',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
@@ -168,6 +176,7 @@ export const ERROR_CODES = {
 export const ERROR_MESSAGES: Record<string, string> = {
   UNAUTHORIZED: 'API Key 无效或已过期，请重新生成。',
   NETWORK: '网络异常，请稍后再试。',
+  AMBIGUOUS_CREATE: '创建请求超时或连接中断，服务端可能已成功创建笔记，请先到墨问检查后再重试。',
   RATE_LIMIT: '请求过于频繁，请稍后再试。',
   CONTENT_TOO_LONG: '内容超过长度限制。',
   SERVICE_UNAVAILABLE: '服务暂时不可用，请稍后再试。',
@@ -352,4 +361,15 @@ export interface NoteListPaging {
  */
 export interface NoteListFilter {
   benchType: number;  // 1=我的笔记
+}
+
+/**
+ * 墨问网页登录态检查结果
+ */
+export type MowenLoginStatus = 'logged_in' | 'logged_out' | 'error';
+
+export interface MowenLoginStatusResult {
+  status: MowenLoginStatus;
+  error?: string;
+  errorCode?: string;
 }

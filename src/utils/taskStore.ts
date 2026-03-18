@@ -3,10 +3,11 @@ import { SaveProgress, NoteCreateResult } from '../types';
 const TASK_PREFIX = 'mowen_task_';
 const TASK_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
-export type TaskStatus = 'idle' | 'processing' | 'success' | 'failed';
+export type TaskStatus = 'idle' | 'processing' | 'paused' | 'cancelled' | 'success' | 'failed';
 
 export interface TaskState {
     tabId: number;
+    taskId: string;
     status: TaskStatus;
     startTime: number;
     lastUpdate: number;
@@ -41,6 +42,12 @@ export const TaskStore = {
                 return null;
             }
 
+            // Legacy task state without taskId is considered stale.
+            if (!task.taskId) {
+                await this.clear(tabId);
+                return null;
+            }
+
             return task;
         } catch (e) {
             console.error('TaskStore.get failed:', e);
@@ -51,9 +58,10 @@ export const TaskStore = {
     /**
      * Initialize or overwrite a task
      */
-    async init(tabId: number): Promise<void> {
+    async init(tabId: number, taskId: string): Promise<void> {
         const state: TaskState = {
             tabId,
+            taskId,
             status: 'processing',
             startTime: Date.now(),
             lastUpdate: Date.now(),
@@ -65,11 +73,19 @@ export const TaskStore = {
     /**
      * Update progress
      */
-    async updateProgress(tabId: number, progress: SaveProgress): Promise<void> {
+    async updateProgress(tabId: number, taskId: string, progress: SaveProgress): Promise<void> {
         const task = await this.get(tabId);
         if (!task) return; // Task might be cleared or expired
+        if (task.taskId !== taskId) return;
 
         task.progress = { ...task.progress, ...progress };
+        if (progress.status === 'paused') {
+            task.status = 'paused';
+        } else if (progress.status === 'cancelled') {
+            task.status = 'cancelled';
+        } else if (task.status !== 'processing') {
+            task.status = 'processing';
+        }
         task.lastUpdate = Date.now();
         await this.save(tabId, task);
     },
@@ -77,39 +93,47 @@ export const TaskStore = {
     /**
      * Complete task
      */
-    async complete(tabId: number, result: NoteCreateResult): Promise<void> {
+    async complete(tabId: number, taskId: string, result: NoteCreateResult): Promise<void> {
         const task = await this.get(tabId);
-        // Even if task is null (expired?), we might want to record the result if it just finished?
-        // But for simplicity, if it's gone, it's gone.
-        // However, usually it won't be gone while running unless user manually cleared it.
+        if (!task || task.taskId !== taskId) return;
 
-        // Create new state if missing to ensure result is saved
-        const state: TaskState = task || {
-            tabId,
-            status: 'processing',
-            startTime: Date.now(),
-            lastUpdate: Date.now(),
-        };
-
-        state.status = result.success ? 'success' : 'failed';
-        state.lastUpdate = Date.now();
-        state.result = {
+        task.status = result.errorCode === 'CANCELLED'
+            ? 'cancelled'
+            : (result.success ? 'success' : 'failed');
+        task.lastUpdate = Date.now();
+        task.result = {
             success: result.success,
             // Map result fields to storage friendly format
             notes: result.success ? (result as any).notes : undefined,
             error: result.error,
             errorCode: result.errorCode
         };
-        // Clear progress on completion to save space, or keep it? Keep it for "100%" visualization if needed.
+        await this.save(tabId, task);
+    },
 
-        await this.save(tabId, state);
+    async setPaused(tabId: number, taskId: string, progress?: SaveProgress): Promise<void> {
+        const task = await this.get(tabId);
+        if (!task || task.taskId !== taskId) return;
+
+        task.status = 'paused';
+        task.lastUpdate = Date.now();
+        task.progress = {
+            ...task.progress,
+            ...(progress || {}),
+            status: 'paused',
+        };
+        await this.save(tabId, task);
     },
 
     /**
      * Clear task (Manual close)
      */
-    async clear(tabId: number): Promise<void> {
+    async clear(tabId: number, taskId?: string): Promise<void> {
         const key = `${TASK_PREFIX}${tabId}`;
+        if (taskId) {
+            const existingTask = await this.get(tabId);
+            if (!existingTask || existingTask.taskId !== taskId) return;
+        }
         await chrome.storage.session.remove(key);
     },
 

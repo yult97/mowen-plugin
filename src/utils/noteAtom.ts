@@ -5,17 +5,20 @@
  * 1. Block-level first: Parse HTML by block boundaries (p, div, section, li, etc.)
  * 2. Preserve paragraph structure: Each block element = one paragraph node
  * 3. Support lists: ul/ol → paragraphs with bullet/number prefix
- * 4. Support code blocks: pre/code → paragraph with ``` wrapper
+ * 4. Support code blocks: pre/code → codeblock (with language) or quote (without language)
  * 5. Structure summary logging for debugging
  * 
  * NoteAtom supported types (per official API):
  * - doc (root)
  * - paragraph (main content)
  * - quote (blockquote)
+ * - codeblock (code block with language)
  * - image (with uuid)
  * 
  * Marks: bold, italic, highlight, link, code
  */
+
+import { detectCodeLanguage } from './shikiLanguages';
 
 interface NoteAtomMark {
   type: 'bold' | 'italic' | 'highlight' | 'link' | 'code';
@@ -77,7 +80,56 @@ interface MowenNoteGalleryLike {
   gallerys?: Record<string, { fileUuids?: string[] } | undefined>;
 }
 
+interface ProtectedCodeBlock {
+  placeholder: string;
+  content: string;
+  language: string | null;
+}
+
 // Block-level tags are handled inline in parseBlockContent
+
+function protectCodeBlocks(html: string): { html: string; codeBlocks: ProtectedCodeBlock[] } {
+  const codeBlocks: ProtectedCodeBlock[] = [];
+
+  const registerCodeBlock = (preAttrs: string, content: string): string => {
+    const placeholder = `@@MOWEN_CODE_BLOCK_${codeBlocks.length}@@`;
+    const codeTagMatch = content.match(/<code\b([^>]*)>/i);
+    const codeAttrs = codeTagMatch ? codeTagMatch[1] : '';
+    const language = detectCodeLanguage(preAttrs, codeAttrs);
+    const codeContent = content.replace(/<\/?code[^>]*>/gi, '');
+
+    codeBlocks.push({
+      placeholder,
+      content: codeContent,
+      language,
+    });
+
+    return `\n${placeholder}\n`;
+  };
+
+  let protectedHtml = html.replace(/<pre\b([^>]*)>([\s\S]*?)<\/pre>/gi, (_match, preAttrs, content) => (
+    registerCodeBlock(preAttrs, content)
+  ));
+
+  // 有些站点会把块级代码打散成 <p><code>...</code></p> 或 <div><code>...</code></div>
+  // 只在“容器内只有 code + 空白”的情况下识别，避免误伤行内 code。
+  protectedHtml = protectedHtml.replace(
+    /<(p|div|section|article|li)\b([^>]*)>\s*<code\b([^>]*)>([\s\S]*?)<\/code>\s*<\/\1>/gi,
+    (match, _tag, wrapperAttrs, codeAttrs, content) => {
+      const looksLikeBlockCode = /\n/.test(content) || Boolean(detectCodeLanguage(wrapperAttrs, codeAttrs));
+      if (!looksLikeBlockCode) {
+        return match;
+      }
+
+      return registerCodeBlock(`${wrapperAttrs} ${codeAttrs}`, content);
+    }
+  );
+
+  return {
+    html: protectedHtml,
+    codeBlocks,
+  };
+}
 
 /**
  * Main conversion function
@@ -94,8 +146,10 @@ export function htmlToNoteAtom(html: string): NoteAtom {
   };
 
   try {
+    const protectedCode = protectCodeBlocks(html);
+
     // 1. Clean script/style/comments
-    let processed = html
+    let processed = protectedCode.html
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, '')
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gmi, '')
       .replace(/<!--[\s\S]*?-->/g, '');
@@ -112,7 +166,7 @@ export function htmlToNoteAtom(html: string): NoteAtom {
     });
 
     // 3. Parse blocks
-    const blocks = parseBlockContent(processed, images, stats);
+    const blocks = parseBlockContent(processed, images, stats, protectedCode.codeBlocks);
     stats.total = blocks.length;
 
     // 4. Ensure at least one block
@@ -137,7 +191,12 @@ export function htmlToNoteAtom(html: string): NoteAtom {
  * Parse block-level content from HTML
  * Uses a streaming approach to handle nested structures
  */
-function parseBlockContent(html: string, images: ImageData[], stats: ConvertStats): NoteAtom[] {
+function parseBlockContent(
+  html: string,
+  images: ImageData[],
+  stats: ConvertStats,
+  protectedCodeBlocks: ProtectedCodeBlock[] = []
+): NoteAtom[] {
   const blocks: NoteAtom[] = [];
 
   // Strategy: Use regex to find block boundaries and process sequentially
@@ -158,15 +217,8 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
     return `\n${placeholder}\n`;
   });
 
-  // 3. Handle code blocks (pre/code)
-  const codeBlocks: Array<{ placeholder: string; content: string }> = [];
-  normalized = normalized.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_m, content) => {
-    const placeholder = `<!--CODE:${codeBlocks.length}-->`;
-    // Strip inner <code> tag if present
-    const codeContent = content.replace(/<\/?code[^>]*>/gi, '');
-    codeBlocks.push({ placeholder, content: codeContent });
-    return `\n${placeholder}\n`;
-  });
+  // 3. Handle protected code block placeholders extracted before any global HTML cleanup.
+  const codeBlocks = protectedCodeBlocks;
 
   // 4. Handle lists (convert to individual paragraphs with prefixes)
   normalized = normalized.replace(/<ul\b[^>]*>([\s\S]*?)<\/ul>/gi, (_m, content) => {
@@ -187,7 +239,7 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
   // 6. 确保 QUOTE、CODE、IMG 占位符独立成行，便于后续匹配
   normalized = normalized
     .replace(/(<!--QUOTE:\d+-->)/g, '\n$1\n')
-    .replace(/(<!--CODE:\d+-->)/g, '\n$1\n')
+    .replace(/(@@MOWEN_CODE_BLOCK_\d+@@)/g, '\n$1\n')
     .replace(/(<!--IMG:\d+-->)/g, '$1');
 
   // 7. Split by block boundaries
@@ -278,20 +330,19 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
       }
 
       // Check for code placeholder
-      const codeMatch = trimmed.match(/^<!--CODE:(\d+)-->$/);
+      const codeMatch = trimmed.match(/^@@MOWEN_CODE_BLOCK_(\d+)@@$/);
       if (codeMatch) {
         const codeIndex = parseInt(codeMatch[1]);
         const codeData = codeBlocks[codeIndex];
         if (codeData) {
-          // Create code block as quote for better visual presentation
-          // Preserve line breaks by only decoding HTML entities, not stripping newlines
+          // 保留换行，仅解码 HTML 实体
           let codeText = codeData.content;
 
-          // Remove HTML tags but preserve newlines
+          // 移除 HTML 标签但保留换行
           codeText = codeText
-            .replace(/<br\s*\/?>/gi, '\n')  // Convert <br> to newline
-            .replace(/<[^>]+>/g, '')         // Remove other HTML tags
-            .replace(/&lt;/g, '<')           // Decode common entities
+            .replace(/<br\s*\/?>/gi, '\n')  // 将 <br> 转为换行
+            .replace(/<[^>]+>/g, '')         // 移除其他 HTML 标签
+            .replace(/&lt;/g, '<')           // 解码常见实体
             .replace(/&gt;/g, '>')
             .replace(/&amp;/g, '&')
             .replace(/&quot;/g, '"')
@@ -300,8 +351,10 @@ function parseBlockContent(html: string, images: ImageData[], stats: ConvertStat
             .trim();
 
           if (codeText) {
+            // 即便未识别语言，也保留为代码块，默认使用 text。
             blocks.push({
-              type: 'quote',
+              type: 'codeblock',
+              attrs: { language: codeData.language || 'text' },
               content: [{ type: 'text', text: codeText }]
             });
             stats.code++;
@@ -743,7 +796,7 @@ function parseInlineContent(html: string): NoteAtom[] {
   const result: NoteAtom[] = [];
 
   // Remove placeholders
-  html = html.replace(/<!--(?:IMG|QUOTE|CODE):\d+-->/g, '');
+  html = html.replace(/<!--(?:IMG|QUOTE):\d+-->|@@MOWEN_CODE_BLOCK_\d+@@/g, '');
 
   // Parse inline elements
   const inlineRegex = /<(strong|b|em|i|mark|a|code|span)(\s[^>]*)?>|<\/(strong|b|em|i|mark|a|code|span)>/gi;
@@ -958,11 +1011,37 @@ function createImageBlock(imgData: ImageData): NoteAtom | null {
         ...(imgData.alt ? { alt: imgData.alt } : {})
       }
     };
-  } else {
-    // No UUID means image upload failed - skip this image entirely
-    // User preference: do not show images as links
+  }
+
+  if (!isSafeHttpImageUrl(imgData.src)) {
     console.warn('[noteAtom] Skipping image without UUID');
     return null;
+  }
+
+  return {
+    type: 'paragraph',
+    content: [{
+      type: 'text',
+      text: buildImageFallbackLabel(imgData.alt),
+      marks: [{
+        type: 'link',
+        attrs: { href: imgData.src }
+      }]
+    }]
+  };
+}
+
+function buildImageFallbackLabel(alt?: string): string {
+  const normalizedAlt = alt?.trim();
+  return normalizedAlt ? `查看原图：${normalizedAlt}` : '查看原图';
+}
+
+function isSafeHttpImageUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
   }
 }
 
@@ -1496,6 +1575,15 @@ function atomNodeToHtml(node: NoteAtom, options: NoteAtomToHtmlOptions = {}): st
         const inner = node.content.map(child => atomNodeToHtml(child, options)).join('');
         return `<blockquote><p>${inner}</p></blockquote>`;
       }
+    }
+
+    case 'codeblock': {
+      // 代码块节点：渲染为 <pre><code> 并附带语言 class
+      const lang = String(node.attrs?.language || 'text');
+      const codeText = node.content
+        ? node.content.map(c => escapeHtmlForAtom(c.text || '')).join('')
+        : '';
+      return `<pre><code class="language-${escapeHtmlForAtom(lang)}">${codeText}</code></pre>`;
     }
 
     case 'image': {

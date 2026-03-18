@@ -4,7 +4,7 @@ import { getSettings } from '../utils/storage';
 import { TaskStore, TaskState } from '../utils/taskStore';
 import { injectContentScript } from '../utils/contentScriptHelper';
 import { exportSinglePdf } from '../utils/pdfExporter';
-import { formatErrorForLog } from '../utils/helpers';
+import { formatErrorForLog, generateId } from '../utils/helpers';
 import {
   Settings as SettingsIcon,
   X,
@@ -44,7 +44,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [isClippable, setIsClippable] = useState(true);
   const [previewState, setPreviewState] = useState<PreviewState>('P0_Idle');
   const [loading, setLoading] = useState(true);
-  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [cancelDialogTaskId, setCancelDialogTaskId] = useState<string | null>(null);
   const [showTutorial, setShowTutorial] = useState(false);
   const [isPdfExporting, setIsPdfExporting] = useState(false);
 
@@ -53,6 +53,27 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
   // Use ref to track preview state inside event listeners
   const previewStateRef = useRef<PreviewState>('P0_Idle');
+  const currentTabIdRef = useRef<number | null>(null);
+  const currentTaskIdRef = useRef<string | null>(null);
+  const saveInFlightRef = useRef(false);
+
+  const bindTaskContext = (tabId: number | null, taskId: string | null) => {
+    currentTabIdRef.current = tabId;
+    currentTaskIdRef.current = taskId;
+  };
+
+  const clearTaskScopedUiState = () => {
+    setCancelDialogTaskId(null);
+  };
+
+  const matchesCurrentTaskMessage = (tabId?: number, taskId?: string) => {
+    return (
+      typeof tabId === 'number' &&
+      currentTabIdRef.current === tabId &&
+      Boolean(taskId) &&
+      currentTaskIdRef.current === taskId
+    );
+  };
 
   useEffect(() => {
     previewStateRef.current = previewState;
@@ -65,34 +86,58 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     const handleStorageChange = async (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => {
       // 1. Handle Task State Changes (Session Storage)
       if (areaName === 'session') {
-        // We need to know current tab ID to filter relevant updates
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!activeTab?.id) return;
+        const currentTabId = currentTabIdRef.current;
+        if (!currentTabId) return;
 
-        const taskKey = `mowen_task_${activeTab.id}`;
+        const taskKey = `mowen_task_${currentTabId}`;
         if (changes[taskKey]) {
           const newValue = changes[taskKey].newValue as TaskState | undefined;
+          const oldValue = changes[taskKey].oldValue as TaskState | undefined;
 
           if (!newValue) {
-            // Task cleared?
+            if (oldValue?.taskId && currentTaskIdRef.current === oldValue.taskId) {
+              currentTaskIdRef.current = null;
+            }
             return;
           }
 
-          console.log('[墨问 Popup] 🔄 Storage update:', newValue.status);
+          if (currentTaskIdRef.current && newValue.taskId !== currentTaskIdRef.current) {
+            return;
+          }
+
+          if (!currentTaskIdRef.current) {
+            currentTaskIdRef.current = newValue.taskId;
+          }
+
+          console.log('[墨问 Popup] 🔄 Storage update:', newValue.status, 'task:', newValue.taskId);
 
           if (newValue.status === 'processing' && newValue.progress) {
+            saveInFlightRef.current = true;
+            clearTaskScopedUiState();
             setPreviewState('P3_Saving');
             setProgress({
               ...newValue.progress,
               status: newValue.progress.status === 'uploading_images' ? 'uploading_images' : 'creating_note'
             } as SaveProgress);
+          } else if (newValue.status === 'paused' && newValue.progress) {
+            saveInFlightRef.current = true;
+            setCancelDialogTaskId(newValue.taskId);
+            setPreviewState('P3_Saving');
+            setProgress({
+              ...newValue.progress,
+              status: 'paused',
+            });
           } else if (newValue.status === 'success' && newValue.result?.success) {
+            saveInFlightRef.current = false;
+            clearTaskScopedUiState();
             setPreviewState('P4_Success');
             setProgress({
               status: 'success',
               notes: newValue.result.notes,
             });
           } else if (newValue.status === 'failed') {
+            saveInFlightRef.current = false;
+            clearTaskScopedUiState();
             setPreviewState('P5_Failed');
             setProgress({
               status: 'failed',
@@ -135,12 +180,13 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     // Listen for tab activation (switching tabs)
     const handleTabChange = async (activeInfo: chrome.tabs.TabActiveInfo) => {
       console.log('[墨问 Popup] Tab switched to:', activeInfo.tabId);
+      bindTaskContext(activeInfo.tabId, null);
 
       // Try to restore persisted task state for the new active tab FIRST!
       const restored = await checkPersistedState(activeInfo.tabId);
       if (restored) {
         console.log('[墨问 Popup] ♻️ Restored persisted task state for tab:', activeInfo.tabId);
-        await updateCurrentTab();
+        await updateCurrentTab(activeInfo.tabId);
         return; // Do NOT reset state if we have a running/completed task
       }
 
@@ -149,7 +195,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       setPreviewState('P1_PreviewLoading');
       setExtractResult(null);
       setProgress({ status: 'idle' });
-      await updateCurrentTab();
+      await updateCurrentTab(activeInfo.tabId);
       // Trigger auto-fetch
       setAutoFetchTrigger(prev => prev + 1);
     };
@@ -162,20 +208,32 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // Reset on URL change
       if (changeInfo.url) {
         console.log('[墨问 Popup] URL changed, auto-fetching preview...');
+        bindTaskContext(tabId, null);
+        const restored = await checkPersistedState(tabId);
+        if (restored) {
+          await updateCurrentTab(tabId);
+          return;
+        }
         setPreviewState('P1_PreviewLoading');
         setExtractResult(null);
         setProgress({ status: 'idle' });
-        await updateCurrentTab();
+        await updateCurrentTab(tabId);
         setAutoFetchTrigger(prev => prev + 1);
       }
 
       // Auto-fetch when page finishes loading (catches refresh)
       if (changeInfo.status === 'complete') {
         console.log('[墨问 Popup] Page load complete, auto-fetching preview...');
+        bindTaskContext(tabId, null);
+        const restored = await checkPersistedState(tabId);
+        if (restored) {
+          await updateCurrentTab(tabId);
+          return;
+        }
         setPreviewState('P1_PreviewLoading');
         setExtractResult(null);
         setProgress({ status: 'idle' });
-        await updateCurrentTab();
+        await updateCurrentTab(tabId);
         // Minimal initial delay, rely on PING retries for reliability
         setTimeout(() => {
           setAutoFetchTrigger(prev => prev + 1);
@@ -184,15 +242,33 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     };
 
     // Listen for save completion messages from background
-    const handleSaveComplete = (message: { type: string; result?: any }) => {
+    const handleSaveComplete = (message: {
+      type: string;
+      tabId?: number;
+      taskId?: string;
+      result?: {
+        success: boolean;
+        notes?: Array<{ partIndex: number; noteUrl: string; isIndex?: boolean }>;
+        error?: string;
+        errorCode?: string;
+      };
+    }) => {
       if (message.type === 'SAVE_NOTE_COMPLETE' && message.result) {
+        if (!matchesCurrentTaskMessage(message.tabId, message.taskId)) {
+          return;
+        }
+
         if (message.result.success) {
+          saveInFlightRef.current = false;
+          clearTaskScopedUiState();
           setProgress({
             status: 'success',
             notes: message.result.notes,
           });
           setPreviewState('P4_Success');
         } else {
+          saveInFlightRef.current = false;
+          clearTaskScopedUiState();
           setProgress({
             status: 'failed',
             error: message.result.error || '保存失败',
@@ -204,12 +280,44 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     };
 
     // Listen for save progress messages from background
-    const handleSaveProgress = (message: { type: string; progress?: any }) => {
+    const handleSaveProgress = (message: {
+      type: string;
+      tabId?: number;
+      taskId?: string;
+      progress?: SaveProgress;
+    }) => {
       if (message.type === 'SAVE_NOTE_PROGRESS' && message.progress) {
+        if (!matchesCurrentTaskMessage(message.tabId, message.taskId)) {
+          return;
+        }
+
         setProgress((prev) => ({
           ...prev,
           status: 'creating',
           ...message.progress,
+        }));
+      }
+    };
+
+    const handleSavePaused = (message: { type: string; tabId?: number; taskId?: string }) => {
+      if (message.type === 'SAVE_NOTE_PAUSED') {
+        if (!matchesCurrentTaskMessage(message.tabId, message.taskId)) {
+          return;
+        }
+        setCancelDialogTaskId(message.taskId || null);
+        setProgress((prev) => ({ ...prev, status: 'paused' }));
+      }
+    };
+
+    const handleSaveResumed = (message: { type: string; tabId?: number; taskId?: string }) => {
+      if (message.type === 'SAVE_NOTE_RESUMED') {
+        if (!matchesCurrentTaskMessage(message.tabId, message.taskId)) {
+          return;
+        }
+        setCancelDialogTaskId(null);
+        setProgress((prev) => ({
+          ...prev,
+          status: prev.totalImages && (prev.uploadedImages || 0) < prev.totalImages ? 'uploading_images' : 'creating_note',
         }));
       }
     };
@@ -229,8 +337,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     };
 
     // Listen for content script ready notification (after page refresh)
-    const handleContentScriptReady = (message: { type: string }) => {
+    const handleContentScriptReady = (message: { type: string }, sender?: chrome.runtime.MessageSender) => {
       if (message.type === 'CONTENT_SCRIPT_READY') {
+        if (sender?.tab?.id && currentTabIdRef.current && sender.tab.id !== currentTabIdRef.current) {
+          return;
+        }
         console.log('[墨问 Popup] 🚀 Content script ready, triggering extraction...');
         // Immediately trigger fetch - no need to wait or poll
         setPreviewState('P1_PreviewLoading');
@@ -242,26 +353,38 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     const handleTabActivated = async (message: { type: string; payload?: { tabId: number; windowId: number } }) => {
       if (message.type === 'TAB_ACTIVATED' && message.payload) {
         console.log('[墨问 Popup] 🔄 TAB_ACTIVATED received, refreshing for tab:', message.payload.tabId);
+        bindTaskContext(message.payload.tabId, null);
+
+        const restored = await checkPersistedState(message.payload.tabId);
+        if (restored) {
+          await updateCurrentTab(message.payload.tabId);
+          return;
+        }
 
         // 清理旧内容，重新加载新 Tab 的内容
         setExtractResult(null);
         setPreviewState('P1_PreviewLoading');
         setProgress({ status: 'idle' });
-        await updateCurrentTab();
+        await updateCurrentTab(message.payload.tabId);
         // 触发自动获取预览
         setAutoFetchTrigger(prev => prev + 1);
       }
     };
 
     // UNIFIED message handler - prevents conflicts between multiple listeners
-    const handleRuntimeMessage = (message: { type: string; result?: any; progress?: any; data?: ExtractResult; payload?: any }) => {
+    const handleRuntimeMessage = (
+      message: { type: string; tabId?: number; taskId?: string; result?: any; progress?: any; data?: ExtractResult; payload?: any },
+      sender?: chrome.runtime.MessageSender
+    ) => {
       console.log('[墨问 Popup] Received message:', message.type);
 
       // Handle all message types in one listener
       handleSaveComplete(message);
       handleSaveProgress(message);
+      handleSavePaused(message);
+      handleSaveResumed(message);
       handleContentUpdate(message);
-      handleContentScriptReady(message);
+      handleContentScriptReady(message, sender);
       handleTabActivated(message);
     };
 
@@ -378,21 +501,31 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     doAutoFetch();
   }, [autoFetchTrigger]);
 
-  const updateCurrentTab = async () => {
+  const updateCurrentTab = async (targetTabId?: number) => {
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.url) {
-        const newUrl = tab.url;
-        setCurrentUrl(newUrl);
-        try {
-          const url = new URL(newUrl);
-          setCurrentDomain(url.hostname);
-          // Check if page is clippable
-          setIsClippable(checkClippability(url));
-        } catch {
-          setCurrentDomain('');
-          setIsClippable(false);
-        }
+      const tab = typeof targetTabId === 'number'
+        ? await chrome.tabs.get(targetTabId).catch(() => null)
+        : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+
+      currentTabIdRef.current = tab?.id ?? null;
+
+      if (!tab?.url) {
+        setCurrentUrl('');
+        setCurrentDomain('');
+        setIsClippable(false);
+        return;
+      }
+
+      const newUrl = tab.url;
+      setCurrentUrl(newUrl);
+      try {
+        const url = new URL(newUrl);
+        setCurrentDomain(url.hostname);
+        // Check if page is clippable
+        setIsClippable(checkClippability(url));
+      } catch {
+        setCurrentDomain('');
+        setIsClippable(false);
       }
     } catch (error) {
       console.error(`Failed to update current tab: ${formatErrorForLog(error)}`);
@@ -539,12 +672,18 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
       if (!state) {
         console.log('[墨问 Popup] No persisted state found');
+        if (currentTabIdRef.current === tabId) {
+          currentTaskIdRef.current = null;
+        }
         return false;
       }
 
       console.log('[墨问 Popup] ♻️ Found persisted state:', state.status);
 
       if (state.status === 'processing' && state.progress) {
+        bindTaskContext(tabId, state.taskId);
+        saveInFlightRef.current = true;
+        clearTaskScopedUiState();
         // 恢复进度显示 - 任务仍在进行中
         setPreviewState('P3_Saving');
         setProgress({
@@ -552,11 +691,26 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           status: state.progress.status === 'uploading_images' ? 'uploading_images' : 'creating_note'
         } as SaveProgress);
         return true;
+      } else if (state.status === 'paused' && state.progress) {
+        bindTaskContext(tabId, state.taskId);
+        saveInFlightRef.current = true;
+        setCancelDialogTaskId(state.taskId);
+        setPreviewState('P3_Saving');
+        setProgress({
+          ...state.progress,
+          status: 'paused',
+        });
+        return true;
       } else if (state.status === 'success' || state.status === 'failed') {
+        saveInFlightRef.current = false;
+        clearTaskScopedUiState();
         // 成功/失败状态：不再恢复，直接清理
         // 用户期望重新打开插件时是干净的预览页面
         console.log('[墨问 Popup] 🧹 Clearing completed task state, user should see fresh preview');
-        await TaskStore.clear(tabId);
+        await TaskStore.clear(tabId, state.taskId);
+        if (currentTabIdRef.current === tabId) {
+          currentTaskIdRef.current = null;
+        }
         return false; // 返回 false 让 initializePopup 继续正常流程
       }
     } catch (e) {
@@ -709,13 +863,23 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const handleCancelPreview = () => {
     // Clear legacy state if any
     chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-      if (tab?.id) TaskStore.clear(tab.id);
+      if (tab?.id) {
+        const taskId = currentTaskIdRef.current || undefined;
+        TaskStore.clear(tab.id, taskId);
+      }
     });
+    currentTaskIdRef.current = null;
+    clearTaskScopedUiState();
     setPreviewState('P0_Idle');
     setExtractResult(null);
   };
 
   const handleSave = async () => {
+    if (saveInFlightRef.current || previewStateRef.current === 'P3_Saving') {
+      console.log('[墨问 Popup] Save ignored because a save task is already in flight');
+      return;
+    }
+
     if (!extractResult) {
       setProgress({
         status: 'failed',
@@ -735,6 +899,8 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     }
 
     console.log('[墨问 Popup] 💾 Starting save process...');
+    saveInFlightRef.current = true;
+    clearTaskScopedUiState();
 
     // Stop auto-extraction to prevent state reset
     try {
@@ -784,6 +950,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // Get tab ID before sending to ensure correct task binding
       const [saveTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const saveTabId = saveTab?.id;
+      if (!saveTabId) {
+        throw new Error('No active tab');
+      }
+
+      const taskId = generateId();
+      bindTaskContext(saveTabId, taskId);
       console.log('[墨问 Popup] 📤 Sending SAVE_NOTE with tabId:', saveTabId);
 
       const response = await Promise.race([
@@ -796,6 +968,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             maxImages: settings.maxImages,
             createIndexNote: settings.createIndexNote,
             enableAutoTag,
+            taskId,
             tabId: saveTabId, // Include tabId for proper task binding
           },
         }),
@@ -814,6 +987,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           error: '后台服务未响应，请重试或刷新扩展',
           errorCode: response?.errorCode,
         });
+        saveInFlightRef.current = false;
         setPreviewState('P5_Failed');
         return;
       }
@@ -841,6 +1015,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         status: 'failed',
         error: errorMessage,
       });
+      saveInFlightRef.current = false;
       setPreviewState('P5_Failed');
     }
   };
@@ -857,46 +1032,96 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const handleRetry = () => {
     // Clear failed state to start fresh
     chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-      if (tab?.id) TaskStore.clear(tab.id);
+      if (tab?.id) {
+        const taskId = currentTaskIdRef.current || undefined;
+        TaskStore.clear(tab.id, taskId);
+      }
     });
+    currentTaskIdRef.current = null;
+    saveInFlightRef.current = false;
+    clearTaskScopedUiState();
     setPreviewState('P2_PreviewReady');
     setProgress({ status: 'idle' });
   };
 
   // Show cancel confirmation modal
   const handleCancelClick = () => {
-    setShowCancelConfirm(true);
+    const taskId = currentTaskIdRef.current;
+    if (!taskId) {
+      return;
+    }
+
+    chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      if (!tab?.id) {
+        return;
+      }
+
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: 'PAUSE_SAVE',
+          payload: { tabId: tab.id, taskId }
+        });
+        if (!response?.success) {
+          console.error('[墨问 Popup] Failed to pause save task:', response?.error);
+        }
+      } catch (error) {
+        console.error(`[墨问 Popup] Failed to request pause: ${formatErrorForLog(error)}`);
+      }
+    });
   };
 
   // User confirms cancel - actually stop the save
   const handleConfirmCancel = async () => {
     console.log('[墨问 Popup] ❌ User confirmed cancel');
-    setShowCancelConfirm(false);
+    clearTaskScopedUiState();
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const taskId = currentTaskIdRef.current;
       if (tab?.id) {
         await chrome.runtime.sendMessage({
           type: 'CANCEL_SAVE',
-          payload: { tabId: tab.id }
+          payload: { tabId: tab.id, taskId }
         });
         // IMPORTANT: Clear persisted task state to prevent stale restoration on tab switch
-        await TaskStore.clear(tab.id);
+        await TaskStore.clear(tab.id, taskId || undefined);
         console.log('[墨问 Popup] 🧹 Cleared TaskStore for tab:', tab.id);
       }
     } catch (err) {
       console.error(`[墨问 Popup] Failed to send cancel message: ${formatErrorForLog(err)}`);
     }
+    currentTaskIdRef.current = null;
+    saveInFlightRef.current = false;
     setPreviewState('P5_Failed');
     setProgress({ status: 'cancelled' });
   };
 
   // User wants to continue saving
   const handleContinueSave = () => {
-    setShowCancelConfirm(false);
+    const taskId = currentTaskIdRef.current;
+    clearTaskScopedUiState();
+    if (!taskId) {
+      return;
+    }
+
+    chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => {
+      if (!tab?.id) {
+        return;
+      }
+
+      try {
+        await chrome.runtime.sendMessage({
+          type: 'RESUME_SAVE',
+          payload: { tabId: tab.id, taskId }
+        });
+      } catch (error) {
+        console.error(`[墨问 Popup] Failed to resume save task: ${formatErrorForLog(error)}`);
+      }
+    });
   };
 
   // Reset to try again after cancel
   const handleRestartAfterCancel = () => {
+    clearTaskScopedUiState();
     setPreviewState('P2_PreviewReady');
     setProgress({ status: 'idle' });
   };
@@ -1210,12 +1435,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                     }
                   }
                 }}
-                disabled={isPdfExporting}
+                disabled={isPdfExporting || saveInFlightRef.current}
                 title="导出 PDF"
               >
                 {isPdfExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
               </button>
-              <button className="btn-secondary" onClick={handleGetPreview}>
+              <button className="btn-secondary" onClick={handleGetPreview} disabled={saveInFlightRef.current}>
                 <RefreshCw size={16} />
               </button>
             </div>
@@ -1226,6 +1451,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
     // P3 Saving
     if (previewState === 'P3_Saving') {
+      const isPausedConfirming = cancelDialogTaskId !== null && cancelDialogTaskId === currentTaskIdRef.current;
 
       // Generate cancel confirmation description
       const getCancelDescription = () => {
@@ -1250,8 +1476,10 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           </div>
 
           <div className="text-center py-4">
-            <RefreshCw className="animate-spin text-brand-primary mx-auto mb-3" size={32} />
-            <p className="text-sm font-medium text-text-primary mb-4">正在保存到墨问…</p>
+            <RefreshCw className={`${isPausedConfirming ? '' : 'animate-spin'} text-brand-primary mx-auto mb-3`} size={32} />
+            <p className="text-sm font-medium text-text-primary mb-4">
+              {isPausedConfirming ? '已暂停，等待你的选择' : '正在保存到墨问…'}
+            </p>
 
             {/* Unified Progress Bar - Two Phases: Image Upload then Note Creation */}
             <div className="space-y-3 text-left px-2">
@@ -1305,6 +1533,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
                         <button
                           className="text-brand-primary hover:underline px-2 py-1"
                           onClick={handleCancelClick}
+                          disabled={isPausedConfirming}
                         >
                           取消
                         </button>
@@ -1334,7 +1563,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           </div>
 
           {/* Confirmation Modal */}
-          {showCancelConfirm && (
+          {isPausedConfirming && (
             <div className="absolute inset-0 bg-white/95 rounded-xl flex flex-col items-center justify-center p-4 z-10">
               <AlertCircle className="text-brand-primary mb-3" size={32} />
               <h4 className="text-base font-semibold text-text-primary mb-2">停止保存？</h4>
@@ -1391,7 +1620,8 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
       // Regular P5_Failed (error state)
       const errorNeedsRefresh = progress.error?.includes('刷新页面');
-      const isExtractionFailed = progress.error?.includes('提取失败') || progress.error?.includes('超时') || progress.error?.includes('未加载');
+      const isExtractionFailed = !extractResult;
+      const isAmbiguousCreate = progress.errorCode === 'AMBIGUOUS_CREATE';
       const isPermissionDenied = progress.errorCode === 'PERMISSION_DENIED';
 
       // 权限不足：展示专用提示
@@ -1430,12 +1660,21 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
             <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-3">
               <AlertCircle className="text-red-600" size={24} />
             </div>
-            <p className="text-sm font-medium text-text-primary mb-1">
+              <p className="text-sm font-medium text-text-primary mb-1">
               {isExtractionFailed ? '预览失败' : '保存失败'}
             </p>
             <p className="text-xs text-text-secondary mb-4">{progress.error || '未知错误'}</p>
 
             <div className="flex flex-col gap-2">
+              {isAmbiguousCreate && (
+                <button
+                  className="btn-primary w-full"
+                  onClick={() => window.open('https://note.mowen.cn', '_blank')}
+                >
+                  去墨问确认结果
+                </button>
+              )}
+
               {errorNeedsRefresh && (
                 <button
                   className="btn-primary w-full"

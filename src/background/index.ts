@@ -3,9 +3,9 @@ import {
   ExtractResult,
   ImageCandidate,
   ImageProcessResult,
-  NotePart,
   NoteCreateResult,
   ImageFailureReason,
+  SaveProgress,
   SaveHighlightPayload,
   HighlightSaveResult,
   Highlight,
@@ -13,7 +13,7 @@ import {
 import { getSettings, saveSettings } from '../utils/storage';
 import { sleep, isValidPageTitle, extractTitleFromText, formatErrorForLog } from '../utils/helpers';
 
-import { createNote, createNoteWithBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
+import { createNote, createNoteWithBody, buildNoteBody, uploadImageWithFallback, ImageUploadResult, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 import { TaskStore } from '../utils/taskStore';
 import { GlobalRateLimiter } from '../utils/rateLimiter';
@@ -32,8 +32,141 @@ const ALLOWED_MOWEN_WEB_API_PATHS = new Set([
   '/api/note/entry/v1/note/ref/infos',
 ]);
 
-// Running Tasks Map: tabId -> AbortController
-const runningTasks = new Map<number, AbortController>();
+interface SaveTaskRuntimeMessage {
+  type: 'SAVE_NOTE_PROGRESS' | 'SAVE_NOTE_COMPLETE' | 'SAVE_NOTE_PAUSED' | 'SAVE_NOTE_RESUMED';
+  tabId: number;
+  taskId: string;
+}
+
+interface SaveTaskCompleteMessage extends SaveTaskRuntimeMessage {
+  type: 'SAVE_NOTE_COMPLETE';
+  result: NoteCreateResult;
+}
+
+interface SaveTaskProgressMessage extends SaveTaskRuntimeMessage {
+  type: 'SAVE_NOTE_PROGRESS';
+  progress: {
+    type: 'uploading_images' | 'creating_note';
+    uploadedImages?: number;
+    totalImages?: number;
+    currentPart?: number;
+    totalParts?: number;
+  };
+}
+
+interface SaveTaskPausedMessage extends SaveTaskRuntimeMessage {
+  type: 'SAVE_NOTE_PAUSED';
+}
+
+interface SaveTaskResumedMessage extends SaveTaskRuntimeMessage {
+  type: 'SAVE_NOTE_RESUMED';
+}
+
+type RunningTaskStatus = 'running' | 'pause_requested' | 'paused' | 'cancelling';
+
+interface RunningSaveTask {
+  taskId: string;
+  controller: AbortController;
+  status: RunningTaskStatus;
+  waiters: Array<() => void>;
+}
+
+interface NoteAtomMark {
+  type: string;
+  attrs?: Record<string, unknown>;
+}
+
+interface NoteAtomNode {
+  type: string;
+  text?: string;
+  marks?: NoteAtomMark[];
+  content?: NoteAtomNode[];
+  attrs?: Record<string, unknown>;
+}
+
+interface NoteAtomDoc {
+  type: string;
+  content?: NoteAtomNode[];
+}
+
+interface NoteSplitPart {
+  index: number;
+  total: number;
+  title: string;
+  content?: string;
+  body?: NoteAtomDoc;
+  isIndex?: boolean;
+}
+
+const NON_RETRIABLE_CREATE_ERROR_CODES = new Set([
+  'PERMISSION_DENIED',
+  'AMBIGUOUS_CREATE',
+  'CANCELLED',
+]);
+
+function shouldRetryCreateFailure(result: NoteCreateResult): boolean {
+  if (!result.errorCode) {
+    return true;
+  }
+
+  return !NON_RETRIABLE_CREATE_ERROR_CODES.has(result.errorCode);
+}
+
+// Running Tasks Map: tabId -> task context
+const runningTasks = new Map<number, RunningSaveTask>();
+
+function notifyTaskWaiters(task: RunningSaveTask): void {
+  const pendingWaiters = task.waiters.splice(0);
+  for (const resolve of pendingWaiters) {
+    resolve();
+  }
+}
+
+function getRunningTask(tabId: number, taskId: string): RunningSaveTask | null {
+  const task = runningTasks.get(tabId);
+  if (!task || task.taskId !== taskId) {
+    return null;
+  }
+
+  return task;
+}
+
+async function waitForTaskRunnable(tabId: number, taskId: string, progress?: SaveProgress): Promise<'running' | 'cancelled'> {
+  while (true) {
+    const task = getRunningTask(tabId, taskId);
+    if (!task) {
+      return 'cancelled';
+    }
+
+    if (task.status === 'cancelling' || task.controller.signal.aborted) {
+      return 'cancelled';
+    }
+
+    if (task.status === 'pause_requested') {
+      task.status = 'paused';
+      await TaskStore.setPaused(tabId, taskId, progress);
+      chrome.runtime.sendMessage({
+        type: 'SAVE_NOTE_PAUSED',
+        tabId,
+        taskId,
+      } as SaveTaskPausedMessage).catch(() => { });
+    }
+
+    if (task.status === 'paused') {
+      await new Promise<void>((resolve) => {
+        const latestTask = getRunningTask(tabId, taskId);
+        if (!latestTask || latestTask.status !== 'paused') {
+          resolve();
+          return;
+        }
+        latestTask.waiters.push(resolve);
+      });
+      continue;
+    }
+
+    return 'running';
+  }
+}
 
 function isTrustedExtensionPageSender(sender: chrome.runtime.MessageSender): boolean {
   return typeof sender.url === 'string' && sender.url.startsWith(EXTENSION_PAGE_PREFIX);
@@ -324,6 +457,7 @@ interface SaveNotePayload {
   includeImages: boolean;
   maxImages: number;
   createIndexNote: boolean;
+  taskId: string;
   enableAutoTag?: boolean;  // 是否自动添加「墨问剪藏」标签
   tabId?: number; // Optional, can be injected by sender
 }
@@ -346,17 +480,75 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'CANCEL_SAVE') {
     const tabId = message.payload?.tabId;
-    console.log(`[墨问 Background] ❌ CANCEL_SAVE received for tab ${tabId}`);
+    const taskId = message.payload?.taskId;
+    console.log(`[墨问 Background] ❌ CANCEL_SAVE received for tab ${tabId}, task ${taskId}`);
 
-    if (tabId && runningTasks.has(tabId)) {
-      const controller = runningTasks.get(tabId);
-      controller?.abort();
-      runningTasks.delete(tabId);
-      console.log(`[墨问 Background] 🛑 Task for tab ${tabId} aborted`);
-    } else {
-      console.log(`[墨问 Background] ⚠️ No running task found for tab ${tabId}`);
+    if (!tabId || !taskId) {
+      sendResponse({ success: false, error: 'INVALID_CANCEL_PAYLOAD' });
+      return false;
     }
 
+    const runningTask = runningTasks.get(tabId);
+    if (runningTask && runningTask.taskId === taskId) {
+      runningTask.status = 'cancelling';
+      runningTask.controller.abort();
+      notifyTaskWaiters(runningTask);
+      console.log(`[墨问 Background] 🛑 Task for tab ${tabId} aborted`);
+      TaskStore.clear(tabId, taskId).catch((error) => {
+        console.error(`[墨问 Background] Failed to clear cancelled task store: ${formatErrorForLog(error)}`);
+      });
+      sendResponse({ success: true });
+    } else {
+      console.log(`[墨问 Background] ⚠️ No running task found for tab ${tabId}, task ${taskId}`);
+      sendResponse({ success: false, error: 'TASK_NOT_FOUND' });
+    }
+
+    return false;
+  }
+
+  if (message.type === 'PAUSE_SAVE') {
+    const tabId = message.payload?.tabId;
+    const taskId = message.payload?.taskId;
+    if (!tabId || !taskId) {
+      sendResponse({ success: false, error: 'INVALID_PAUSE_PAYLOAD' });
+      return false;
+    }
+
+    const runningTask = getRunningTask(tabId, taskId);
+    if (!runningTask) {
+      sendResponse({ success: false, error: 'TASK_NOT_FOUND' });
+      return false;
+    }
+
+    if (runningTask.status === 'running') {
+      runningTask.status = 'pause_requested';
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.type === 'RESUME_SAVE') {
+    const tabId = message.payload?.tabId;
+    const taskId = message.payload?.taskId;
+    if (!tabId || !taskId) {
+      sendResponse({ success: false, error: 'INVALID_RESUME_PAYLOAD' });
+      return false;
+    }
+
+    const runningTask = getRunningTask(tabId, taskId);
+    if (!runningTask) {
+      sendResponse({ success: false, error: 'TASK_NOT_FOUND' });
+      return false;
+    }
+
+    runningTask.status = 'running';
+    notifyTaskWaiters(runningTask);
+    TaskStore.updateProgress(tabId, taskId, { status: 'creating' }).catch(() => { });
+    chrome.runtime.sendMessage({
+      type: 'SAVE_NOTE_RESUMED',
+      tabId,
+      taskId,
+    } as SaveTaskResumedMessage).catch(() => { });
     sendResponse({ success: true });
     return false;
   }
@@ -401,6 +593,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
 
+    if (!message.payload.taskId) {
+      console.error('[墨问 Background] ❌ taskId is missing in SAVE_NOTE message');
+      sendResponse({ success: false, error: 'taskId is required' });
+      return false;
+    }
+
     // Send immediate acknowledgment to prevent message channel timeout
     sendResponse({ success: true, acknowledged: true });
 
@@ -413,6 +611,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     (async () => {
       let targetTabId = message.payload?.tabId;
+      const taskId = message.payload.taskId;
       if (!targetTabId) {
         const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
         targetTabId = activeTab?.id;
@@ -420,29 +619,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (!targetTabId) {
         console.error('[墨问 Background] ❌ Could not determine target tab ID');
+        chrome.runtime.sendMessage({
+          type: 'SAVE_NOTE_COMPLETE',
+          tabId: -1,
+          taskId,
+          result: {
+            success: false,
+            error: '无法确定目标标签页',
+            errorCode: 'INVALID_TAB',
+          },
+        } as SaveTaskCompleteMessage).catch(() => { });
         return;
       }
 
       try {
         handleSaveNote(message.payload, targetTabId)
           .then((result) => {
-            console.log(`[墨问 Background] 📤 Sending SAVE_NOTE_COMPLETE for tab ${targetTabId}:`, result.success);
-            // Send result via a separate message to popup/content
-            // We can't target popup easily, but sendMessage works if popup is listening
+            console.log(`[墨问 Background] 📤 Sending SAVE_NOTE_COMPLETE for tab ${targetTabId}, task ${taskId}:`, result.success);
             chrome.runtime.sendMessage({
               type: 'SAVE_NOTE_COMPLETE',
+              tabId: targetTabId,
+              taskId,
               result,
-            }).catch(() => { });
+            } as SaveTaskCompleteMessage).catch(() => { });
           })
           .catch((error) => {
             console.error(`[墨问 Background] Save process failed: ${formatErrorForLog(error)}`);
             chrome.runtime.sendMessage({
               type: 'SAVE_NOTE_COMPLETE',
+              tabId: targetTabId,
+              taskId,
               result: {
                 success: false,
                 error: error.message || 'Unknown error',
+                errorCode: 'UNKNOWN',
               },
-            }).catch(() => { });
+            } as SaveTaskCompleteMessage).catch(() => { });
           });
       } catch (e) {
         console.error(`[墨问 Background] Synchronous error calling handleSaveNote: ${formatErrorForLog(e)}`);
@@ -870,12 +1082,7 @@ function formatHighlightContent(highlight: Highlight): string {
   return `<p>${highlight.text}</p>`;
 }
 
-async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<{
-  success: boolean;
-  notes?: Array<{ partIndex: number; noteUrl: string; isIndex?: boolean }>;
-  error?: string;
-  errorCode?: string;
-}> {
+async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<NoteCreateResult> {
   // Defensive check for payload
   if (!payload) {
     console.error('[墨问 Background] ❌ Payload is undefined/null');
@@ -884,6 +1091,30 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
 
   console.log(`[墨问 Background] 🚀 handleSaveNote started for tab ${tabId}`);
   logToContentScript('🚀 handleSaveNote started', tabId);
+
+  const {
+    extractResult,
+    isPublic,
+    includeImages,
+    maxImages,
+    createIndexNote,
+    enableAutoTag,
+    taskId,
+  } = payload;
+
+  if (!taskId) {
+    return { success: false, error: 'taskId 缺失', errorCode: 'INVALID_PAYLOAD' };
+  }
+
+  if (!extractResult) {
+    console.error('[墨问 Background] ❌ extractResult is undefined/null');
+    return { success: false, error: 'extractResult is undefined', errorCode: 'INVALID_PAYLOAD' };
+  }
+
+  if (!extractResult.contentHtml) {
+    console.error('[墨问 Background] ❌ extractResult.contentHtml is empty');
+    return { success: false, error: '页面内容为空', errorCode: 'EMPTY_CONTENT' };
+  }
 
   let settings;
   try {
@@ -895,35 +1126,48 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
     return { success: false, error: '无法加载设置', errorCode: 'SETTINGS_ERROR' };
   }
 
-  const { extractResult, isPublic, includeImages, maxImages, createIndexNote, enableAutoTag } = payload;
-
-  // Create new AbortController and register it
-  const abortController = new AbortController();
-  runningTasks.set(tabId, abortController);
-  const signal = abortController.signal;
-
-  // 初始化任务状态
-  try {
-    await TaskStore.init(tabId);
-  } catch (e) {
-    console.log(`[墨问 Background] ⚠️ 无法初始化 TaskStore for tab ${tabId}`);
-  }
-
-  // Defensive check for extractResult
-  if (!extractResult) {
-    console.error('[墨问 Background] ❌ extractResult is undefined/null');
-    return { success: false, error: 'extractResult is undefined', errorCode: 'INVALID_PAYLOAD' };
-  }
-
-  if (!extractResult.contentHtml) {
-    console.error('[墨问 Background] ❌ extractResult.contentHtml is empty');
-    return { success: false, error: '页面内容为空', errorCode: 'EMPTY_CONTENT' };
-  }
-
   if (!settings.apiKey) {
     console.error('[墨问 Background] ❌ No API key configured');
     return { success: false, error: 'API Key 未配置', errorCode: 'UNAUTHORIZED' };
   }
+
+  const existingTask = runningTasks.get(tabId);
+  if (existingTask && existingTask.taskId !== taskId) {
+    existingTask.controller.abort();
+    void TaskStore.clear(tabId, existingTask.taskId).catch(() => { });
+  }
+
+  const abortController = new AbortController();
+  runningTasks.set(tabId, { taskId, controller: abortController, status: 'running', waiters: [] });
+  const signal = abortController.signal;
+
+  try {
+    await TaskStore.init(tabId, taskId);
+  } catch (e) {
+    console.log(`[墨问 Background] ⚠️ 无法初始化 TaskStore for tab ${tabId}`);
+  }
+
+  const finalize = async (
+    result: NoteCreateResult,
+    options: { clearTask?: boolean } = {}
+  ): Promise<NoteCreateResult> => {
+    const currentTask = runningTasks.get(tabId);
+    if (currentTask?.taskId === taskId) {
+      runningTasks.delete(tabId);
+    }
+
+    try {
+      if (options.clearTask) {
+        await TaskStore.clear(tabId, taskId);
+      } else {
+        await TaskStore.complete(tabId, taskId, result);
+      }
+    } catch (storageError) {
+      console.error(`[墨问 Background] Failed to finalize task state: ${formatErrorForLog(storageError)}`);
+    }
+
+    return result;
+  };
 
   try {
     // Step 1: Process images (if enabled)
@@ -935,12 +1179,12 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       console.log(`[墨问 Background] 🖼️ Found ${images.length} images, processing...`);
       logToContentScript(`🖼️ Found ${images.length} images, processing...`, tabId);
       const imagesToProcess = images.slice(0, maxImages);
+      const extraImages = images.slice(maxImages);
 
       // Upload images with concurrency control
-      imageResults = await processImages(settings.apiKey, imagesToProcess, tabId, signal);
+      imageResults = await processImages(settings.apiKey, imagesToProcess, tabId, taskId, signal);
 
-      // Replace image URLs in content (for images that exist in contentHtml)
-      processedContent = replaceImageUrls(processedContent, imageResults, []);
+      processedContent = replaceImageUrls(processedContent, imageResults, extraImages);
 
       // Inject uploaded images that weren't matched (e.g., when contentHtml doesn't have img tags)
       processedContent = injectUploadedImages(processedContent, imageResults);
@@ -954,44 +1198,59 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       console.log(`[墨问 Background] 🚫 包含图片已关闭，移除 ${images.length} 张图片`);
     }
 
-    // Step 3: Split content if needed
     if (signal.aborted) {
       console.log('[墨问 Background] ⚠️ Cancel requested, aborting note creation');
-      return { success: false, error: '已取消保存', errorCode: 'CANCELLED' };
+      return finalize({ success: false, error: '已取消保存', errorCode: 'CANCELLED' }, { clearTask: true });
     }
 
     const parts = splitContent(
       extractResult.title,
+      extractResult.sourceUrl,
       processedContent,
       SAFE_LIMIT
     );
 
-    // Step 4: Create notes
     console.log(`[note] create start title="${extractResult.title.substring(0, 30)}..." partsCount=${parts.length}`);
     logToContentScript(`创建 ${parts.length} 篇笔记...`, tabId);
     const createdNotes: Array<{ partIndex: number; noteUrl: string; noteId: string; shareUrl?: string; isIndex?: boolean }> = [];
 
     for (const part of parts) {
+      const runnableState = await waitForTaskRunnable(tabId, taskId, {
+        ...((await TaskStore.get(tabId))?.progress || {}),
+        status: 'paused',
+      });
+      if (runnableState === 'cancelled') {
+        break;
+      }
+
       if (signal.aborted) {
         console.log('[墨问 Background] ⚠️ Cancel requested, stopping note creation loop');
         break;
       }
 
-      // Send progress update
       try {
         sendProgressUpdate({
           type: 'creating_note',
           currentPart: part.index + 1,
           totalParts: parts.length,
-        }, tabId);
+        }, tabId, taskId);
       } catch (err) { /* ignore */ }
 
       let result: NoteCreateResult = { success: false, error: 'Not executed', errorCode: 'UNKNOWN' };
       let retryCount = 0;
       let success = false;
 
-      // Retry loop
       while (retryCount < MAX_RETRY_ROUNDS) {
+        const retryRunnableState = await waitForTaskRunnable(tabId, taskId, {
+          type: 'creating_note',
+          currentPart: part.index + 1,
+          totalParts: parts.length,
+          status: 'paused',
+        } as SaveProgress);
+        if (retryRunnableState === 'cancelled') {
+          break;
+        }
+
         if (signal.aborted) break;
 
         retryCount++;
@@ -999,12 +1258,28 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         logToContentScript(`📝 正在创建第 ${part.index + 1}/${parts.length} 部分 (第 ${retryCount} 次尝试)...`, tabId);
 
         try {
-          // Pass logToContentScript to createNote so internal logs are visible to user
-          // Wrap in GlobalRateLimiter to enforce 1 QPS
           result = await GlobalRateLimiter.schedule(async () => {
-            // Create async wrapper for logToContentScript that matches expected signature
+            if (part.body) {
+              return createNoteWithBody(
+                settings.apiKey,
+                part.body as unknown as Record<string, unknown>,
+                isPublic,
+                enableAutoTag,
+                signal
+              );
+            }
+
             const logWrapper = async (msg: string) => { logToContentScript(msg, tabId); };
-            return await createNote(settings.apiKey, part.title, part.content, isPublic, logWrapper, extractResult.sourceUrl, enableAutoTag);
+            return createNote(
+              settings.apiKey,
+              part.title,
+              part.content || '',
+              isPublic,
+              logWrapper,
+              extractResult.sourceUrl,
+              enableAutoTag,
+              signal
+            );
           });
         } catch (apiErr) {
           const errMsg = apiErr instanceof Error ? apiErr.message : 'Exception';
@@ -1019,7 +1294,6 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
 
         if (result.success) {
           success = true;
-          // markNoteApiCall(); // Removed: Handled by RateLimiter
           console.log(`[note] create ok noteId=${result.noteId} url=${result.noteUrl}`);
           logToContentScript(`✅ 第 ${part.index + 1} 部分创建成功: ${result.noteUrl}`, tabId);
           createdNotes.push({
@@ -1032,13 +1306,10 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         } else {
           console.log(`[note] part ${part.index + 1} fail: ${result.error} code=${result.errorCode}`);
           logToContentScript(`⚠️ 第 ${part.index + 1} 部分失败: ${result.error}`, tabId);
-          // 权限不足（如 Pro 会员限制）：重试无意义，直接跳出
-          if (result.errorCode === 'PERMISSION_DENIED') {
-            console.log(`[note] part ${part.index + 1} PERMISSION_DENIED, skip retry`);
+          if (!shouldRetryCreateFailure(result)) {
+            console.log(`[note] part ${part.index + 1} non-retriable error ${result.errorCode}, skip retry`);
             break;
           }
-          // If content too long, logic for splitting further would go here
-          // Simplified: just wait and retry
           if (retryCount < MAX_RETRY_ROUNDS) {
             logToContentScript(`⏳ 等待 ${(1000 * retryCount) / 1000} 秒后重试...`, tabId);
             await sleep(1000 * retryCount);
@@ -1052,7 +1323,11 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       }
     }
 
-    // Step 5: Create index note if multiple parts and enabled
+    if (signal.aborted) {
+      console.log('[墨问 Background] ⚠️ Cancel requested after note creation loop');
+      return finalize({ success: false, error: '已取消保存', errorCode: 'CANCELLED' }, { clearTask: true });
+    }
+
     console.log(`[墨问 Background] 🔍 合集创建条件检查: createIndexNote=${createIndexNote}, parts.length=${parts.length}, createdNotes.length=${createdNotes.length}`);
     logToContentScript(`🔍 合集检查: 开关=${createIndexNote}, 分块=${parts.length}, 成功=${createdNotes.length}`, tabId);
 
@@ -1067,12 +1342,23 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         createdNotes
       );
 
+      const indexRunnableState = await waitForTaskRunnable(tabId, taskId, {
+        type: 'creating_note',
+        currentPart: parts.length,
+        totalParts: parts.length,
+        status: 'paused',
+      } as SaveProgress);
+      if (indexRunnableState === 'cancelled') {
+        return finalize({ success: false, error: '已取消保存', errorCode: 'CANCELLED' }, { clearTask: true });
+      }
+
       const indexResult = await GlobalRateLimiter.schedule(async () => {
         return await createNoteWithBody(
           settings.apiKey,
           indexBody,
           isPublic,
-          enableAutoTag
+          enableAutoTag,
+          signal
         );
       });
 
@@ -1093,12 +1379,9 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
 
     console.log('[墨问 Background] 📊 Final note count:', createdNotes.length);
 
-    // Clean up task from map if finished
-    runningTasks.delete(tabId);
-
     if (createdNotes.length === 0) {
       console.error('[墨问 Background] ❌ No notes were created');
-      return { success: false, error: '创建笔记失败', errorCode: 'UNKNOWN' };
+      return finalize({ success: false, error: '创建笔记失败', errorCode: 'UNKNOWN' });
     }
 
     console.log('[墨问 Background] ✅ Save process completed successfully!');
@@ -1117,25 +1400,15 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       })),
     };
 
-    if (tabId) {
-      await TaskStore.complete(tabId, result);
-    }
-
-    return result;
+    return finalize(result);
   } catch (error) {
-    // Also clean up on error
-    runningTasks.delete(tabId);
     console.error(`[墨问 Background] Save process failed with exception: ${formatErrorForLog(error)}`);
     const errorResult = {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
+      errorCode: 'UNKNOWN',
     };
-
-    if (tabId) {
-      await TaskStore.complete(tabId, errorResult);
-    }
-
-    return errorResult;
+    return finalize(errorResult);
   }
 }
 
@@ -1148,17 +1421,19 @@ function sendProgressUpdate(progress: {
   totalImages?: number;
   currentPart?: number;
   totalParts?: number;
-}, tabId: number) {
+}, tabId: number, taskId: string) {
   chrome.runtime.sendMessage({
     type: 'SAVE_NOTE_PROGRESS',
+    tabId,
+    taskId,
     progress,
-  }).catch(() => {
+  } as SaveTaskProgressMessage).catch(() => {
     // Popup might be closed, ignore error
   });
 
   // 更新持久化状态
   if (tabId) {
-    TaskStore.updateProgress(tabId, {
+    TaskStore.updateProgress(tabId, taskId, {
       ...progress,
       status: progress.type === 'uploading_images' ? 'uploading_images' : 'creating_note',
     }).catch((error) => console.error(`Failed to persist progress: ${formatErrorForLog(error)}`));
@@ -1220,6 +1495,7 @@ async function processImages(
   apiKey: string,
   images: ImageCandidate[],
   tabId: number,
+  taskId: string,
   signal: AbortSignal
 ): Promise<ImageProcessResult[]> {
   console.log(`[img] ========== START PROCESSING ${images.length} IMAGES (Pipeline) ==========`);
@@ -1228,12 +1504,17 @@ async function processImages(
   const totalImages = images.length;
   // Initialize results array
   const results: ImageProcessResult[] = new Array(totalImages);
+  const pausedProgress = (uploadedImages: number): SaveProgress => ({
+    status: 'paused',
+    uploadedImages,
+    totalImages,
+  });
 
   sendProgressUpdate({
     type: 'uploading_images',
     uploadedImages: 0,
     totalImages,
-  }, tabId);
+  }, tabId, taskId);
 
   // 1. Fetch Queue: Concurrently fetch image blobs from Content Script
   // We limit fetch concurrency to avoid overwhelming the browser/content script
@@ -1286,6 +1567,12 @@ async function processImages(
 
   // 2. Upload Loop: Strictly Serial & Rate Limited via GlobalRateLimiter
   for (let i = 0; i < totalImages; i++) {
+    const runnableState = await waitForTaskRunnable(tabId, taskId, pausedProgress(i));
+    if (runnableState === 'cancelled') {
+      console.log('[img] ⚠️ Cancel requested before upload step');
+      break;
+    }
+
     if (signal.aborted) {
       console.log('[img] ⚠️ Cancel requested, stopping uploads');
       logToContentScript('⚠️ 用户取消，停止图片上传', tabId);
@@ -1337,7 +1624,7 @@ async function processImages(
       type: 'uploading_images',
       uploadedImages: imageIndex,
       totalImages,
-    }, tabId);
+    }, tabId, taskId);
   }
 
   // Ensure all fetches settle (cleanup)
@@ -1438,196 +1725,222 @@ export async function processImage(
 function replaceImageUrls(
   content: string,
   imageResults: ImageProcessResult[],
-  _extraImages: ImageCandidate[]
+  extraImages: ImageCandidate[]
 ): string {
-  let processed = content;
+  interface ImageReplacementAction {
+    kind: 'inject_uid' | 'replace_with_link';
+    originalUrl: string;
+    uid?: string;
+    label?: string;
+  }
+
+  const actions: ImageReplacementAction[] = [
+    ...imageResults
+      .filter((result) => result.success && result.uid)
+      .map((result) => ({
+        kind: 'inject_uid' as const,
+        originalUrl: result.originalUrl,
+        uid: result.uid!,
+      })),
+    ...imageResults
+      .filter((result) => !result.success)
+      .map((result) => ({
+        kind: 'replace_with_link' as const,
+        originalUrl: result.originalUrl,
+      })),
+    ...extraImages.map((image) => ({
+      kind: 'replace_with_link' as const,
+      originalUrl: image.url,
+      label: buildImageFallbackLabel(image.alt),
+    })),
+  ];
+
   let successCount = 0;
   let failCount = 0;
 
-  console.log(`[sw] replaceImageUrls: processing ${imageResults.length} results`);
+  const processed = content.replace(/<img\b[^>]*>/gi, (imgTag) => {
+    const tagUrls = extractImageUrlsFromTag(imgTag);
+    const action = actions.find((candidate) => tagUrls.some((url) => matchesImageUrl(url, candidate.originalUrl)));
 
-  // Replace successfully uploaded images
-  for (let i = 0; i < imageResults.length; i++) {
-    const result = imageResults[i];
-
-    // Log result
-    console.log(`[sw] replaceImageUrls: result for ${result.originalUrl.substring(0, 50)}...`, {
-      success: result.success,
-      assetUrl: result.assetUrl?.substring(0, 50),
-      fileId: result.fileId,
-      uid: result.uid,
-    });
-
-    if (result.success && result.assetUrl && result.uid) {
-      successCount++;
-
-      // Strategy: Find img tags that contain the original URL and inject data-mowen-uid attribute
-      // We try multiple matching strategies to handle various URL formats
-
-      const originalUrl = result.originalUrl;
-      let matched = false;
-
-      // Strategy 0: For WeChat images, use the unique path segment as identifier
-      // WeChat URLs: https://mmbiz.qpic.cn/mmbiz_jpg/UNIQUE_ID/640?wx_fmt=jpeg
-      // The UNIQUE_ID is the key identifier that's consistent across src and data-src
-      if (originalUrl.includes('mmbiz.qpic.cn') || originalUrl.includes('mmbiz.qlogo.cn')) {
-        try {
-          const urlObj = new URL(originalUrl);
-          const pathParts = urlObj.pathname.split('/').filter(p => p.length > 10);
-          if (pathParts.length > 0) {
-            // Use the longest path segment as identifier (usually the unique ID)
-            const uniqueId = pathParts.reduce((a, b) => a.length > b.length ? a : b);
-            const escapedId = escapeRegExp(uniqueId);
-            const weixinRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedId}[^"']*["'][^>]*)>`, 'gi');
-
-            if (weixinRegex.test(processed)) {
-              weixinRegex.lastIndex = 0;
-              processed = processed.replace(weixinRegex, (match, imgTagContent) => {
-                if (imgTagContent.includes('data-mowen-uid')) {
-                  return match;
-                }
-                console.log(`[sw] replaceImageUrls: WeChat ID match (${uniqueId.substring(0, 20)}...), injecting uid=${result.uid}`);
-                matched = true;
-                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-              });
-            }
-          }
-        } catch (e) {
-          // URL parsing failed, continue to other strategies
-        }
-      }
-
-      // Strategy 1: Try exact URL match first
-      if (!matched) {
-        const exactUrlEscaped = escapeRegExp(originalUrl);
-        const exactRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["']${exactUrlEscaped}["'][^>]*)>`, 'gi');
-
-        if (exactRegex.test(processed)) {
-          exactRegex.lastIndex = 0; // Reset regex state
-          processed = processed.replace(exactRegex, (match, imgTagContent) => {
-            if (imgTagContent.includes('data-mowen-uid')) {
-              return match;
-            }
-            console.log(`[sw] replaceImageUrls: exact match, injecting uid=${result.uid}`);
-            matched = true;
-            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-          });
-        }
-      }
-
-      // Strategy 2: Try URL without query params
-      if (!matched) {
-        const urlParts = originalUrl.split('?');
-        const baseUrl = urlParts[0];
-        const baseUrlEscaped = escapeRegExp(baseUrl);
-        const baseUrlRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${baseUrlEscaped}[^"']*["'][^>]*)>`, 'gi');
-
-        if (baseUrlRegex.test(processed)) {
-          baseUrlRegex.lastIndex = 0;
-          processed = processed.replace(baseUrlRegex, (match, imgTagContent) => {
-            if (imgTagContent.includes('data-mowen-uid')) {
-              return match;
-            }
-            console.log(`[sw] replaceImageUrls: base URL match, injecting uid=${result.uid}`);
-            matched = true;
-            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-          });
-        }
-      }
-
-      // Strategy 3: Try matching by URL identifier (last 50 chars, removing width suffix)
-      if (!matched) {
-        const urlParts = originalUrl.split('?');
-        const baseUrl = urlParts[0];
-        const urlWithoutWidthSuffix = baseUrl.replace(/\/\d{1,4}$/, '');
-        const urlIdentifier = urlWithoutWidthSuffix.slice(-50);
-        const escapedIdentifier = escapeRegExp(urlIdentifier);
-        const identifierRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${escapedIdentifier}[^"']*["'][^>]*)>`, 'gi');
-
-        if (identifierRegex.test(processed)) {
-          identifierRegex.lastIndex = 0;
-          processed = processed.replace(identifierRegex, (match, imgTagContent) => {
-            if (imgTagContent.includes('data-mowen-uid')) {
-              return match;
-            }
-            console.log(`[sw] replaceImageUrls: identifier match, injecting uid=${result.uid}`);
-            matched = true;
-            return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-          });
-        }
-      }
-
-      // Strategy 4: Try matching by filename (last segment of path)
-      if (!matched) {
-        try {
-          const urlObj = new URL(originalUrl);
-          const pathname = urlObj.pathname;
-          const filename = pathname.split('/').pop();
-          if (filename && filename.length > 5) {
-            const filenameEscaped = escapeRegExp(filename);
-            const filenameRegex = new RegExp(`(<img[^>]*(?:src|data-src|data-original)=["'][^"']*${filenameEscaped}[^"']*["'][^>]*)>`, 'gi');
-
-            if (filenameRegex.test(processed)) {
-              filenameRegex.lastIndex = 0;
-              processed = processed.replace(filenameRegex, (match, imgTagContent) => {
-                if (imgTagContent.includes('data-mowen-uid')) {
-                  return match;
-                }
-                console.log(`[sw] replaceImageUrls: filename match, injecting uid=${result.uid}`);
-                matched = true;
-                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-              });
-            }
-          }
-        } catch (e) {
-          // URL parsing failed, skip this strategy
-        }
-      }
-
-      // Strategy 5: Medium/CDN specific - match by unique image ID in path
-      // Medium URLs like: https://miro.medium.com/v2/resize:fit:1400/1*ZIcUbGyIASJ3iXrD5oTeoA.jpeg
-      // After normalization: https://miro.medium.com/v2/1*ZIcUbGyIASJ3iXrD5oTeoA.jpeg
-      // We need to extract the image ID (1*...) and match it in the HTML
-      if (!matched && originalUrl.includes('miro.medium.com')) {
-        try {
-          const urlObj = new URL(originalUrl);
-          const pathname = urlObj.pathname;
-          // Extract the image ID: usually looks like "1*XXXX" or just a hash
-          const imageIdMatch = pathname.match(/(\d\*[A-Za-z0-9_-]+)/);
-          if (imageIdMatch && imageIdMatch[1]) {
-            const imageId = imageIdMatch[1];
-            const escapedId = escapeRegExp(imageId);
-            // Match any img src containing this image ID
-            const mediumRegex = new RegExp(`(<img[^>]*(?:src|data-src|srcset)=["'][^"']*${escapedId}[^"']*["'][^>]*)>`, 'gi');
-
-            if (mediumRegex.test(processed)) {
-              mediumRegex.lastIndex = 0;
-              processed = processed.replace(mediumRegex, (match, imgTagContent) => {
-                if (imgTagContent.includes('data-mowen-uid')) {
-                  return match;
-                }
-                console.log(`[sw] replaceImageUrls: Medium ID match, injecting uid=${result.uid}`);
-                matched = true;
-                return `${imgTagContent} data-mowen-uid="${result.uid}">`;
-              });
-            }
-          }
-        } catch (e) {
-          // Ignore
-        }
-      }
-    } else {
-      failCount++;
+    if (!action) {
+      return imgTag;
     }
-  }
 
-  // Handle remaining images that should be linked but not processed (if any)
-  // Currently we only process up to maxImages. The rest are untouched or handled below if we want to convert them to links.
-  // The logic for converting extra images to links is currently not fully implemented in replaceImageUrls
-  // It handles imageResults (processed images). extraImages passed in are just candidates.
+    if (action.kind === 'inject_uid' && action.uid) {
+      if (imgTag.includes('data-mowen-uid=')) {
+        return imgTag;
+      }
+      successCount++;
+      return imgTag.replace(/\s*\/?>$/, ` data-mowen-uid="${escapeHtmlAttribute(action.uid)}">`);
+    }
+
+    const safeLinkUrl = [action.originalUrl, ...tagUrls].find((url) => isSafeHttpUrl(url));
+    if (!safeLinkUrl) {
+      return imgTag;
+    }
+
+    failCount++;
+    return buildImageFallbackLinkHtml(
+      safeLinkUrl,
+      action.label || buildImageFallbackLabel(extractImageAltFromTag(imgTag))
+    );
+  });
 
   console.log(`[sw] replaceImageUrls: done replacements. Success: ${successCount}, Fail: ${failCount}`);
   return processed;
+}
+
+function buildImageFallbackLabel(alt?: string): string {
+  const normalizedAlt = alt?.trim();
+  if (!normalizedAlt) {
+    return '查看原图';
+  }
+  return `查看原图：${normalizedAlt}`;
+}
+
+function buildImageFallbackLinkHtml(url: string, label: string): string {
+  return `<p><a href="${escapeHtmlAttribute(url)}" target="_blank" rel="noopener noreferrer">${escapeHtmlText(label)}</a></p>`;
+}
+
+function extractImageUrlsFromTag(imgTag: string): string[] {
+  const urls: string[] = [];
+  const attributeNames = ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-actualsrc'];
+
+  for (const attributeName of attributeNames) {
+    const match = imgTag.match(new RegExp(`${attributeName}=["']([^"']+)["']`, 'i'));
+    if (match?.[1]) {
+      urls.push(match[1].trim());
+    }
+  }
+
+  const srcsetNames = ['srcset', 'data-srcset'];
+  for (const attributeName of srcsetNames) {
+    const match = imgTag.match(new RegExp(`${attributeName}=["']([^"']+)["']`, 'i'));
+    if (!match?.[1]) continue;
+    const srcsetUrls = match[1]
+      .split(',')
+      .map((value) => value.trim().split(/\s+/)[0])
+      .filter(Boolean);
+    urls.push(...srcsetUrls);
+  }
+
+  return Array.from(new Set(urls));
+}
+
+function extractImageAltFromTag(imgTag: string): string {
+  const captionMatch = imgTag.match(/data-mowen-caption=["']([^"']+)["']/i);
+  if (captionMatch?.[1]) {
+    return captionMatch[1].trim();
+  }
+
+  const altMatch = imgTag.match(/alt=["']([^"']+)["']/i);
+  return altMatch?.[1]?.trim() || '';
+}
+
+function matchesImageUrl(candidateUrl: string, targetUrl: string): boolean {
+  if (!candidateUrl || !targetUrl) {
+    return false;
+  }
+
+  if (candidateUrl === targetUrl) {
+    return true;
+  }
+
+  const candidateBase = stripUrlSearchAndHash(candidateUrl);
+  const targetBase = stripUrlSearchAndHash(targetUrl);
+
+  if (candidateBase === targetBase) {
+    return true;
+  }
+
+  if (stripWidthSuffix(candidateBase) === stripWidthSuffix(targetBase)) {
+    return true;
+  }
+
+  const candidateMediumId = extractMediumImageId(candidateUrl);
+  const targetMediumId = extractMediumImageId(targetUrl);
+  if (candidateMediumId && candidateMediumId === targetMediumId) {
+    return true;
+  }
+
+  const candidateUniqueSegment = extractUniquePathSegment(candidateUrl);
+  const targetUniqueSegment = extractUniquePathSegment(targetUrl);
+  if (candidateUniqueSegment && candidateUniqueSegment === targetUniqueSegment) {
+    return true;
+  }
+
+  const candidateFilename = extractImageFilename(candidateUrl);
+  const targetFilename = extractImageFilename(targetUrl);
+  if (candidateFilename && candidateFilename.length > 5 && candidateFilename === targetFilename) {
+    return true;
+  }
+
+  return false;
+}
+
+function stripUrlSearchAndHash(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return rawUrl.split('#')[0].split('?')[0];
+  }
+}
+
+function stripWidthSuffix(rawUrl: string): string {
+  return rawUrl.replace(/\/\d{1,4}$/, '');
+}
+
+function extractImageFilename(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.pathname.split('/').pop() || '';
+  } catch {
+    const cleanUrl = stripUrlSearchAndHash(rawUrl);
+    return cleanUrl.split('/').pop() || '';
+  }
+}
+
+function extractUniquePathSegment(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const segments = parsed.pathname.split('/').filter((segment) => segment.length > 10);
+    return segments.sort((a, b) => b.length - a.length)[0] || '';
+  } catch {
+    return '';
+  }
+}
+
+function extractMediumImageId(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const match = parsed.pathname.match(/(\d\*[A-Za-z0-9_-]+)/);
+    return match?.[1] || '';
+  } catch {
+    return '';
+  }
+}
+
+function isSafeHttpUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => (
+    char === '&' ? '&amp;' :
+      char === '<' ? '&lt;' :
+        char === '>' ? '&gt;' :
+          char === '"' ? '&quot;' : '&#39;'
+  ));
+}
+
+function escapeHtmlText(value: string): string {
+  return escapeHtmlAttribute(value);
 }
 
 function injectUploadedImages(
@@ -1659,74 +1972,259 @@ function removeAllImageTags(content: string): string {
 // function createMetaHeader removed
 
 
-function splitContent(title: string, content: string, limit: number): NotePart[] {
-  // 辅助函数：移除 HTML 标签获取纯文本长度
-  const getTextLength = (html: string) => html.replace(/<[^>]*>/g, '').length;
+function splitContent(title: string, sourceUrl: string, content: string, limit: number): NoteSplitPart[] {
+  const contentBody = htmlToNoteAtom(content) as unknown as NoteAtomDoc;
+  const contentBlocks = Array.isArray(contentBody.content) ? contentBody.content : [];
+  const totalTextLength = contentBlocks.reduce((sum, block) => sum + getNodeTextLength(block), 0);
 
-  const textLength = getTextLength(content);
-
-  // 使用纯文本长度判断，而非 HTML 长度
-  if (textLength <= limit) {
+  if (totalTextLength <= limit) {
     return [{
       index: 0,
-      title: title,
-      content: content,
-      total: 1
+      title,
+      content,
+      total: 1,
     }];
   }
 
-  // If content is too long, we need to split it
-  // Logic: Split by headers (h1, h2, h3) or paragraphs, trying to keep chunks under limit
-  console.log(`[bg] Text length ${textLength} > ${limit}, splitting...`);
+  console.log(`[bg] Text length ${totalTextLength} > ${limit}, splitting by NoteAtom blocks...`);
 
-  const parts: NotePart[] = [];
-  let currentPartContent = '';
-  let currentPartTextLength = 0; // 追踪当前分块的纯文本长度
-  let partIndex = 0;
+  const normalizedBlocks = contentBlocks.flatMap((block) => splitOversizedBlock(block, limit));
+  const groupedBlocks: NoteAtomNode[][] = [];
+  let currentGroup: NoteAtomNode[] = [];
+  let currentLength = 0;
 
-  // Use a simple regex to split by logical blocks
-  // Split by closing tags of block elements to keep HTML structure integrity
-  // Note: This is a simplistic splitter and might break complex HTML. 
-  // Ideally we should use a DOM parser but we are in SW/Background.
-  const blocks = content.split(/(<\/p>|<\/div>|<\/h[1-6]>|<\/blockquote>|<\/ul>|<\/ol>|<\/table>)/i);
+  for (const block of normalizedBlocks) {
+    const blockLength = Math.max(getNodeTextLength(block), 1);
 
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    const blockTextLength = getTextLength(block);
+    if (currentGroup.length > 0 && currentLength + blockLength > limit) {
+      groupedBlocks.push(currentGroup);
+      currentGroup = [];
+      currentLength = 0;
+    }
 
-    // 使用纯文本长度判断是否需要分割
-    if ((currentPartTextLength + blockTextLength) > limit && currentPartContent.length > 0) {
-      // Current part full, push it and start new
-      parts.push({
-        index: partIndex,
-        title: partIndex === 0 ? title : `${title} (${partIndex + 1})`,
-        content: currentPartContent,
-        total: 0 // Will update later
-      });
-      partIndex++;
-      currentPartContent = block;
-      currentPartTextLength = blockTextLength;
-    } else {
-      currentPartContent += block;
-      currentPartTextLength += blockTextLength;
+    currentGroup.push(cloneNoteAtomNode(block));
+    currentLength += blockLength;
+
+    if (blockLength > limit) {
+      groupedBlocks.push(currentGroup);
+      currentGroup = [];
+      currentLength = 0;
     }
   }
 
-  // Push remaining content
-  if (currentPartContent.length > 0) {
-    parts.push({
-      index: partIndex,
-      title: partIndex === 0 ? title : `${title} (${partIndex + 1})`,
-      content: currentPartContent,
-      total: 0 // Will update later
+  if (currentGroup.length > 0) {
+    groupedBlocks.push(currentGroup);
+  }
+
+  const total = groupedBlocks.length;
+  if (total <= 1) {
+    return [{
+      index: 0,
+      total: 1,
+      title,
+      content,
+    }];
+  }
+
+  return groupedBlocks.map((blocks, index) => {
+    const partTitle = index === 0 ? title : `${title} (${index + 1})`;
+    return {
+      index,
+      total,
+      title: partTitle,
+      body: buildMultipartBody(partTitle, sourceUrl, blocks),
+    };
+  });
+}
+
+function buildMultipartBody(title: string, sourceUrl: string, blocks: NoteAtomNode[]): NoteAtomDoc {
+  const metaBody = buildNoteBody(title, '', sourceUrl) as unknown as NoteAtomDoc;
+  return {
+    type: 'doc',
+    content: [
+      ...(Array.isArray(metaBody.content) ? metaBody.content.map((block) => cloneNoteAtomNode(block)) : []),
+      ...blocks.map((block) => cloneNoteAtomNode(block)),
+    ],
+  };
+}
+
+function splitOversizedBlock(block: NoteAtomNode, limit: number): NoteAtomNode[] {
+  const blockLength = getNodeTextLength(block);
+  if (blockLength <= limit) {
+    return [cloneNoteAtomNode(block)];
+  }
+
+  if (block.type === 'paragraph' || block.type === 'quote') {
+    return splitTextBlock(block, limit);
+  }
+
+  if (block.type === 'codeblock') {
+    return splitCodeBlock(block, limit);
+  }
+
+  return [cloneNoteAtomNode(block)];
+}
+
+function splitTextBlock(block: NoteAtomNode, limit: number): NoteAtomNode[] {
+  const content = Array.isArray(block.content) ? block.content : [];
+  const fullText = content.map((node) => node.text || '').join('');
+  if (!fullText) {
+    return [cloneNoteAtomNode(block)];
+  }
+
+  const chunks: NoteAtomNode[] = [];
+  let start = 0;
+
+  while (start < fullText.length) {
+    const nextEnd = findPreferredTextSplit(fullText, start, limit);
+    const end = nextEnd > start ? nextEnd : Math.min(fullText.length, start + limit);
+    const slicedContent = sliceInlineTextNodes(content, start, end);
+    const slicedLength = slicedContent.reduce((sum, node) => sum + (node.text?.length || 0), 0);
+
+    if (slicedLength === 0) {
+      break;
+    }
+
+    chunks.push({
+      ...cloneNoteAtomNode(block),
+      content: slicedContent,
+    });
+    start = end;
+  }
+
+  return chunks.length > 0 ? chunks : [cloneNoteAtomNode(block)];
+}
+
+function findPreferredTextSplit(text: string, start: number, limit: number): number {
+  const maxEnd = Math.min(text.length, start + limit);
+  if (maxEnd >= text.length) {
+    return text.length;
+  }
+
+  const window = text.slice(start, maxEnd);
+  const newlineBoundary = window.lastIndexOf('\n');
+  if (newlineBoundary > 0) {
+    return start + newlineBoundary + 1;
+  }
+
+  const sentenceMatches = Array.from(window.matchAll(/[。！？!?；;](?:\s|$)|\.(?:\s|$)/g));
+  if (sentenceMatches.length > 0) {
+    const lastMatch = sentenceMatches[sentenceMatches.length - 1];
+    return start + lastMatch.index + lastMatch[0].length;
+  }
+
+  const whitespaceBoundary = window.search(/\s+[^\s]*$/);
+  if (whitespaceBoundary > 0) {
+    return start + whitespaceBoundary + 1;
+  }
+
+  return maxEnd;
+}
+
+function sliceInlineTextNodes(content: NoteAtomNode[], start: number, end: number): NoteAtomNode[] {
+  const result: NoteAtomNode[] = [];
+  let offset = 0;
+
+  for (const node of content) {
+    const text = node.text || '';
+    const nodeStart = offset;
+    const nodeEnd = offset + text.length;
+    offset = nodeEnd;
+
+    if (nodeEnd <= start || nodeStart >= end) {
+      continue;
+    }
+
+    const sliceStart = Math.max(0, start - nodeStart);
+    const sliceEnd = Math.min(text.length, end - nodeStart);
+    const nextText = text.slice(sliceStart, sliceEnd);
+    if (!nextText) {
+      continue;
+    }
+
+    result.push({
+      ...cloneNoteAtomNode(node),
+      text: nextText,
+      content: undefined,
     });
   }
 
-  // Update total count
-  const total = parts.length;
-  parts.forEach(p => p.total = total);
+  return result;
+}
 
-  return parts;
+function splitCodeBlock(block: NoteAtomNode, limit: number): NoteAtomNode[] {
+  const codeText = getNodeText(block);
+  if (!codeText) {
+    return [cloneNoteAtomNode(block)];
+  }
+
+  const lines = codeText.match(/[^\n]*\n?|[^\n]+/g)?.filter(Boolean) || [codeText];
+  const chunks: string[] = [];
+  let currentChunk = '';
+
+  for (const line of lines) {
+    if (line.length > limit) {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+
+      for (let offset = 0; offset < line.length; offset += limit) {
+        chunks.push(line.slice(offset, offset + limit));
+      }
+      continue;
+    }
+
+    if (currentChunk && currentChunk.length + line.length > limit) {
+      chunks.push(currentChunk);
+      currentChunk = '';
+    }
+
+    currentChunk += line;
+  }
+
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks.map((chunk) => ({
+    ...cloneNoteAtomNode(block),
+    content: [{ type: 'text', text: chunk }],
+  }));
+}
+
+function getNodeTextLength(node: NoteAtomNode): number {
+  const textLength = typeof node.text === 'string' ? node.text.length : 0;
+  const childrenLength = Array.isArray(node.content)
+    ? node.content.reduce((sum, child) => sum + getNodeTextLength(child), 0)
+    : 0;
+  const combinedLength = textLength + childrenLength;
+
+  if (combinedLength > 0) {
+    return combinedLength;
+  }
+
+  if (node.type === 'image' || node.type === 'note' || node.type === 'file') {
+    return 1;
+  }
+
+  return 0;
+}
+
+function getNodeText(node: NoteAtomNode): string {
+  if (typeof node.text === 'string') {
+    return node.text;
+  }
+
+  if (!Array.isArray(node.content)) {
+    return '';
+  }
+
+  return node.content.map((child) => getNodeText(child)).join('');
+}
+
+function cloneNoteAtomNode<T extends NoteAtomNode>(node: T): T {
+  return JSON.parse(JSON.stringify(node)) as T;
 }
 
 
@@ -1801,8 +2299,4 @@ function createIndexNoteAtom(
     type: 'doc',
     content
   };
-}
-
-function escapeRegExp(string: string): string {
-  return string.replace(/[.*+?^$${}()|[\]\\]/g, '\\$&');
 }

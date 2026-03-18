@@ -22,6 +22,12 @@ import { fetchImageAsBase64 } from './imageFetcher';
 import { ExtractResult } from '../types';
 import { initHighlighter } from './highlighter';
 
+const contentScriptGlobal = globalThis as typeof globalThis & {
+  __mowenContentScriptLoaded__?: boolean;
+};
+
+contentScriptGlobal.__mowenContentScriptLoaded__ = true;
+
 // State for auto-extraction
 let observer: MutationObserver | null = null;
 let isObserving = false;

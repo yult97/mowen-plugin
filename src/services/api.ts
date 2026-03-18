@@ -77,11 +77,27 @@ class ApiRequestError extends Error {
 async function apiRequest<T>(
   endpoint: string,
   apiKey: string,
-  body?: object
+  body?: object,
+  options: {
+    signal?: AbortSignal;
+  } = {}
 ): Promise<T> {
-  // Create AbortController for timeout
+  const timeoutMs = getApiTimeoutMs(endpoint);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let abortedByCaller = false;
+  const handleExternalAbort = () => {
+    abortedByCaller = true;
+    controller.abort();
+  };
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      handleExternalAbort();
+    } else {
+      options.signal.addEventListener('abort', handleExternalAbort, { once: true });
+    }
+  }
 
   const fullUrl = `${API_BASE_URL}${endpoint}`;
 
@@ -222,17 +238,48 @@ async function apiRequest<T>(
     return parsed?.data as T;
   } catch (error) {
     clearTimeout(timeoutId);
+    if (options.signal) {
+      options.signal.removeEventListener('abort', handleExternalAbort);
+    }
 
     // Handle abort error (timeout)
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new ApiRequestError('TIMEOUT: 请求超时，请检查网络连接', { status: 0 });
+      if (abortedByCaller || options.signal?.aborted) {
+        throw new ApiRequestError('ABORTED: 请求已取消', { status: 0 });
+      }
+      throw new ApiRequestError(`TIMEOUT: 请求超时（${Math.round(timeoutMs / 1000)} 秒），请检查网络连接`, { status: 0 });
+    }
+    if (error instanceof Error && (error.name === 'TypeError' || /fetch|network/i.test(error.message))) {
+      throw new ApiRequestError('NETWORK: 网络连接异常，请稍后重试', { status: 0 });
     }
     throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    if (options.signal) {
+      options.signal.removeEventListener('abort', handleExternalAbort);
+    }
   }
+}
+
+function getApiTimeoutMs(endpoint: string): number {
+  if (endpoint === '/note/create' || endpoint === '/note/edit') {
+    return 90000;
+  }
+
+  if (endpoint === '/upload/prepare' || endpoint === '/upload/url') {
+    return 60000;
+  }
+
+  return 30000;
 }
 
 // Document emoji for original link source line
 const ORIGINAL_LINK_ICON = '📄';
+
+type NoteBody = Record<string, unknown> & {
+  type?: string;
+  content?: unknown[];
+};
 
 /**
  * Create original link HTML section with icon
@@ -243,6 +290,22 @@ function createOriginalLinkHtml(sourceUrl?: string): string {
   return `<p>${ORIGINAL_LINK_ICON} 来源：<a href="${sourceUrl}" target="_blank" rel="noopener noreferrer">查看原文</a></p>`;
 }
 
+function buildNoteHtml(title: string, content: string, sourceUrl?: string): string {
+  const cleanedContent = removeDuplicateTitleFromContent(content, title);
+  const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
+  return `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${cleanedContent}`;
+}
+
+export function buildNoteBody(
+  title: string,
+  content: string,
+  sourceUrl?: string,
+  preparedHtml?: string
+): NoteBody {
+  const fullHtml = preparedHtml ?? buildNoteHtml(title, content, sourceUrl);
+  return htmlToNoteAtom(fullHtml) as unknown as NoteBody;
+}
+
 export async function createNote(
   apiKey: string,
   title: string,
@@ -250,7 +313,8 @@ export async function createNote(
   isPublic: boolean = false,
   logger?: (msg: string) => Promise<void>,
   sourceUrl?: string,
-  enableAutoTag?: boolean
+  enableAutoTag?: boolean,
+  signal?: AbortSignal
 ): Promise<NoteCreateResult> {
   const log = (msg: string) => {
     console.log(`[sw] ${msg}`);
@@ -260,13 +324,11 @@ export async function createNote(
   log(`createNote start: "${title.substring(0, 30)}..." (${content.length} chars)`);
 
   try {
-    // 移除 content 开头与标题重复的内容
     const cleanedContent = removeDuplicateTitleFromContent(content, title);
     if (cleanedContent !== content) {
       log('createNote: removed duplicate title from content');
     }
 
-    // Build the complete HTML with title as a heading, original link, and content
     const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
     const fullHtml = `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${cleanedContent}`;
     log(`createNote: fullHtml length = ${fullHtml.length}`);
@@ -276,7 +338,7 @@ export async function createNote(
     let body;
     try {
       // Safe Mode Parser used, should be fast and non-blocking
-      body = htmlToNoteAtom(fullHtml);
+      body = buildNoteBody(title, content, sourceUrl, fullHtml);
       log(`createNote: NoteAtom conversion done, content items = ${body?.content?.length || 0}`);
       // Log full object depth for debugging
     } catch (convErr) {
@@ -299,7 +361,7 @@ export async function createNote(
 
     log('createNote: calling /note/create API...');
 
-    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
+    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData, { signal });
 
     log('createNote: API response received');
 
@@ -363,10 +425,10 @@ export async function createNote(
     }
 
     // No noteId in error response - this is a real failure
-    const errorCode = getErrorCode(error);
+    const errorCode = getNoteCreateErrorCode(error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: formatNoteCreateErrorMessage(error, errorCode),
       errorCode,
     };
   }
@@ -380,7 +442,8 @@ export async function createNoteWithBody(
   apiKey: string,
   body: Record<string, unknown>,
   isPublic: boolean = false,
-  enableAutoTag?: boolean
+  enableAutoTag?: boolean,
+  signal?: AbortSignal
 ): Promise<NoteCreateResult> {
   console.log(`[sw] createNoteWithBody: starting with body type=${body?.type}`);
 
@@ -393,7 +456,7 @@ export async function createNoteWithBody(
       },
     };
 
-    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData);
+    const data = await apiRequest<NoteCreateData>('/note/create', apiKey, requestData, { signal });
 
     const noteId = data?.noteId;
     if (!noteId) {
@@ -437,10 +500,10 @@ export async function createNoteWithBody(
     }
 
     console.error(`[sw] createNoteWithBody: error: ${formatErrorForLog(error)}`);
-    const errorCode = getErrorCode(error);
+    const errorCode = getNoteCreateErrorCode(error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: formatNoteCreateErrorMessage(error, errorCode),
       errorCode,
     };
   }
@@ -1257,6 +1320,19 @@ function getErrorCode(error: unknown): string {
     }
 
     if (
+      error.message?.includes('ABORTED')
+    ) {
+      return 'CANCELLED';
+    }
+
+    if (
+      error.status === 0 &&
+      error.message?.includes('TIMEOUT')
+    ) {
+      return 'AMBIGUOUS_CREATE';
+    }
+
+    if (
       error.status === 503 ||
       error.code === 503 ||
       codeString.includes('SERVICE')
@@ -1280,4 +1356,28 @@ function getErrorCode(error: unknown): string {
   }
 
   return parseErrorCode(error);
+}
+
+function getNoteCreateErrorCode(error: unknown): string {
+  if (error instanceof ApiRequestError && error.message?.includes('ABORTED')) {
+    return 'CANCELLED';
+  }
+
+  if (error instanceof ApiRequestError && error.status === 0) {
+    return 'AMBIGUOUS_CREATE';
+  }
+
+  return getErrorCode(error);
+}
+
+function formatNoteCreateErrorMessage(error: unknown, errorCode: string): string {
+  if (errorCode === 'CANCELLED') {
+    return '请求已取消';
+  }
+
+  if (errorCode === 'AMBIGUOUS_CREATE') {
+    return '创建请求超时，服务端可能已成功创建笔记。请先到墨问确认是否已生成，避免重复保存。';
+  }
+
+  return error instanceof Error ? error.message : 'Unknown error';
 }

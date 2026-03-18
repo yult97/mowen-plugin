@@ -43,6 +43,102 @@ function getVisibleCaption(img: HTMLImageElement): string {
     return '';
 }
 
+function getEffectiveImageSize(img: HTMLImageElement): { width: number; height: number } {
+    const rect = img.getBoundingClientRect();
+    const rectWidth = rect.width;
+    const rectHeight = rect.height;
+    const naturalWidth = img.naturalWidth || 0;
+    const naturalHeight = img.naturalHeight || 0;
+    const attrWidth = parseInt(img.getAttribute('width') || '0', 10);
+    const attrHeight = parseInt(img.getAttribute('height') || '0', 10);
+
+    return {
+        width: naturalWidth > 0 ? naturalWidth : (rectWidth > 0 ? rectWidth : attrWidth),
+        height: naturalHeight > 0 ? naturalHeight : (rectHeight > 0 ? rectHeight : attrHeight),
+    };
+}
+
+function hasBadgeLikeSignal(value: string): boolean {
+    return /(open in colab|view on github|github repository|colab-badge|badge\.svg|shields\.io)/i.test(value);
+}
+
+export function isLinkedBadgeImage(img: HTMLImageElement): boolean {
+    const link = img.closest('a, button');
+    const src = (img.currentSrc || img.src || '').toLowerCase();
+    const alt = (img.alt || '').toLowerCase();
+    const title = (img.getAttribute('title') || '').toLowerCase();
+    const ariaLabel = (img.getAttribute('aria-label') || '').toLowerCase();
+    const linkHref = link instanceof HTMLAnchorElement ? (link.href || '').toLowerCase() : '';
+    const linkText = (link?.textContent || '').trim().toLowerCase();
+
+    const { width, height } = getEffectiveImageSize(img);
+    const aspectRatio = width > 0 && height > 0 ? width / height : 0;
+    const isCompactBadge = (!width && !height) || height <= 56 || (width <= 320 && height <= 80);
+    const isWideBadge = !width || !height || (aspectRatio >= 2.2 && height <= 64);
+
+    const hasSrcSignal =
+        hasBadgeLikeSignal(src) ||
+        src.includes('colab.research.google.com/assets/colab-badge') ||
+        src.includes('img.shields.io/');
+
+    const hasTextSignal =
+        hasBadgeLikeSignal(alt) ||
+        hasBadgeLikeSignal(title) ||
+        hasBadgeLikeSignal(ariaLabel) ||
+        hasBadgeLikeSignal(linkText);
+
+    const hasLinkSignal =
+        linkHref.includes('colab.research.google.com') ||
+        linkHref.includes('github.com');
+
+    if ((hasSrcSignal || hasTextSignal) && Boolean(link) && isCompactBadge && isWideBadge) {
+        console.log(`[images] excluding: linked badge image src=${src.substring(0, 80)}`);
+        return true;
+    }
+
+    if (hasSrcSignal && hasLinkSignal && isCompactBadge) {
+        console.log(`[images] excluding: badge image linked to CTA href=${linkHref.substring(0, 80)}`);
+        return true;
+    }
+
+    return false;
+}
+
+export function removeLinkedBadgeImages(container: ParentNode): void {
+    const images = Array.from(container.querySelectorAll('img'));
+
+    for (const img of images) {
+        if (!(img instanceof HTMLImageElement)) continue;
+        if (!isLinkedBadgeImage(img)) continue;
+
+        const wrapper = img.closest('a, button');
+        const cleanupStart = (wrapper?.parentElement || img.parentElement) as HTMLElement | null;
+        const shouldRemoveWrapper = Boolean(
+            wrapper &&
+            wrapper.querySelectorAll('img').length === 1 &&
+            (wrapper.textContent || '').trim().length === 0
+        );
+
+        if (shouldRemoveWrapper) {
+            wrapper?.remove();
+        } else {
+            img.remove();
+        }
+
+        let current = cleanupStart;
+        while (current && ['P', 'DIV', 'SPAN'].includes(current.tagName)) {
+            const remainingText = (current.textContent || '').replace(/\s+/g, '');
+            if (remainingText.length > 0 || current.querySelector('img, picture, video, iframe')) {
+                break;
+            }
+
+            const parent = current.parentElement;
+            current.remove();
+            current = parent;
+        }
+    }
+}
+
 /**
  * Extract images from a container element, filtering out non-content images.
  */
@@ -56,6 +152,10 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
 
     // Check if an image should be excluded based on its context
     function shouldExcludeImage(img: HTMLImageElement): boolean {
+        if (isLinkedBadgeImage(img)) {
+            return true;
+        }
+
         // Medium specific: exclude author photo
         if (img.getAttribute('data-testid') === 'authorPhoto') {
             console.log(`[images] excluding: Medium authorPhoto`);
@@ -115,17 +215,7 @@ export function extractImages(container: HTMLElement): ImageCandidate[] {
         }
 
         // Check if image is very small (likely an icon or avatar)
-        const rect = img.getBoundingClientRect();
-        const rectWidth = rect.width;
-        const rectHeight = rect.height;
-        const naturalWidth = img.naturalWidth || 0;
-        const naturalHeight = img.naturalHeight || 0;
-        // Also check attributes as fallback (crucial for unloaded images)
-        const attrWidth = parseInt(img.getAttribute('width') || '0', 10);
-        const attrHeight = parseInt(img.getAttribute('height') || '0', 10);
-
-        const effectiveWidth = naturalWidth > 0 ? naturalWidth : (rectWidth > 0 ? rectWidth : attrWidth);
-        const effectiveHeight = naturalHeight > 0 ? naturalHeight : (rectHeight > 0 ? rectHeight : attrHeight);
+        const { width: effectiveWidth, height: effectiveHeight } = getEffectiveImageSize(img);
 
         // Filter small images (icons, avatars)
         // Adjusted to 50px to ensure legitimate small content images (like badges, pixel art) are not filtered,
