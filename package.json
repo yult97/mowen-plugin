@@ -1,6 +1,6 @@
 {
   "name": "mowen-note-assistant",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "墨问笔记助手 - 一键剪藏网页到墨问笔记",
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives",
     "typecheck": "tsc --noEmit",
-    "build:zip": "npm run build && cd dist && zip -r ../extension.zip ."
+    "build:zip": "rm -rf dist && npm run build && mkdir -p releases && VERSION=$(node -p \"require('./package.json').version\") && cd dist && zip -r ../releases/mowen-plugin-v$VERSION.zip ."
   },
   "dependencies": {
     "@mozilla/readability": "^0.5.0",
