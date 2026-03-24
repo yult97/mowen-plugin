@@ -19,6 +19,17 @@ export default defineConfig({
   },
   build: {
     rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) {
+            return 'react-vendor';
+          }
+
+          if (id.includes('lucide-react')) {
+            return 'icon-vendor';
+          }
+        },
+      },
       // 添加 notesExport.html 为额外的多页入口
       input: {
         notesExport: resolve(__dirname, 'notesExport.html'),

@@ -14,7 +14,6 @@ import {
   checkLoginStatus,
   MowenWebApiError,
 } from '../services/mowenWebApi';
-import { exportMergedPdf, exportBatchAsZip } from '../utils/pdfExporter';
 import {
   FileText,
   Download,
@@ -744,6 +743,8 @@ const NotesExportPage: React.FC = () => {
     const generationFailedTitles: string[] = [];
 
     try {
+      const { exportMergedPdf, exportBatchAsZip } = await import('../utils/pdfExporter');
+
       if (exportSettings.exportMode === 'merged') {
         // 合并导出为单个 PDF
         await exportMergedPdf(noteDetails, { skipImages });

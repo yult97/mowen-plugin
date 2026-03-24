@@ -185,6 +185,13 @@ export class SelectionToolbar {
      * 创建工具栏 DOM
      */
     private createToolbar(): void {
+        // 防御性清理：如果页面上已有旧工具栏残留，先移除，避免重复浮层并存。
+        document.querySelectorAll('.mowen-selection-toolbar').forEach((node) => {
+            if (node instanceof HTMLElement) {
+                node.remove();
+            }
+        });
+
         this.container = document.createElement('div');
         this.container.className = 'mowen-selection-toolbar';
         this.container.style.display = 'none';

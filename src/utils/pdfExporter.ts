@@ -1,18 +1,22 @@
 /**
  * PDF 导出工具模块
  *
- * 使用 html2pdf.js 将 HTML 内容转换为 PDF 并触发下载。
- * 支持单篇导出和批量导出，内置打印友好的 CSS 样式。
+ * 这是导出业务编排层：
+ * 负责把 HTML 内容整理为可打印 DOM，并串联单篇、合并、ZIP 三类导出流程。
+ *
+ * 底层能力已拆分到：
+ * - pdfHtml2Pdf.ts：html2pdf 加载与运行时补丁
+ * - pdfOutput.ts：PDF 二进制输出与预览兼容处理
  */
 
 import DOMPurify from 'dompurify';
+import {
+  computeCanvasAlignedPageMetricsFromExactCssWidth,
+  getPatchedHtml2Pdf,
+} from './pdfHtml2Pdf';
+import { outputPdfBlob } from './pdfOutput';
 import { downloadAndPreviewPdf } from './pdfPreview';
-
-// html2pdf.js 没有官方的 TypeScript 类型声明
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let html2pdfModule: any = null;
-let pdfLibModule: typeof import('pdf-lib') | null = null;
-let html2pdfOverlayPatched = false;
+import { detectCodeLanguage } from './shikiLanguages';
 
 const PDF_PAGE_WIDTH_MM = 210;
 const PDF_PAGE_HEIGHT_MM = 297;
@@ -34,328 +38,35 @@ const PDF_RENDER_ROOT_ATTRIBUTE = 'data-pdf-render-root';
 const PDF_FORCE_PAGE_BREAK_CLASS = 'pdf-force-page-break';
 const INTERNAL_NOTE_LINK_REGEX = /^(?:https?:\/\/(?:note|d-note|dev-note)\.mowen\.cn)?\/detail\/([^/?#]+)/i;
 const INLINE_NOTE_REFERENCE_REGEX = /(?:<note\b[^>]*uuid=|data-note-uuid=|data-mowen-note-uuid=|<q\b[^>]*(?:uuid=|cite=)|<a\b[^>]*href="(?:https?:\/\/(?:note|d-note|dev-note)\.mowen\.cn)?\/detail\/[^"]+)/i;
+const PDF_CODEBLOCK_UI_SELECTORS = [
+  'button',
+  '[role="button"]',
+  '[data-code-copy]',
+  '[data-copy]',
+  '[data-line-number]',
+  '.copy-btn',
+  '.copy-code-btn',
+  '.copy-button',
+  '.line-numbers',
+  '.line-numbers-rows',
+  '.line-number',
+  '.line-number-row',
+  '.code-header',
+  '.code-toolbar',
+  '.toolbar',
+  '.filename',
+  '.lang',
+];
+const PDF_CODEBLOCK_UI_SELECTOR = PDF_CODEBLOCK_UI_SELECTORS.join(', ');
+const PDF_CODEBLOCK_UI_CSS_SELECTOR = PDF_CODEBLOCK_UI_SELECTORS
+  .map((selector) => `.pdf-body pre ${selector}`)
+  .join(',\n    ');
 
 type PdfChildNote = {
   uuid: string;
   title: string;
   digest?: string;
 };
-
-/**
- * 延迟加载 html2pdf 模块
- */
-async function getHtml2Pdf() {
-  if (!html2pdfModule) {
-    // 动态导入，减小初始 bundle 体积
-    const module = await import('html2pdf.js');
-    html2pdfModule = module.default || module;
-  }
-  if (!html2pdfOverlayPatched) {
-    patchHtml2PdfOverlayBehavior(html2pdfModule);
-    html2pdfOverlayPatched = true;
-  }
-  return html2pdfModule;
-}
-
-async function getPdfLib() {
-  if (!pdfLibModule) {
-    const module = await import('pdf-lib');
-    pdfLibModule = module;
-  }
-
-  return pdfLibModule;
-}
-
-function toUint8Array(
-  data: ArrayBuffer | Uint8Array | ArrayBufferView
-): Uint8Array {
-  if (data instanceof Uint8Array) {
-    return data;
-  }
-
-  if (data instanceof ArrayBuffer) {
-    return new Uint8Array(data);
-  }
-
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  }
-
-  throw new Error('Unsupported PDF binary payload type');
-}
-
-function toArrayBuffer(data: ArrayBuffer | Uint8Array | ArrayBufferView): ArrayBuffer {
-  if (data instanceof ArrayBuffer) {
-    return data;
-  }
-
-  const bytes = toUint8Array(data);
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buffer).set(bytes);
-  return buffer;
-}
-
-async function normalizePdfForViewerCompatibility(
-  pdfBinary: ArrayBuffer | Uint8Array | ArrayBufferView
-): Promise<Blob> {
-  const { PDFDocument, PDFName } = await getPdfLib();
-  const sourceBytes = toUint8Array(pdfBinary);
-  const pdfDocument = await PDFDocument.load(sourceBytes, {
-    updateMetadata: false,
-  });
-  const catalog = pdfDocument.catalog;
-
-  for (const key of ['OpenAction', 'PageLayout', 'PageMode', 'ViewerPreferences']) {
-    catalog.delete(PDFName.of(key));
-  }
-
-  const normalizedBytes = await pdfDocument.save({
-    useObjectStreams: false,
-    updateFieldAppearances: false,
-  });
-
-  return new Blob([toArrayBuffer(normalizedBytes)], { type: 'application/pdf' });
-}
-
-async function outputCompatiblePdfBlob(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  worker: any
-): Promise<Blob> {
-  const rawPdfBinary = await worker.outputPdf('arraybuffer');
-
-  try {
-    return await normalizePdfForViewerCompatibility(rawPdfBinary);
-  } catch (error) {
-    console.warn('[pdfExporter] normalizePdfForViewerCompatibility failed:', error);
-    return new Blob([toArrayBuffer(rawPdfBinary)], { type: 'application/pdf' });
-  }
-}
-
-function resolveHtml2CanvasScale(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  workerContext?: any
-): number {
-  const configuredScale = Number(workerContext?.opt?.html2canvas?.scale);
-  if (Number.isFinite(configuredScale) && configuredScale > 0) {
-    return configuredScale;
-  }
-
-  if (typeof window !== 'undefined' && Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0) {
-    return window.devicePixelRatio;
-  }
-
-  return 1;
-}
-
-function computeCanvasAlignedPageMetricsFromExactCssWidth(
-  exactCssWidth: number,
-  exactRatio: number,
-  scale: number
-): {
-  renderWidthPx: number;
-  pageHeightPx: number;
-  canvasPageHeightPx: number;
-  ratio: number;
-} {
-  const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
-  const safeExactWidth = Number.isFinite(exactCssWidth) && exactCssWidth > 0 ? exactCssWidth : 1;
-  const safeExactRatio = Number.isFinite(exactRatio) && exactRatio > 0 ? exactRatio : 1;
-  const renderWidthPx = Math.max(1, Math.ceil(safeExactWidth));
-  const canvasWidthPx = Math.max(1, Math.floor(renderWidthPx * safeScale));
-  const canvasPageHeightPx = Math.max(1, Math.floor(canvasWidthPx * safeExactRatio));
-
-  return {
-    renderWidthPx,
-    pageHeightPx: canvasPageHeightPx / safeScale,
-    canvasPageHeightPx,
-    ratio: canvasPageHeightPx / canvasWidthPx,
-  };
-}
-
-function syncWorkerPageMetricsToCanvasPipeline(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  workerContext: any
-): void {
-  const pageSize = workerContext?.prop?.pageSize;
-  const innerWidth = Number(pageSize?.inner?.width);
-  const innerHeight = Number(pageSize?.inner?.height);
-  const unitScale = Number(pageSize?.k);
-
-  if (!Number.isFinite(innerWidth) || !Number.isFinite(innerHeight) || !Number.isFinite(unitScale)) {
-    return;
-  }
-
-  const exactCssWidth = innerWidth * unitScale / 72 * 96;
-  const metrics = computeCanvasAlignedPageMetricsFromExactCssWidth(
-    exactCssWidth,
-    innerHeight / innerWidth,
-    resolveHtml2CanvasScale(workerContext)
-  );
-
-  pageSize.inner.px = pageSize.inner.px || {};
-  pageSize.inner.px.width = metrics.renderWidthPx;
-  pageSize.inner.px.height = metrics.pageHeightPx;
-  pageSize.inner.ratio = metrics.ratio;
-}
-
-function getPdfRenderRootFromWorkerContext(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  workerContext: any
-): HTMLElement | null {
-  const source = workerContext?.prop?.src;
-  if (!(source instanceof Element)) {
-    return null;
-  }
-
-  return source.closest<HTMLElement>(`[${PDF_RENDER_ROOT_ATTRIBUTE}="true"]`);
-}
-
-function applyDetachedOverlayStyles(overlay: HTMLElement): void {
-  overlay.style.position = 'absolute';
-  overlay.style.left = '0';
-  overlay.style.top = '0';
-  overlay.style.right = 'auto';
-  overlay.style.bottom = 'auto';
-  overlay.style.width = '100%';
-  overlay.style.height = 'auto';
-  overlay.style.minHeight = '100%';
-  overlay.style.opacity = '0';
-  overlay.style.pointerEvents = 'none';
-  overlay.style.overflow = 'hidden';
-  overlay.style.zIndex = '-1';
-}
-
-function attachWorkerCleanup(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  workerResult: any,
-  cleanup: () => void
-): void {
-  let cleanedUp = false;
-  const runCleanup = () => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    cleanup();
-  };
-
-  if (workerResult && typeof workerResult.thenExternal === 'function') {
-    workerResult.thenExternal(runCleanup, runCleanup);
-    return;
-  }
-
-  if (workerResult && typeof workerResult.finally === 'function') {
-    workerResult.finally(runCleanup);
-    return;
-  }
-
-  runCleanup();
-}
-
-function patchHtml2PdfOverlayBehavior(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  html2pdf: any
-): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const workerPrototype = html2pdf?.Worker?.prototype as Record<string, any> | undefined;
-  if (!workerPrototype || workerPrototype.__mowenDetachedOverlayPatched) {
-    return;
-  }
-
-  const originalSetPageSize = workerPrototype.setPageSize;
-  const originalToContainer = workerPrototype.toContainer;
-  const originalToCanvas = workerPrototype.toCanvas;
-
-  if (typeof originalSetPageSize === 'function') {
-    workerPrototype.setPageSize = function patchedSetPageSize(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this: any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ...args: any[]
-    ) {
-      return originalSetPageSize.apply(this, args).then(function afterSetPageSize(this: any) {
-        syncWorkerPageMetricsToCanvasPipeline(this);
-      });
-    };
-  }
-
-  if (typeof originalToContainer === 'function') {
-    workerPrototype.toContainer = function patchedToContainer(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this: any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ...args: any[]
-    ) {
-      const body = document.body;
-      const originalAppendChild = body.appendChild;
-
-      body.appendChild = (<T extends Node>(node: T): T => {
-        if (node instanceof HTMLElement && node.classList.contains('html2pdf__overlay')) {
-          const renderRoot = getPdfRenderRootFromWorkerContext(this);
-          if (renderRoot) {
-            applyDetachedOverlayStyles(node);
-            return renderRoot.appendChild(node) as T;
-          }
-        }
-
-        return originalAppendChild.call(body, node) as T;
-      }) as typeof body.appendChild;
-
-      try {
-        return originalToContainer.apply(this, args);
-      } finally {
-        body.appendChild = originalAppendChild;
-      }
-    };
-  }
-
-  if (typeof originalToCanvas === 'function') {
-    workerPrototype.toCanvas = function patchedToCanvas(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this: any,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ...args: any[]
-    ) {
-      const body = document.body;
-      const originalContains = body.contains;
-      const originalRemoveChild = body.removeChild;
-
-      body.contains = ((node: Node | null): boolean => {
-        if (node) {
-          const overlayParent = this?.prop?.overlay?.parentNode;
-          if (overlayParent instanceof Element && overlayParent.contains(node)) {
-            return true;
-          }
-        }
-
-        return originalContains.call(body, node);
-      }) as typeof body.contains;
-
-      body.removeChild = (<T extends Node>(child: T): T => {
-        if (child === this?.prop?.overlay && child.parentNode && child.parentNode !== body) {
-          child.parentNode.removeChild(child);
-          return child;
-        }
-
-        return originalRemoveChild.call(body, child) as T;
-      }) as typeof body.removeChild;
-
-      const restoreBodyMethods = () => {
-        body.contains = originalContains;
-        body.removeChild = originalRemoveChild;
-      };
-
-      try {
-        const workerResult = originalToCanvas.apply(this, args);
-        attachWorkerCleanup(workerResult, restoreBodyMethods);
-        return workerResult;
-      } catch (error) {
-        restoreBodyMethods();
-        throw error;
-      }
-    };
-  }
-
-  workerPrototype.__mowenDetachedOverlayPatched = true;
-}
 
 /**
  * 打印友好的 CSS 样式
@@ -526,10 +237,29 @@ const PDF_STYLES = `
       word-wrap: break-word;
     }
     .pdf-body pre code {
+      display: block !important;
       background: transparent !important;
       padding: 0 !important;
       color: inherit !important;
       font-size: inherit !important;
+      white-space: inherit !important;
+      word-break: break-word;
+    }
+    .pdf-body pre *,
+    .pdf-body pre code * {
+      color: inherit !important;
+      background: transparent !important;
+      -webkit-text-fill-color: currentColor !important;
+      opacity: 1 !important;
+      text-shadow: none !important;
+      box-shadow: none !important;
+      filter: none !important;
+      font-family: inherit !important;
+    }
+    ${PDF_CODEBLOCK_UI_CSS_SELECTOR},
+    .pdf-body pre [hidden],
+    .pdf-body pre [aria-hidden="true"] {
+      display: none !important;
     }
     .pdf-body code {
       font-family: "SF Mono", "Fira Code", Consolas, monospace;
@@ -667,6 +397,9 @@ const PDF_STYLES = `
   </style>
 `;
 
+// 这个模块仍然偏大，原因是它暂时承载了大部分“导出前 DOM 预处理”逻辑。
+// 后续继续拆分时，应优先把图片预处理、引用卡片处理、分页辅助等独立出去。
+
 function parseCssPixelValue(value: string): number | null {
   const normalized = value.trim();
   if (!normalized.endsWith('px')) return null;
@@ -737,6 +470,85 @@ function normalizeWideContentForPdf(container: HTMLElement): void {
         }
       }
     }
+  }
+}
+
+function serializeElementAttributes(element: Element | null | undefined): string {
+  if (!element) {
+    return '';
+  }
+
+  return Array.from(element.attributes)
+    .map((attribute) => `${attribute.name}="${attribute.value}"`)
+    .join(' ');
+}
+
+function detectCodeLanguageForPdf(pre: HTMLElement, code: HTMLElement | null): string | null {
+  const directLanguage = detectCodeLanguage(
+    serializeElementAttributes(pre),
+    serializeElementAttributes(code)
+  );
+
+  if (directLanguage) {
+    return directLanguage;
+  }
+
+  const wrappers = [
+    pre.parentElement,
+    code?.parentElement,
+    pre.closest('[data-language], [data-lang], [class*="language-"], [class*="lang-"], [class*="hljs"]'),
+  ];
+
+  for (const wrapper of wrappers) {
+    const resolved = detectCodeLanguage(
+      serializeElementAttributes(wrapper),
+      serializeElementAttributes(code)
+    );
+
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function normalizeCodeTextForPdf(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+function normalizeCodeBlocksForPdf(container: HTMLElement): void {
+  const preBlocks = Array.from(container.querySelectorAll<HTMLElement>('.pdf-body pre'));
+
+  for (const pre of preBlocks) {
+    pre.querySelectorAll(PDF_CODEBLOCK_UI_SELECTOR).forEach((element) => element.remove());
+
+    const code = pre.querySelector<HTMLElement>('code');
+    const language = detectCodeLanguageForPdf(pre, code);
+    const textSource = code || pre;
+    const visibleText = textSource.innerText || textSource.textContent || '';
+    const normalizedText = normalizeCodeTextForPdf(visibleText);
+
+    if (!normalizedText.trim()) {
+      continue;
+    }
+
+    const normalizedCode = container.ownerDocument.createElement('code');
+    normalizedCode.textContent = normalizedText;
+    if (language) {
+      normalizedCode.className = `language-${language}`;
+      normalizedCode.setAttribute('data-language', language);
+      pre.setAttribute('data-language', language);
+    } else {
+      pre.removeAttribute('data-language');
+    }
+
+    pre.replaceChildren(normalizedCode);
+    pre.removeAttribute('style');
+    pre.className = '';
   }
 }
 
@@ -1531,6 +1343,8 @@ async function prepareContainerForPdf(
   options?: { skipImages?: boolean }
 ): Promise<void> {
   await waitForRender();
+  normalizeCodeBlocksForPdf(container);
+  await waitForRender();
   // 画廊展开：将 Swiper 轮播图片平铺，避免被裁剪
   flattenGalleries(container);
   normalizeNoteReferenceElements(container);
@@ -1615,7 +1429,7 @@ export async function exportSinglePdf(
     skipImages?: boolean;
   }
 ): Promise<void> {
-  const html2pdf = await getHtml2Pdf();
+  const html2pdf = await getPatchedHtml2Pdf(PDF_RENDER_ROOT_ATTRIBUTE);
 
   const fileName = `${sanitizeFileName(title) || '导出笔记'}.pdf`;
   const fullHtml = buildPdfHtml(title, htmlContent, options);
@@ -1676,7 +1490,9 @@ export async function exportSinglePdf(
       addPdfOutline(pdf, container);
     });
 
-    const blob = await outputCompatiblePdfBlob(worker);
+    const blob = await outputPdfBlob(worker, {
+      normalizeForViewer: true,
+    });
     await downloadAndPreviewPdf(fileName, blob);
   } finally {
     // 无论成功还是失败，都清理 DOM 容器
@@ -1699,7 +1515,7 @@ export async function generatePdfBlob(
     skipImages?: boolean;
   }
 ): Promise<Blob> {
-  const html2pdf = await getHtml2Pdf();
+  const html2pdf = await getPatchedHtml2Pdf(PDF_RENDER_ROOT_ATTRIBUTE);
 
   const fullHtml = buildPdfHtml(title, htmlContent, options);
 
@@ -1757,7 +1573,9 @@ export async function generatePdfBlob(
       addPdfOutline(pdf, container);
     });
 
-    const blob = await outputCompatiblePdfBlob(worker);
+    const blob = await outputPdfBlob(worker, {
+      normalizeForViewer: true,
+    });
 
     return blob;
   } finally {
@@ -1825,7 +1643,7 @@ export async function exportMergedPdf(
     skipImages?: boolean;
   }
 ): Promise<void> {
-  const html2pdf = await getHtml2Pdf();
+  const html2pdf = await getPatchedHtml2Pdf(PDF_RENDER_ROOT_ATTRIBUTE);
 
   // 构建合并后的 HTML：每篇之间用分页符分隔
   const mergedSections = notes.map((note, index) => {
@@ -1923,7 +1741,9 @@ export async function exportMergedPdf(
       addPdfOutline(pdf, container);
     });
 
-    const blob = await outputCompatiblePdfBlob(worker);
+    const blob = await outputPdfBlob(worker, {
+      normalizeForViewer: true,
+    });
     await downloadAndPreviewPdf(fileName, blob);
   } finally {
     if (host.parentNode) {

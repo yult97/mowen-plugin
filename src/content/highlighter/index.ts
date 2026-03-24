@@ -7,6 +7,9 @@
 import { HighlightManager } from './HighlightManager';
 
 let highlightManager: HighlightManager | null = null;
+const highlighterGlobal = globalThis as typeof globalThis & {
+    __mowenHighlightManager__?: HighlightManager | null;
+};
 
 /**
  * 初始化划线功能
@@ -17,8 +20,15 @@ export function initHighlighter(): void {
         return;
     }
 
+    if (highlighterGlobal.__mowenHighlightManager__) {
+        console.log('[Highlighter] Reusing existing global manager');
+        highlightManager = highlighterGlobal.__mowenHighlightManager__;
+        return;
+    }
+
     console.log('[Highlighter] Initializing...');
     highlightManager = new HighlightManager();
+    highlighterGlobal.__mowenHighlightManager__ = highlightManager;
     console.log('[Highlighter] Initialized successfully');
 }
 
@@ -30,6 +40,7 @@ export function destroyHighlighter(): void {
         console.log('[Highlighter] Destroying...');
         highlightManager.destroy();
         highlightManager = null;
+        highlighterGlobal.__mowenHighlightManager__ = null;
         console.log('[Highlighter] Destroyed');
     }
 }

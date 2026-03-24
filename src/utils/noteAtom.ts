@@ -488,6 +488,23 @@ function isEmptyParagraph(block: NoteAtom): boolean {
 }
 
 /**
+ * 这些块在墨问里本身就有明显的块级样式，不需要额外空段落撑开间距。
+ */
+function isSelfSpacedBlock(block: NoteAtom | undefined): boolean {
+  if (!block) {
+    return false;
+  }
+
+  return (
+    block.type === 'quote' ||
+    block.type === 'codeblock' ||
+    block.type === 'image' ||
+    block.type === 'note' ||
+    block.type === 'file'
+  );
+}
+
+/**
  * Collapse consecutive empty paragraphs into a single one
  * Also filter out unwanted social media metadata content
  */
@@ -559,13 +576,12 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
       continue; // Skip duplicate empty paragraph
     }
 
-    // Remove empty paragraph if adjacent to IMAGE blocks
-    // But preserve empty paragraphs between text paragraphs (normal spacing)
+    // Remove empty paragraph if adjacent to structural blocks that already carry spacing.
+    // Preserve empty paragraphs only between text paragraphs.
     if (isEmptyParagraph(block)) {
-      // Check if previous block is an image
-      const isAfterImage = lastBlock && lastBlock.type === 'image';
+      const isAfterSelfSpacedBlock = isSelfSpacedBlock(lastBlock);
 
-      // Check if next NON-EMPTY block is an image (look-ahead)
+      // Check if next NON-EMPTY block is a self-spaced block (look-ahead)
       // We need to find the next block that will actually be in the output
       let nextRealBlock: NoteAtom | undefined;
       for (let j = i + 1; j < blocks.length; j++) {
@@ -574,10 +590,10 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
           break;
         }
       }
-      const isBeforeImage = nextRealBlock && nextRealBlock.type === 'image';
+      const isBeforeSelfSpacedBlock = isSelfSpacedBlock(nextRealBlock);
 
-      if (isAfterImage || isBeforeImage) {
-        continue; // Skip empty spacer adjacent to images
+      if (isAfterSelfSpacedBlock || isBeforeSelfSpacedBlock) {
+        continue; // Skip placeholder-derived spacers around structural blocks
       }
     }
 

@@ -247,6 +247,13 @@ export class HighlightManager {
   private injectStyles(): void {
     if (this.styleElement) return;
 
+    // 防御性清理：重复注入时只保留最新一份样式，避免旧实例残留。
+    document.querySelectorAll('#mowen-highlighter-styles').forEach((node) => {
+      if (node instanceof HTMLStyleElement) {
+        node.remove();
+      }
+    });
+
     this.styleElement = document.createElement('style');
     this.styleElement.id = 'mowen-highlighter-styles';
     this.styleElement.textContent = this.getStyles();

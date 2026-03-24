@@ -459,6 +459,79 @@ function syncCodeLanguageMetadata(pre: HTMLElement, code: HTMLElement | null): v
     }
 }
 
+/**
+ * 某些文档会把“示例代码”和“运行输出”拆成连续两个 <pre>，
+ * 但输出块本身没有 language 标记。
+ * 这时继承前一个已识别代码块的语言，避免在墨问里退化成 text。
+ */
+function inheritAdjacentCodeBlockLanguageMetadata(root: ParentNode): void {
+    const preBlocks = Array.from(root.querySelectorAll('pre'));
+
+    for (const pre of preBlocks) {
+        const code = pre.querySelector('code');
+        const currentLanguage = detectCodeLanguageFromElements(pre, code, [
+            pre.parentElement,
+            code?.parentElement,
+        ]);
+
+        if (currentLanguage) {
+            continue;
+        }
+
+        const previousSibling = pre.previousElementSibling;
+        if (!(previousSibling instanceof HTMLElement) || previousSibling.tagName !== 'PRE') {
+            continue;
+        }
+
+        const previousCode = previousSibling.querySelector('code');
+        const inheritedLanguage = detectCodeLanguageFromElements(previousSibling, previousCode, [
+            previousSibling.parentElement,
+            previousCode?.parentElement,
+        ]);
+
+        if (!inheritedLanguage) {
+            continue;
+        }
+
+        pre.setAttribute('data-language', inheritedLanguage);
+        if (code) {
+            code.setAttribute('data-language', inheritedLanguage);
+        }
+    }
+}
+
+/**
+ * 移除文档站注入的辅助文本块，例如“编辑本文”、评论占位文案等。
+ * 这些内容通常是小块文案，不属于正文，但 Readability 容易误收进去。
+ */
+function removeInjectedTextArtifacts(root: ParentNode): void {
+    const containersToRemove = new Set<HTMLElement>();
+
+    root.querySelectorAll('div, span, p, a, time').forEach((node) => {
+        const element = node as HTMLElement;
+        const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 120) {
+            return;
+        }
+
+        const matchesPattern = METADATA_TEXT_PATTERNS.some((pattern) => pattern.test(text));
+        if (!matchesPattern) {
+            return;
+        }
+
+        const container = element.closest('.pagination, .pagination-item, .gitalk, .gitalk-container')
+            || (element.tagName === 'A' ? element.parentElement : null)
+            || (element.parentElement && element.parentElement.innerText.trim().length < 240 ? element.parentElement : null)
+            || element;
+
+        if (container && container instanceof HTMLElement) {
+            containersToRemove.add(container);
+        }
+    });
+
+    containersToRemove.forEach((container) => container.remove());
+}
+
 function normalizeStandaloneCodeBlocks(doc: Document, body: HTMLElement): void {
     const standaloneCodes = Array.from(body.querySelectorAll('code')).filter(code => !code.closest('pre'));
 
@@ -550,6 +623,12 @@ function preprocessDom(doc: Document, baseUrl: string) {
     const noiseSelectors = ['script', 'style', 'noscript', 'iframe', 'svg', 'canvas', 'button', 'input', 'select', 'textarea'];
     doc.querySelectorAll(noiseSelectors.join(',')).forEach(el => el.remove());
 
+    // 1.5. 在 Readability 选主内容前先移除已知的页脚、评论和交互容器，
+    // 否则这类节点可能被错误并入正文区域。
+    for (const selector of JUNK_SELECTORS) {
+        doc.querySelectorAll(selector).forEach((el) => el.remove());
+    }
+
     // 2. Fix Lazy Loading Images
     // Try to find real src in dataset
     const imgCandidates = ['data-src', 'data-original', 'data-lazy-src', 'data-url', 'dataset.src'];
@@ -583,6 +662,9 @@ function preprocessDom(doc: Document, baseUrl: string) {
     doc.querySelectorAll('a').forEach(a => {
         if (a.href) a.href = makeAbsolute(a.getAttribute('href') || a.href);
     });
+
+    // 3.5. 去除 docsify/gitalk 等注入的辅助文本块，避免混入正文。
+    removeInjectedTextArtifacts(doc);
 
     // 4. 【新增】将 font-weight: bold 样式的 span 转换为语义化的 <strong> 标签
     // 在 Readability 解析之前进行，因为 Readability 会移除 style 属性
@@ -625,6 +707,8 @@ function preprocessDom(doc: Document, baseUrl: string) {
         // c) 清除代码块内的干扰元素（复制按钮、行号等）
         pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
     });
+
+    inheritAdjacentCodeBlockLanguageMetadata(doc);
 
     // 7. 过滤文档顶部的 badge/CTA 图片（如 Open in Colab / View on GitHub）
     // 这类图片不是正文内容，保留会导致被当作普通文章配图剪藏。
@@ -732,6 +816,7 @@ function normalizeReadabilityHtml(html: string): string {
 
     // 清理链接型 badge/按钮图片，避免它们出现在正文与图片候选中。
     removeLinkedBadgeImages(body);
+    removeInjectedTextArtifacts(body);
 
     // 1. Unwrap layout divs (divs that just contain other block elements or text)
     // simple logic: if a div has no attributes (cleaned by Readability?) or just class,
@@ -803,6 +888,7 @@ function normalizeReadabilityHtml(html: string): string {
         syncCodeLanguageMetadata(pre, code);
         pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
     });
+    inheritAdjacentCodeBlockLanguageMetadata(body);
 
     // 3. 【新增】清理冗余 HTML 属性，大幅减少 HTML 体积
     // 保留必要属性：href, src, alt, data-mowen-uid, width, height, target, rel, style

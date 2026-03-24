@@ -24,9 +24,15 @@ import { initHighlighter } from './highlighter';
 
 const contentScriptGlobal = globalThis as typeof globalThis & {
   __mowenContentScriptLoaded__?: boolean;
+  __mowenContentScriptBootstrapped__?: boolean;
 };
 
 contentScriptGlobal.__mowenContentScriptLoaded__ = true;
+
+if (contentScriptGlobal.__mowenContentScriptBootstrapped__) {
+  console.log('[content] Content script bootstrap already completed, skipping duplicate setup');
+} else {
+  contentScriptGlobal.__mowenContentScriptBootstrapped__ = true;
 
 // State for auto-extraction
 let observer: MutationObserver | null = null;
@@ -484,4 +490,5 @@ if (document.readyState === 'loading') {
   setTimeout(() => {
     initHighlighter();
   }, 500);
+}
 }

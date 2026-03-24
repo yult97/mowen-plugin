@@ -1,9 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
 import { Settings, ExtractResult, SaveProgress, DEFAULT_SETTINGS } from '../types';
 import { getSettings } from '../utils/storage';
 import { TaskStore, TaskState } from '../utils/taskStore';
 import { injectContentScript } from '../utils/contentScriptHelper';
-import { exportSinglePdf } from '../utils/pdfExporter';
 import { formatErrorForLog, generateId } from '../utils/helpers';
 import {
   Settings as SettingsIcon,
@@ -21,9 +20,8 @@ import {
   Key,
   BookOpen,
   Tag,
-  Download,
 } from 'lucide-react';
-import TutorialModal from '../components/TutorialModal';
+const TutorialModal = lazy(() => import('../components/TutorialModal'));
 
 // Card 4 state machine: P0-P5
 type PreviewState = 'P0_Idle' | 'P1_PreviewLoading' | 'P2_PreviewReady' | 'P3_Saving' | 'P4_Success' | 'P5_Failed';
@@ -46,7 +44,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   const [loading, setLoading] = useState(true);
   const [cancelDialogTaskId, setCancelDialogTaskId] = useState<string | null>(null);
   const [showTutorial, setShowTutorial] = useState(false);
-  const [isPdfExporting, setIsPdfExporting] = useState(false);
 
   // State to trigger auto-fetch preview
   const [autoFetchTrigger, setAutoFetchTrigger] = useState(0);
@@ -64,6 +61,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
   const clearTaskScopedUiState = () => {
     setCancelDialogTaskId(null);
+  };
+
+  const openNotesExport = () => {
+    const url = chrome.runtime.getURL('notesExport.html');
+    chrome.tabs.create({ url });
   };
 
   const matchesCurrentTaskMessage = (tabId?: number, taskId?: string) => {
@@ -1419,27 +1421,6 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
               <button className="btn-primary flex-1" onClick={handleSave}>
                 保存到墨问
               </button>
-              <button
-                className="btn-secondary"
-                onClick={async () => {
-                  if (extractResult && !isPdfExporting) {
-                    setIsPdfExporting(true);
-                    try {
-                      await exportSinglePdf(extractResult.title, extractResult.contentHtml, {
-                        sourceUrl: currentUrl,
-                      });
-                    } catch (e) {
-                      console.error(`[Popup] PDF export error: ${formatErrorForLog(e)}`);
-                    } finally {
-                      setIsPdfExporting(false);
-                    }
-                  }
-                }}
-                disabled={isPdfExporting || saveInFlightRef.current}
-                title="导出 PDF"
-              >
-                {isPdfExporting ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
-              </button>
               <button className="btn-secondary" onClick={handleGetPreview} disabled={saveInFlightRef.current}>
                 <RefreshCw size={16} />
               </button>
@@ -1779,7 +1760,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-semibold text-text-primary">墨问笔记助手</h1>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1.5">
+          <button
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
+            onClick={openNotesExport}
+            title="我的笔记"
+          >
+            <BookOpen size={15} />
+            <span>我的笔记</span>
+            <ExternalLink size={13} />
+          </button>
           <button
             className="p-2 hover:bg-brand-soft rounded-lg transition-colors"
             onClick={() => openOptions()}
@@ -1818,31 +1808,16 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           {renderFeatureOverview()}
 
           {/* Tutorial Modal */}
-          <TutorialModal
-            isOpen={showTutorial}
-            onClose={() => setShowTutorial(false)}
-            onConfirm={() => {
-              setShowTutorial(false);
-              openOptions();
-            }}
-          />
-
-          {/* 我的笔记入口 */}
-          <div className="card p-3 mb-3">
-            <button
-              className="w-full flex items-center justify-between px-3 py-2 text-sm text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
-              onClick={() => {
-                const url = chrome.runtime.getURL('notesExport.html');
-                chrome.tabs.create({ url });
+          <Suspense fallback={null}>
+            <TutorialModal
+              isOpen={showTutorial}
+              onClose={() => setShowTutorial(false)}
+              onConfirm={() => {
+                setShowTutorial(false);
+                openOptions();
               }}
-            >
-              <span className="flex items-center gap-2">
-                <BookOpen size={16} />
-                我的笔记
-              </span>
-              <ExternalLink size={14} />
-            </button>
-          </div>
+            />
+          </Suspense>
         </>
       )}
     </div>

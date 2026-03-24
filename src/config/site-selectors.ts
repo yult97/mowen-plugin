@@ -52,6 +52,8 @@ export const JUNK_SELECTORS = [
     '.comment-section', '#comments', '[class*="comment"]',
     // VuePress/VitePress
     '.page-edit', '.page-nav', '.page-meta', '.last-updated',
+    // Docsify / documentation footers
+    '.runtime', '.pagination', '.pagination-item', '.pagination-item-label', '.pagination-item-title', '.docsify-pagination-container',
     // Header anchors
     'a.header-anchor', 'a.heading-anchor', 'a.anchor', '.header-anchor',
     // Twitter/X
@@ -110,6 +112,11 @@ export const METADATA_TEXT_PATTERNS = [
     // 中文作者格式："作者：xxx" 或 "作者/公众号：xxx"
     /^作者[：:]/,
     /^作者\/公众号[：:]/,
+    // 文档站注入的页脚辅助信息
+    /^(📝\s*)?编辑本文$/i,
+    /^edit this (page|doc(?:ument)?|article)$/i,
+    /^gitalk\s*(加载中|loading)\s*\.{0,3}$/i,
+    /^[\w\s.-]+已运行\s+\d+\s+天\s+\d+\s+小时\s+\d+\s+分\s+\d+\s+秒$/i,
 ];
 
 // Selectors for non-content image containers (avatars, author bios, social, etc.)
@@ -193,4 +200,3 @@ export const TWITTER_SELECTORS = {
 };
 
 // 封面图自动注入黑名单已移除，采用更通用的 DOM 位置探测策略
-

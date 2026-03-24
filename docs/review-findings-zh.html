@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>代码审查调整说明</title>
+  <style>
+    :root {
+      --bg: #f5efe4;
+      --paper: rgba(255, 251, 245, 0.92);
+      --ink: #1d1b18;
+      --muted: #695f53;
+      --line: rgba(60, 40, 22, 0.14);
+      --accent: #9e2f21;
+      --accent-soft: rgba(158, 47, 33, 0.1);
+      --warn: #8c5c12;
+      --warn-soft: rgba(140, 92, 18, 0.12);
+      --low: #2d5c56;
+      --low-soft: rgba(45, 92, 86, 0.12);
+      --shadow: 0 24px 60px rgba(65, 45, 26, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(158, 47, 33, 0.1), transparent 32%),
+        radial-gradient(circle at bottom right, rgba(45, 92, 86, 0.12), transparent 28%),
+        linear-gradient(180deg, #f8f3eb 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+
+    .page {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 32px auto 64px;
+    }
+
+    .hero,
+    .section,
+    .detail {
+      background: var(--paper);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 40px;
+      border-radius: 28px;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 16px;
+      border: 1px solid rgba(158, 47, 33, 0.1);
+      border-radius: 20px;
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(29, 27, 24, 0.05);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+    }
+
+    h1,
+    h2,
+    h3 {
+      font-family: "Iowan Old Style", "Palatino Linotype", "Songti SC", serif;
+      letter-spacing: 0.01em;
+      margin: 0;
+    }
+
+    h1 {
+      margin-top: 22px;
+      font-size: clamp(34px, 5vw, 54px);
+      line-height: 1.08;
+      max-width: 820px;
+    }
+
+    .hero p {
+      margin: 18px 0 0;
+      max-width: 780px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.8;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+      margin-top: 30px;
+    }
+
+    .meta-card {
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.56);
+      border: 1px solid rgba(60, 40, 22, 0.1);
+    }
+
+    .meta-card strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 18px;
+    }
+
+    .section {
+      margin-top: 22px;
+      padding: 28px;
+      border-radius: 24px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .finding-card {
+      padding: 22px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.54));
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 58px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    .badge.p2 {
+      background: var(--warn-soft);
+      color: var(--warn);
+    }
+
+    .badge.p3 {
+      background: var(--low-soft);
+      color: var(--low);
+    }
+
+    .finding-card h3 {
+      margin-top: 16px;
+      font-size: 24px;
+      line-height: 1.3;
+    }
+
+    .finding-card p {
+      color: var(--muted);
+      line-height: 1.75;
+      margin: 14px 0 0;
+    }
+
+    .detail {
+      margin-top: 22px;
+      padding: 30px;
+      border-radius: 24px;
+    }
+
+    .detail-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 20px;
+    }
+
+    .detail-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+    }
+
+    .panel {
+      padding: 20px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.6);
+    }
+
+    .panel h3 {
+      font-size: 22px;
+      margin-bottom: 14px;
+    }
+
+    .panel ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink);
+      line-height: 1.8;
+    }
+
+    .panel li + li {
+      margin-top: 6px;
+    }
+
+    .label {
+      margin-top: 18px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    pre {
+      margin: 0;
+      overflow: auto;
+      border-radius: 16px;
+      padding: 18px;
+      background: #1f1a17;
+      color: #f8efe1;
+      font-size: 13px;
+      line-height: 1.7;
+      font-family: "SFMono-Regular", "Menlo", "Monaco", "Cascadia Mono", monospace;
+    }
+
+    code {
+      font-family: "SFMono-Regular", "Menlo", "Monaco", "Cascadia Mono", monospace;
+    }
+
+    .flow {
+      display: grid;
+      gap: 12px;
+    }
+
+    .flow-step {
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(29, 27, 24, 0.04);
+      border: 1px dashed rgba(60, 40, 22, 0.18);
+    }
+
+    .flow-step strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .tip {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: var(--accent-soft);
+      color: #652117;
+      line-height: 1.8;
+    }
+
+    .footer {
+      margin-top: 22px;
+      padding: 20px 24px;
+      border-radius: 20px;
+      background: rgba(29, 27, 24, 0.05);
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.8;
+    }
+
+    @media (max-width: 860px) {
+      .hero,
+      .section,
+      .detail {
+        padding: 22px;
+      }
+
+      .detail-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow">CODE REVIEW · 中文可视说明</div>
+      <h1>这次审查里，真正需要调整的是哪两处</h1>
+      <p>
+        这份页面把当前审查结论翻成了可执行的中文说明。重点不是“哪里看起来不够好”，而是“哪一处会带来真实回归，
+        应该改什么，改完会修复哪条链路”。
+      </p>
+      <div class="meta">
+        <div class="meta-card">
+          <span>结论</span>
+          <strong>当前 patch 不建议直接视为正确</strong>
+        </div>
+        <div class="meta-card">
+          <span>需要处理</span>
+          <strong>2 个点</strong>
+        </div>
+        <div class="meta-card">
+          <span>优先顺序</span>
+          <strong>先修 PDF，再收窄 DOM 清理</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>摘要</h2>
+      <div class="summary-grid">
+        <article class="finding-card">
+          <span class="badge p2">P2</span>
+          <h3>ZIP 导出的 PDF 丢了兼容性归一化</h3>
+          <p>
+            重构后，单篇导出和合并导出仍然会清理 PDF 的
+            <code>OpenAction</code> / <code>ViewerPreferences</code>，
+            但 ZIP 批量导出不再清理，导致同一功能下三条导出链路行为不一致。
+          </p>
+        </article>
+        <article class="finding-card">
+          <span class="badge p3">P3</span>
+          <h3>工具栏清理选择器过宽，可能删掉站点自身节点</h3>
+          <p>
+            现在会删除页面上所有类名为 <code>.mowen-selection-toolbar</code> 的元素。
+            如果宿主网页刚好用了同名 class，第一次划线时就会误删对方节点。
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="detail">
+      <div class="detail-head">
+        <div>
+          <span class="badge p2">P2</span>
+          <h2 style="margin-top: 12px;">调整 1：恢复 ZIP 导出的 PDF 兼容性归一化</h2>
+        </div>
+        <p>文件：<code>src/utils/pdfExporter.ts</code></p>
+      </div>
+      <div class="detail-grid">
+        <div class="panel">
+          <h3>为什么这里要改</h3>
+          <ul>
+            <li>历史行为里，所有导出产物都经过兼容性归一化。</li>
+            <li>拆分后，<code>generatePdfBlob()</code> 改成直接调用 <code>outputPdfBlob(worker)</code>。</li>
+            <li>这个函数默认不会做归一化。</li>
+            <li>而 <code>exportBatchAsZip()</code> 正是靠 <code>generatePdfBlob()</code> 来生成每个 PDF 文件。</li>
+            <li>结果就是：单篇导出正常、合并导出正常、ZIP 里的 PDF 回退成未归一化版本。</li>
+          </ul>
+
+          <div class="label">受影响流程</div>
+          <div class="flow">
+            <div class="flow-step">
+              <strong>Popup 单篇导出</strong>
+              仍然正常，因为走的是 <code>exportSinglePdf()</code>，那里还保留了归一化。
+            </div>
+            <div class="flow-step">
+              <strong>NotesExport 合并导出</strong>
+              仍然正常，因为走的是 <code>exportMergedPdf()</code>。
+            </div>
+            <div class="flow-step">
+              <strong>NotesExport 批量 ZIP 导出</strong>
+              这里发生回归，因为 ZIP 里的每个 PDF 来自 <code>generatePdfBlob()</code>。
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>建议怎么调</h3>
+          <div class="label">当前代码</div>
+          <pre><code>const blob = await outputPdfBlob(worker);</code></pre>
+
+          <div class="label">建议改成</div>
+          <pre><code>const blob = await outputPdfBlob(worker, {
+  normalizeForViewer: true,
+});</code></pre>
+
+          <div class="tip">
+            如果你的目标是“所有导出产物保持同一兼容策略”，这里最直接的调整就是把
+            <code>generatePdfBlob()</code> 也接回归一化流程。
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="detail">
+      <div class="detail-head">
+        <div>
+          <span class="badge p3">P3</span>
+          <h2 style="margin-top: 12px;">调整 2：只清理扩展自己创建的工具栏节点</h2>
+        </div>
+        <p>文件：<code>src/content/highlighter/SelectionToolbar.ts</code></p>
+      </div>
+      <div class="detail-grid">
+        <div class="panel">
+          <h3>为什么这里要改</h3>
+          <ul>
+            <li>现在的清理逻辑会执行 <code>document.querySelectorAll('.mowen-selection-toolbar')</code>。</li>
+            <li>这个选择器只看 class，不区分“是扩展自己的 DOM”还是“网页本身的 DOM”。</li>
+            <li>如果宿主页面恰好也用了同名 class，第一次划线时会把对方元素一起删掉。</li>
+            <li>这不是理论上的代码洁癖问题，而是会直接改坏网页本身的显示结构。</li>
+          </ul>
+
+          <div class="label">当前代码方向</div>
+          <pre><code>document.querySelectorAll('.mowen-selection-toolbar').forEach((node) =&gt; {
+  if (node instanceof HTMLElement) {
+    node.remove();
+  }
+});</code></pre>
+        </div>
+
+        <div class="panel">
+          <h3>建议怎么调</h3>
+          <ul>
+            <li>给扩展创建的节点加一个专属标记，例如 <code>data-mowen-owned="true"</code>。</li>
+            <li>清理时改成只匹配这个标记，不要匹配所有同名 class。</li>
+            <li>如果只是想移除旧实例，也可以优先直接处理 <code>this.container</code> 或缓存的旧引用。</li>
+          </ul>
+
+          <div class="label">建议代码方向</div>
+          <pre><code>document
+  .querySelectorAll('.mowen-selection-toolbar[data-mowen-owned="true"]')
+  .forEach((node) =&gt; {
+    if (node instanceof HTMLElement) {
+      node.remove();
+    }
+  });
+
+this.container = document.createElement('div');
+this.container.className = 'mowen-selection-toolbar';
+this.container.dataset.mowenOwned = 'true';</code></pre>
+
+          <div class="tip">
+            这个改法的核心不是“换个 selector 写法”，而是把“扩展 DOM”和“宿主页面 DOM”做边界隔离。
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="footer">
+      建议落地顺序：先修 <code>src/utils/pdfExporter.ts</code> 的 ZIP 导出兼容性，再修
+      <code>src/content/highlighter/SelectionToolbar.ts</code> 的 DOM 清理边界。
+      如果你要，我下一步可以直接把这两处代码一起改掉并补一轮构建验证。
+    </section>
+  </main>
+</body>
+</html>
