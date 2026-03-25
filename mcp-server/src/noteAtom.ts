@@ -71,13 +71,20 @@ function parseHtmlToBlocks(html: string): NoteAtom[] {
         break;
       case 'p':
       case 'div':
-        blocks.push(...parseInlineToBlock(innerContent));
+        {
+          const standaloneCodeBlock = tryCreateStandaloneCodeBlock(attributes, innerContent);
+          if (standaloneCodeBlock) {
+            blocks.push(standaloneCodeBlock);
+          } else {
+            blocks.push(...parseInlineToBlock(innerContent));
+          }
+        }
         break;
       case 'blockquote':
         blocks.push(createBlockquoteNode(innerContent));
         break;
       case 'pre':
-        blocks.push(createCodeBlockNode(innerContent));
+        blocks.push(createCodeBlockNode(attributes, innerContent));
         break;
       case 'ul':
       case 'ol':
@@ -236,21 +243,49 @@ function createBlockquoteNode(content: string): NoteAtom {
 /**
  * Create a code block node
  */
-function createCodeBlockNode(content: string): NoteAtom {
-  // Extract code from inner code tag if present
-  const codeMatch = content.match(/<code[^>]*>([\s\S]*?)<\/code>/i);
-  const text = codeMatch ? codeMatch[1] : stripHtmlTags(content);
+function createCodeBlockNode(preAttrs: string, content: string): NoteAtom {
+  const codeMatch = content.match(/<code\b([^>]*)>([\s\S]*?)<\/code>/i);
+  const codeAttrs = codeMatch ? codeMatch[1] : '';
+  const rawText = codeMatch ? codeMatch[2] : content;
+  const text = decodeHtmlEntities(
+    rawText
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+  ).replace(/^\n+|\n+$/g, '');
+  const language = detectCodeLanguage(preAttrs, codeAttrs) || 'text';
 
   return {
-    type: 'paragraph',
-    content: [
-      {
-        type: 'text',
-        text: text.trim(),
-        marks: [{ type: 'code' }],
-      },
-    ],
+    type: 'codeblock',
+    attrs: { language },
+    content: text ? [{ type: 'text', text }] : [{ type: 'text', text: '' }],
   };
+}
+
+function tryCreateStandaloneCodeBlock(wrapperAttrs: string, content: string): NoteAtom | null {
+  const trimmedContent = content.trim();
+  const codeMatch = trimmedContent.match(/^<code\b([^>]*)>([\s\S]*?)<\/code>$/i);
+  if (!codeMatch) {
+    return null;
+  }
+
+  const codeAttrs = codeMatch[1] || '';
+  const normalizedText = decodeHtmlEntities(
+    codeMatch[2]
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+  ).replace(/^\n+|\n+$/g, '');
+  const language = detectCodeLanguage(wrapperAttrs, codeAttrs);
+  const looksLikeBlockCode = Boolean(language) || /\n/.test(normalizedText) || normalizedText.length > 120;
+
+  if (!normalizedText || !looksLikeBlockCode) {
+    return null;
+  }
+
+  return createCodeBlockNode(`${wrapperAttrs} ${codeAttrs}`, trimmedContent);
 }
 
 /**
@@ -372,6 +407,34 @@ function createMarkedNodes(content: string, markType: string): NoteAtom[] {
  */
 function stripHtmlTags(html: string): string {
   return html.replace(/<[^>]+>/g, '').trim();
+}
+
+function detectCodeLanguage(preAttrs: string, codeAttrs: string): string | null {
+  const attrs = `${preAttrs} ${codeAttrs}`;
+
+  const explicitLanguageMatch = attrs.match(/\bdata-language=["']?([\w+-]+)/i)
+    || attrs.match(/\bdata-lang=["']?([\w+-]+)/i)
+    || attrs.match(/\blanguage=["']?([\w+-]+)/i);
+  if (explicitLanguageMatch?.[1]) {
+    return explicitLanguageMatch[1].toLowerCase();
+  }
+
+  const classMatch = attrs.match(/\bclass=["'][^"']*(?:language-|lang-)([\w+-]+)/i);
+  if (classMatch?.[1]) {
+    return classMatch[1].toLowerCase();
+  }
+
+  return null;
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#039;/g, '\'')
+    .replace(/&nbsp;/g, ' ');
 }
 
 /**

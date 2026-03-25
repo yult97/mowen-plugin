@@ -11,6 +11,7 @@ import { generateId } from '../utils/helpers';
 import { extractImages } from './images';
 import { TWITTER_SELECTORS } from '../config/site-selectors';
 import { normalizeImageUrl } from './imageNormalizer';
+import { detectCodeLanguage } from '../utils/shikiLanguages';
 
 /**
  * 辅助函数：归一化文本
@@ -18,6 +19,85 @@ import { normalizeImageUrl } from './imageNormalizer';
  */
 function normalizeText(text: string): string {
     return text.replace(/\s+/g, '').replace(/[^\w\u4e00-\u9fa5]/g, '').toLowerCase();
+}
+
+function escapeHtml(text: string): string {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function serializeElementAttributes(element: Element | null): string {
+    if (!element) {
+        return '';
+    }
+
+    return Array.from(element.attributes)
+        .map((attribute) => `${attribute.name}="${attribute.value}"`)
+        .join(' ');
+}
+
+function normalizeCodeText(text: string): string {
+    return text
+        .replace(/\r\n?/g, '\n')
+        .replace(/\u00a0/g, ' ')
+        .replace(/^\n+|\n+$/g, '');
+}
+
+function extractNormalizedCodeBlock(pre: HTMLElement): { html: string; text: string } | null {
+    const code = pre.querySelector('code');
+    const rawText = code?.textContent || pre.textContent || '';
+    const codeText = normalizeCodeText(rawText);
+
+    if (!codeText.trim()) {
+        return null;
+    }
+
+    const language = detectCodeLanguage(
+        serializeElementAttributes(pre),
+        serializeElementAttributes(code)
+    ) || 'text';
+    const escapedCode = escapeHtml(codeText);
+
+    return {
+        html: `<pre data-language="${language}"><code class="language-${language}">${escapedCode}</code></pre>`,
+        text: codeText,
+    };
+}
+
+function normalizeXArticleInlineHtml(element: HTMLElement): string {
+    const clone = element.cloneNode(true) as HTMLElement;
+
+    Array.from(clone.querySelectorAll('div')).forEach((div) => {
+        const parent = div.parentNode;
+        if (!parent) {
+            return;
+        }
+
+        while (div.firstChild) {
+            parent.insertBefore(div.firstChild, div);
+        }
+        parent.removeChild(div);
+    });
+
+    clone.querySelectorAll('*').forEach((node) => {
+        if (!(node instanceof HTMLElement)) {
+            return;
+        }
+
+        Array.from(node.attributes).forEach((attribute) => {
+            const keepStyle = attribute.name === 'style';
+            const keepHref = node.tagName === 'A' && attribute.name === 'href';
+            if (!keepStyle && !keepHref) {
+                node.removeAttribute(attribute.name);
+            }
+        });
+    });
+
+    return clone.innerHTML;
 }
 
 /**
@@ -1297,7 +1377,7 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
             if (element.classList.contains('public-DraftStyleDefault-block')) {
                 processed.add(element);
                 const text = element.innerText?.trim() || '';
-                const html = element.innerHTML || '';
+                const html = normalizeXArticleInlineHtml(element);
 
                 if (text && !seenTexts.has(text)) {
                     // 去重逻辑：移除标题
@@ -1323,6 +1403,27 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                     });
                 }
                 stack.pop(); // 不再递归处理文字块内部
+                continue;
+            }
+
+            // 检查是否是代码块
+            if (element.tagName === 'PRE') {
+                processed.add(element);
+                const normalizedCodeBlock = extractNormalizedCodeBlock(element);
+
+                if (normalizedCodeBlock) {
+                    contentParts.push(normalizedCodeBlock.html);
+                    textParts.push(normalizedCodeBlock.text);
+                    blocks.push({
+                        id: generateId(),
+                        type: 'code',
+                        html: normalizedCodeBlock.html,
+                        text: normalizedCodeBlock.text,
+                    });
+                    console.log(`[twitterExtractor] 💻 X Article 代码块: ${normalizedCodeBlock.text.substring(0, 40)}...`);
+                }
+
+                stack.pop();
                 continue;
             }
 
@@ -1515,4 +1616,3 @@ function findTweetDataInProps(props: any, depth = 0): any {
 
     return null;
 }
-

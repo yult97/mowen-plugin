@@ -576,6 +576,27 @@ function normalizeStandaloneCodeBlocks(doc: Document, body: HTMLElement): void {
     }
 }
 
+function normalizeCodeBlocksInElement(element: HTMLElement): void {
+    const doc = element.ownerDocument;
+
+    element.querySelectorAll('pre').forEach(pre => {
+        forceElementVisible(pre as HTMLElement);
+        const code = pre.querySelector('code');
+        syncCodeLanguageMetadata(pre as HTMLElement, code as HTMLElement | null);
+        pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
+    });
+
+    normalizeStandaloneCodeBlocks(doc, element);
+
+    element.querySelectorAll('pre').forEach(pre => {
+        const code = pre.querySelector('code');
+        syncCodeLanguageMetadata(pre as HTMLElement, code as HTMLElement | null);
+        pre.querySelectorAll('button, .copy-btn, .copy-code-btn, .line-numbers-rows').forEach(el => el.remove());
+    });
+
+    inheritAdjacentCodeBlockLanguageMetadata(element);
+}
+
 /**
  * 强制元素及其祖先链可见
  * 解决 Milvus 等站点使用 Tab 切换代码块时，非激活代码块被 CSS 隐藏（display:none），
@@ -1047,6 +1068,10 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
     }
 
     removeLinkedBadgeImages(element);
+
+    if (aggressive) {
+        normalizeCodeBlocksInElement(element);
+    }
 
     // Remove hidden elements
     element.querySelectorAll('*').forEach((el) => {
