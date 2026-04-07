@@ -18,6 +18,16 @@
  * Marks: bold, italic, highlight, link, code
  */
 
+import {
+  findMixedLanguageSplitBoundaries,
+  MIXED_LANGUAGE_NONBREAKING_GAP,
+  MIXED_LANGUAGE_SPACE,
+  MIXED_LANGUAGE_WORD_JOINER,
+  needsHanLatinSpace,
+  needsMetadataLabelWordJoiner,
+  needsLatinHanWordJoiner,
+  stabilizeLatinHanLineBreaks,
+} from './mixedLanguage';
 import { detectCodeLanguage } from './shikiLanguages';
 
 interface NoteAtomMark {
@@ -387,11 +397,7 @@ function parseBlockContent(
             // Check if this text looks like a continuation or a new paragraph
             // For now, we add it as a paragraph, but we should make sure we don't add empty ones
             // if the text is just a spacer.
-            const inline = parseInlineContent(partTrimmed);
-            if (inline.length > 0 && hasRealContent(inline)) {
-              blocks.push({ type: 'paragraph', content: inline });
-              stats.paragraph++;
-            }
+            appendParagraphBlocks(blocks, stats, partTrimmed);
           }
         }
         continue;
@@ -414,11 +420,7 @@ function parseBlockContent(
           }
         } else {
           // Non-empty part -> Parse Content
-          const inline = parseInlineContent(partTrimmed);
-          if (inline.length > 0) {
-            blocks.push({ type: 'paragraph', content: inline });
-            stats.paragraph++;
-          }
+          appendParagraphBlocks(blocks, stats, partTrimmed);
         }
       }
     }
@@ -805,6 +807,211 @@ function hasRealContent(inline: NoteAtom[]): boolean {
   return false;
 }
 
+function appendParagraphBlocks(blocks: NoteAtom[], stats: ConvertStats, html: string): void {
+  const inline = normalizeInlineTypography(parseInlineContent(html));
+  if (inline.length === 0 || !hasRealContent(inline)) {
+    return;
+  }
+
+  const paragraphSegments = splitParagraphInlineContent(inline);
+  for (const content of paragraphSegments) {
+    if (!hasRealContent(content)) {
+      continue;
+    }
+
+    blocks.push({ type: 'paragraph', content });
+    stats.paragraph++;
+  }
+}
+
+function splitParagraphInlineContent(inline: NoteAtom[]): NoteAtom[][] {
+  const text = inline
+    .map((node) => (node.type === 'text' ? node.text || '' : ''))
+    .join('');
+
+  if (shouldPreserveInlineParagraph(text)) {
+    return [inline];
+  }
+
+  const boundaries = findMixedLanguageSplitBoundaries(text);
+
+  if (boundaries.length === 0) {
+    return [inline];
+  }
+
+  const segments: NoteAtom[][] = [];
+  let start = 0;
+  const allBoundaries = [...boundaries, text.length];
+
+  for (const end of allBoundaries) {
+    const sliced = trimInlineBoundaryWhitespace(sliceInlineContentNodes(inline, start, end));
+    if (sliced.length > 0) {
+      segments.push(sliced);
+    }
+    start = end;
+  }
+
+  return segments.length > 1 ? segments : [inline];
+}
+
+function shouldPreserveInlineParagraph(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return true;
+  }
+
+  // Preserve metadata rows such as source / quoted-article labels.
+  // These rows often intentionally mix Chinese labels with English link titles
+  // and should stay inline instead of being split into separate paragraphs.
+  return /^([📄🔗]\s*)?(来源：|引用文章：)/.test(normalized);
+}
+
+function sliceInlineContentNodes(content: NoteAtom[], start: number, end: number): NoteAtom[] {
+  const result: NoteAtom[] = [];
+  let offset = 0;
+
+  for (const node of content) {
+    const text = node.type === 'text' ? node.text || '' : '';
+    const nodeStart = offset;
+    const nodeEnd = offset + text.length;
+    offset = nodeEnd;
+
+    if (nodeEnd <= start || nodeStart >= end) {
+      continue;
+    }
+
+    const sliceStart = Math.max(0, start - nodeStart);
+    const sliceEnd = Math.min(text.length, end - nodeStart);
+    const nextText = text.slice(sliceStart, sliceEnd);
+    if (!nextText) {
+      continue;
+    }
+
+    result.push({
+      ...node,
+      text: nextText,
+      content: undefined,
+      marks: node.marks ? [...node.marks] : undefined,
+    });
+  }
+
+  return result;
+}
+
+function trimInlineBoundaryWhitespace(inline: NoteAtom[]): NoteAtom[] {
+  const trimmed = inline.map((node) => ({
+    ...node,
+    marks: node.marks ? [...node.marks] : undefined,
+    content: undefined,
+  }));
+
+  while (trimmed.length > 0) {
+    const first = trimmed[0];
+    if (first.type !== 'text' || !first.text) {
+      break;
+    }
+
+    const nextText = first.text.replace(/^[\s\u00a0]+/, '');
+    if (!nextText) {
+      trimmed.shift();
+      continue;
+    }
+
+    first.text = nextText;
+    break;
+  }
+
+  while (trimmed.length > 0) {
+    const last = trimmed[trimmed.length - 1];
+    if (last.type !== 'text' || !last.text) {
+      break;
+    }
+
+    const nextText = last.text.replace(/[\s\u00a0]+$/, '');
+    if (!nextText) {
+      trimmed.pop();
+      continue;
+    }
+
+    last.text = nextText;
+    break;
+  }
+
+  return trimmed;
+}
+
+function shouldPreserveOriginalTypography(text: string, marks?: NoteAtomMark[]): boolean {
+  const normalizedText = text.trim();
+  if (!normalizedText) {
+    return false;
+  }
+
+  const hasCodeMark = (marks || []).some((mark) => mark.type === 'code');
+  if (hasCodeMark) {
+    return true;
+  }
+
+  const hasLinkMark = (marks || []).some((mark) => mark.type === 'link');
+  if (!hasLinkMark) {
+    return false;
+  }
+
+  return /^https?:\/\//i.test(normalizedText) || /^www\./i.test(normalizedText);
+}
+
+function hasLinkMark(marks?: NoteAtomMark[]): boolean {
+  return (marks || []).some((mark) => mark.type === 'link');
+}
+
+function normalizeInlineTypography(inline: NoteAtom[]): NoteAtom[] {
+  const normalized = inline.map((node) => {
+    if (node.type !== 'text' || !node.text) {
+      return node;
+    }
+
+    return {
+      ...node,
+      text: shouldPreserveOriginalTypography(node.text, node.marks) ? node.text : stabilizeLatinHanLineBreaks(node.text),
+      marks: node.marks ? [...node.marks] : undefined,
+    };
+  });
+
+  for (let index = 1; index < normalized.length; index++) {
+    const previous = normalized[index - 1];
+    const current = normalized[index];
+
+    if (
+      previous.type === 'text' &&
+      current.type === 'text' &&
+      previous.text &&
+      current.text
+    ) {
+      if (hasLinkMark(current.marks) && needsMetadataLabelWordJoiner(previous.text, current.text)) {
+        previous.text = `${previous.text.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_WORD_JOINER}`;
+        continue;
+      }
+
+      if (
+        shouldPreserveOriginalTypography(previous.text, previous.marks) ||
+        shouldPreserveOriginalTypography(current.text, current.marks)
+      ) {
+        continue;
+      }
+
+      if (needsHanLatinSpace(previous.text, current.text)) {
+        previous.text = `${previous.text.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_SPACE}`;
+        continue;
+      }
+
+      if (needsLatinHanWordJoiner(previous.text, current.text)) {
+        previous.text = `${previous.text.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_NONBREAKING_GAP}`;
+      }
+    }
+  }
+
+  return normalized;
+}
+
 /**
  * Parse inline content with marks (bold, italic, links, etc.)
  */
@@ -819,6 +1026,7 @@ function parseInlineContent(html: string): NoteAtom[] {
 
   let lastIndex = 0;
   let currentMarks: NoteAtomMark[] = [];
+  const markStack: Array<{ tagName: string; marks: NoteAtomMark[] }> = [];
   let match: RegExpExecArray | null;
 
   while ((match = inlineRegex.exec(html)) !== null) {
@@ -835,14 +1043,33 @@ function parseInlineContent(html: string): NoteAtom[] {
     if (fullTag.startsWith('</')) {
       // Closing tag - remove mark
       const tagName = (match[3] || '').toLowerCase();
-      const markType = getMarkType(tagName);
-      if (markType) {
-        currentMarks = currentMarks.filter(m => m.type !== markType);
+      let realIndex = -1;
+      for (let index = markStack.length - 1; index >= 0; index--) {
+        if (markStack[index].tagName === tagName) {
+          realIndex = index;
+          break;
+        }
+      }
+
+      if (realIndex !== -1) {
+        const [entry] = markStack.splice(realIndex, 1);
+        const marksToRemove = [...entry.marks];
+
+        currentMarks = currentMarks.filter((mark) => {
+          const markIndex = marksToRemove.indexOf(mark);
+          if (markIndex === -1) {
+            return true;
+          }
+
+          marksToRemove.splice(markIndex, 1);
+          return false;
+        });
       }
     } else {
       // Opening tag - add mark
       const tagName = (match[1] || '').toLowerCase();
       const attributes = match[2] || '';
+      const nextMarks: NoteAtomMark[] = [];
 
       // Get semantic mark (from tag name)
       const semanticMarkType = getMarkType(tagName);
@@ -850,12 +1077,12 @@ function parseInlineContent(html: string): NoteAtom[] {
         // Handle anchor tag special case
         if (tagName === 'a') {
           const hrefMatch = attributes.match(/href=["']([^"']*)["']/i);
-          currentMarks = [...currentMarks, {
+          nextMarks.push({
             type: 'link',
             attrs: hrefMatch ? { href: hrefMatch[1] } : undefined
-          }];
+          });
         } else {
-          currentMarks = [...currentMarks, { type: semanticMarkType }];
+          nextMarks.push({ type: semanticMarkType });
         }
       }
 
@@ -863,8 +1090,14 @@ function parseInlineContent(html: string): NoteAtom[] {
       // This works for span, p, div, etc if they pass through the regex (currently mostly span)
       const styleMarks = getStyleMarks(attributes);
       if (styleMarks.length > 0) {
-        currentMarks = [...currentMarks, ...styleMarks];
+        nextMarks.push(...styleMarks);
       }
+
+      if (nextMarks.length > 0) {
+        currentMarks = [...currentMarks, ...nextMarks];
+      }
+
+      markStack.push({ tagName, marks: nextMarks });
     }
 
     lastIndex = match.index + match[0].length;
@@ -995,9 +1228,10 @@ function createTextNodesWithAutoLinks(text: string, baseMarks: NoteAtomMark[]): 
  * Create a text node with optional marks
  */
 function createTextNode(text: string, marks: NoteAtomMark[]): NoteAtom {
+  const shouldPreserveOriginalText = shouldPreserveOriginalTypography(text, marks);
   const node: NoteAtom = {
     type: 'text',
-    text: text
+    text: shouldPreserveOriginalText ? text : stabilizeLatinHanLineBreaks(text)
   };
 
   if (marks.length > 0) {
@@ -1474,6 +1708,82 @@ function expandGalleryElements(
   }
 }
 
+const MIXED_LANGUAGE_SKIP_TAGS = new Set(['CODE', 'PRE', 'SCRIPT', 'STYLE']);
+const MIXED_LANGUAGE_HARD_BOUNDARY_TAGS = new Set([
+  'BR',
+  'P',
+  'DIV',
+  'SECTION',
+  'ARTICLE',
+  'MAIN',
+  'ASIDE',
+  'HEADER',
+  'FOOTER',
+  'FIGURE',
+  'FIGCAPTION',
+  'TR',
+  'TD',
+  'TH',
+  'LI',
+  'UL',
+  'OL',
+  'BLOCKQUOTE',
+  'HR',
+]);
+
+function normalizeMixedLanguageTextNodes(
+  node: Node,
+  state: { previousTextNode: Text | null } = { previousTextNode: null }
+): void {
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const textNode = child as Text;
+      const currentValue = textNode.nodeValue || '';
+      const normalizedValue = stabilizeLatinHanLineBreaks(currentValue);
+
+      if (normalizedValue !== currentValue) {
+        textNode.nodeValue = normalizedValue;
+      }
+
+      if (state.previousTextNode?.nodeValue && textNode.nodeValue) {
+        const isCurrentLinkText = Boolean(textNode.parentElement?.closest('a[href]'));
+
+        if (isCurrentLinkText && needsMetadataLabelWordJoiner(state.previousTextNode.nodeValue, textNode.nodeValue)) {
+          state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_WORD_JOINER}`;
+        } else if (needsHanLatinSpace(state.previousTextNode.nodeValue, textNode.nodeValue)) {
+          state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_SPACE}`;
+        } else if (needsLatinHanWordJoiner(state.previousTextNode.nodeValue, textNode.nodeValue)) {
+          state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_NONBREAKING_GAP}`;
+        }
+      }
+
+      state.previousTextNode = textNode;
+      continue;
+    }
+
+    if (child.nodeType !== Node.ELEMENT_NODE) {
+      continue;
+    }
+
+    const element = child as HTMLElement;
+    if (MIXED_LANGUAGE_SKIP_TAGS.has(element.tagName)) {
+      state.previousTextNode = null;
+      continue;
+    }
+
+    const isHardBoundary = MIXED_LANGUAGE_HARD_BOUNDARY_TAGS.has(element.tagName);
+    if (isHardBoundary) {
+      state.previousTextNode = null;
+    }
+
+    normalizeMixedLanguageTextNodes(element, state);
+
+    if (isHardBoundary) {
+      state.previousTextNode = null;
+    }
+  }
+}
+
 export function normalizeMowenHtmlForExport(
   html: string,
   options: NormalizeMowenHtmlOptions = {}
@@ -1497,6 +1807,7 @@ export function normalizeMowenHtmlForExport(
   const renderedUuids = normalizeMowenImages(root, doc, options.noteFile);
   expandAttachImages(root, doc, options.noteFile, options.noteFileTree, renderedUuids);
   expandGalleryElements(root, doc, options.noteFile, options.noteGallery, renderedUuids);
+  normalizeMixedLanguageTextNodes(root);
 
   return root.innerHTML;
 }

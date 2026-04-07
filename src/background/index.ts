@@ -1,5 +1,6 @@
 console.log('[墨问 Background] 🏁 Service Worker Script Loaded');
 import {
+  ContentBlock,
   ExtractResult,
   ImageCandidate,
   ImageProcessResult,
@@ -15,6 +16,7 @@ import { createNote, buildNoteBody, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 import { TaskStore } from '../utils/taskStore';
 import { htmlToNoteAtom } from '../utils/noteAtom';
+import { stabilizeLatinHanLineBreaks } from '../utils/mixedLanguage';
 import { registerSidePanelHandlers } from './sidePanel';
 import { registerContextMenuHandlers } from './contextMenu';
 import {
@@ -410,7 +412,7 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
   }
 
   try {
-    const { processedContent } = await prepareContentForSave({
+    const { processedContent, processedBlocks } = await prepareContentForSave({
       extractResult,
       includeImages,
       maxImages,
@@ -444,7 +446,8 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       extractResult.title,
       extractResult.sourceUrl,
       processedContent,
-      SAFE_LIMIT
+      SAFE_LIMIT,
+      processedBlocks
     );
 
     console.log(`[note] create start title="${extractResult.title.substring(0, 30)}..." partsCount=${parts.length}`);
@@ -777,16 +780,201 @@ function removeAllImageTags(content: string): string {
 // function createMetaHeader removed
 
 
-function splitContent(title: string, sourceUrl: string, content: string, limit: number): NoteSplitPart[] {
-  const contentBody = htmlToNoteAtom(content) as unknown as NoteAtomDoc;
-  const contentBlocks = Array.isArray(contentBody.content) ? contentBody.content : [];
+function convertExtractBlocksToNoteBlocks(blocks: ContentBlock[]): NoteAtomNode[] {
+  const noteBlocks: NoteAtomNode[] = [];
+
+  for (const block of blocks) {
+    const atom = htmlToNoteAtom(block.html) as unknown as NoteAtomDoc;
+    const atomBlocks = Array.isArray(atom.content) ? atom.content : [];
+
+    if (atomBlocks.length > 0) {
+      noteBlocks.push(...atomBlocks.map((node) => cloneNoteAtomNode(node)));
+      continue;
+    }
+
+    const text = block.text?.trim();
+    if (!text) {
+      continue;
+    }
+
+    if (block.type === 'quote') {
+      noteBlocks.push({
+        type: 'quote',
+        content: [{ type: 'text', text: stabilizeLatinHanLineBreaks(text) }],
+      });
+      continue;
+    }
+
+    noteBlocks.push({
+      type: 'paragraph',
+      content: [{ type: 'text', text: stabilizeLatinHanLineBreaks(text) }],
+    });
+  }
+
+  return noteBlocks;
+}
+
+function normalizeTitleForComparison(text: string): string {
+  return text.replace(/[\s.,;:!?。，；：！？\u200B]/g, '').toLowerCase();
+}
+
+function isEmptyParagraphNode(node: NoteAtomNode): boolean {
+  return node.type === 'paragraph' && getNodeTextLength(node) === 0;
+}
+
+function isLeadMediaNode(node: NoteAtomNode): boolean {
+  return node.type === 'image';
+}
+
+function shouldRemoveDuplicateTitleNode(node: NoteAtomNode, title: string, normalizedTitle: string): boolean {
+  const blockText = getNodeText(node).trim();
+  if (!blockText || normalizeTitleForComparison(blockText) !== normalizedTitle) {
+    return false;
+  }
+
+  if (node.type === 'heading') {
+    return true;
+  }
+
+  if (node.type === 'paragraph') {
+    return blockText.length <= title.trim().length * 1.5;
+  }
+
+  return false;
+}
+
+function shouldTrimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string, normalizedTitle: string): boolean {
+  if (node.type !== 'paragraph' && node.type !== 'quote') {
+    return false;
+  }
+
+  const blockText = getNodeText(node).trim();
+  if (!blockText || !blockText.startsWith(title)) {
+    return false;
+  }
+
+  const normalizedBlock = normalizeTitleForComparison(blockText);
+  if (!normalizedBlock.startsWith(normalizedTitle) || normalizedBlock === normalizedTitle) {
+    return false;
+  }
+
+  const trailingText = blockText.slice(title.length);
+  if (!trailingText) {
+    return false;
+  }
+
+  return /^[\s\u00a0\-–—:：|丨、,.，。!?！？/()（）]+/.test(trailingText);
+}
+
+function trimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string): NoteAtomNode | null {
+  const blockText = getNodeText(node).trim();
+  if (!blockText.startsWith(title)) {
+    return cloneNoteAtomNode(node);
+  }
+
+  const trimmedText = blockText
+    .slice(title.length)
+    .replace(/^[\s\u00a0\-–—:：|丨、,.，。!?！？/()（）]+/, '')
+    .trim();
+
+  if (!trimmedText) {
+    return null;
+  }
+
+  return {
+    ...cloneNoteAtomNode(node),
+    content: [{ type: 'text', text: stabilizeLatinHanLineBreaks(trimmedText) }],
+  };
+}
+
+function findLeadingTitleCandidateIndex(blocks: NoteAtomNode[]): number {
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index];
+    if (isEmptyParagraphNode(block) || isLeadMediaNode(block)) {
+      continue;
+    }
+    return index;
+  }
+
+  return -1;
+}
+
+function trimAdjacentEmptyParagraphs(blocks: NoteAtomNode[], index: number): void {
+  let currentIndex = index;
+
+  while (currentIndex < blocks.length && isEmptyParagraphNode(blocks[currentIndex])) {
+    blocks.splice(currentIndex, 1);
+  }
+
+  while (currentIndex - 1 >= 0 && isEmptyParagraphNode(blocks[currentIndex - 1])) {
+    blocks.splice(currentIndex - 1, 1);
+    currentIndex--;
+  }
+}
+
+function removeLeadingDuplicateTitleBlocks(blocks: NoteAtomNode[], title: string): NoteAtomNode[] {
+  const trimmedTitle = title.trim();
+  if (!trimmedTitle || blocks.length === 0) {
+    return blocks;
+  }
+
+  const normalizedTitle = normalizeTitleForComparison(trimmedTitle);
+  if (!normalizedTitle) {
+    return blocks;
+  }
+
+  const remainingBlocks = blocks.map((block) => cloneNoteAtomNode(block));
+  let removed = false;
+
+  while (remainingBlocks.length > 0) {
+    const firstContentIndex = findLeadingTitleCandidateIndex(remainingBlocks);
+    if (firstContentIndex === -1) {
+      break;
+    }
+
+    const firstContentBlock = remainingBlocks[firstContentIndex];
+    if (!shouldRemoveDuplicateTitleNode(firstContentBlock, trimmedTitle, normalizedTitle)) {
+      if (shouldTrimDuplicateTitlePrefixNode(firstContentBlock, trimmedTitle, normalizedTitle)) {
+        const trimmedBlock = trimDuplicateTitlePrefixNode(firstContentBlock, trimmedTitle);
+        console.log(`[bg] Trimming duplicate title prefix from block-based save path: "${getNodeText(firstContentBlock).trim().slice(0, 50)}"`);
+        if (trimmedBlock) {
+          remainingBlocks[firstContentIndex] = trimmedBlock;
+        } else {
+          remainingBlocks.splice(firstContentIndex, 1);
+        }
+        trimAdjacentEmptyParagraphs(remainingBlocks, firstContentIndex);
+        removed = true;
+      }
+      break;
+    }
+
+    const removedBlock = remainingBlocks[firstContentIndex];
+    console.log(`[bg] Removing duplicate title block from block-based save path: "${getNodeText(removedBlock!).trim().slice(0, 50)}"`);
+    remainingBlocks.splice(firstContentIndex, 1);
+    trimAdjacentEmptyParagraphs(remainingBlocks, firstContentIndex);
+    removed = true;
+  }
+
+  return removed ? remainingBlocks : blocks;
+}
+
+function splitContent(title: string, sourceUrl: string, content: string, limit: number, blocks?: ContentBlock[]): NoteSplitPart[] {
+  const contentBody = blocks && blocks.length > 0
+    ? { type: 'doc', content: convertExtractBlocksToNoteBlocks(blocks) }
+    : (htmlToNoteAtom(content) as unknown as NoteAtomDoc);
+  const rawContentBlocks = Array.isArray(contentBody.content) ? contentBody.content : [];
+  const contentBlocks = blocks && blocks.length > 0
+    ? removeLeadingDuplicateTitleBlocks(rawContentBlocks, title)
+    : rawContentBlocks;
   const totalTextLength = contentBlocks.reduce((sum, block) => sum + getNodeTextLength(block), 0);
 
   if (totalTextLength <= limit) {
     return [{
       index: 0,
       title,
-      content,
+      ...(blocks && blocks.length > 0
+        ? { body: buildMultipartBody(title, sourceUrl, contentBlocks) }
+        : { content }),
       total: 1,
     }];
   }
@@ -844,10 +1032,16 @@ function splitContent(title: string, sourceUrl: string, content: string, limit: 
 
 function buildMultipartBody(title: string, sourceUrl: string, blocks: NoteAtomNode[]): NoteAtomDoc {
   const metaBody = buildNoteBody(title, '', sourceUrl) as unknown as NoteAtomDoc;
+  const metaBlocks = Array.isArray(metaBody.content)
+    ? metaBody.content.map((block) => cloneNoteAtomNode(block))
+    : [];
+  const needsSourceSpacer = Boolean(sourceUrl && blocks.length > 0);
+
   return {
     type: 'doc',
     content: [
-      ...(Array.isArray(metaBody.content) ? metaBody.content.map((block) => cloneNoteAtomNode(block)) : []),
+      ...metaBlocks,
+      ...(needsSourceSpacer ? [{ type: 'paragraph', content: [] } as NoteAtomNode] : []),
       ...blocks.map((block) => cloneNoteAtomNode(block)),
     ],
   };

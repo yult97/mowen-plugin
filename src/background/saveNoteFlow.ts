@@ -1,4 +1,5 @@
 import {
+  ContentBlock,
   ExtractResult,
   ImageCandidate,
   ImageProcessResult,
@@ -79,6 +80,7 @@ export async function prepareContentForSave(params: {
   logToContentScript: (msg: string, tabId?: number) => void;
 }): Promise<{
   processedContent: string;
+  processedBlocks: ContentBlock[];
   imageResults: ImageProcessResult[];
 }> {
   const {
@@ -97,6 +99,7 @@ export async function prepareContentForSave(params: {
   } = params;
 
   let processedContent = extractResult.contentHtml;
+  let processedBlocks = (extractResult.blocks || []).map((block) => ({ ...block }));
   let imageResults: ImageProcessResult[] = [];
   const images = extractResult.images || [];
 
@@ -108,14 +111,22 @@ export async function prepareContentForSave(params: {
     imageResults = await processImages(apiKey, imagesToProcess, tabId, taskId, signal);
     processedContent = replaceImageUrls(processedContent, imageResults, extraImages);
     processedContent = injectUploadedImages(processedContent, imageResults);
+    processedBlocks = processedBlocks.map((block) => ({
+      ...block,
+      html: injectUploadedImages(replaceImageUrls(block.html, imageResults, extraImages), imageResults),
+    }));
 
     const imgTagsWithUid = processedContent.match(/<img[^>]*data-mowen-uid[^>]*>/gi);
     logToContentScript(`🔍 处理后的图片标签数: ${imgTagsWithUid?.length || 0}`, tabId);
   } else if (images.length > 0) {
     processedContent = removeAllImageTags(processedContent);
+    processedBlocks = processedBlocks.map((block) => ({
+      ...block,
+      html: removeAllImageTags(block.html),
+    }));
   }
 
-  return { processedContent, imageResults };
+  return { processedContent, processedBlocks, imageResults };
 }
 
 export async function createSplitNotes(params: {

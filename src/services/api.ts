@@ -293,7 +293,8 @@ function createOriginalLinkHtml(sourceUrl?: string): string {
 function buildNoteHtml(title: string, content: string, sourceUrl?: string): string {
   const cleanedContent = removeDuplicateTitleFromContent(content, title);
   const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
-  return `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${cleanedContent}`;
+  const sourceSpacerHtml = originalLinkHtml && cleanedContent ? '<p><br></p>' : '';
+  return `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${sourceSpacerHtml}${cleanedContent}`;
 }
 
 export function buildNoteBody(
@@ -329,8 +330,7 @@ export async function createNote(
       log('createNote: removed duplicate title from content');
     }
 
-    const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
-    const fullHtml = `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${cleanedContent}`;
+    const fullHtml = buildNoteHtml(title, content, sourceUrl);
     log(`createNote: fullHtml length = ${fullHtml.length}`);
 
     // Convert HTML to NoteAtom format

@@ -9,6 +9,7 @@ import { Readability } from '@mozilla/readability';
 import { ExtractResult, ContentBlock } from '../types';
 import { generateId, isWeixinArticle, getDomain, stripHtml, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 import { extractImages, removeLinkedBadgeImages } from './images';
+import { normalizeImageUrl } from './imageNormalizer';
 import { isTwitterPage, extractTwitterContent } from './twitterExtractor';
 // import { normalizeReadabilityHtml } from './extractor-utils'; // Defined internally
 
@@ -103,13 +104,22 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
     let title = titleEl?.innerText?.trim() || document.title;
     const author = authorEl?.innerText?.trim();
     const publishTime = publishTimeEl?.innerText?.trim();
+    const ipWording = getWeixinIpWording();
 
     let contentHtml = '';
     let blocks: ContentBlock[] = [];
+    const picturePageImages = extractWeixinPicturePageImages();
 
     if (contentEl) {
         const contentClone = contentEl.cloneNode(true) as HTMLElement;
         cleanContent(contentClone);
+        removeWeixinMetadataArtifacts(contentClone, { author, publishTime, ipWording });
+        injectWeixinPicturePageImages(contentClone, picturePageImages);
+        contentHtml = contentClone.innerHTML;
+        blocks = parseBlocks(contentClone);
+    } else if (picturePageImages.length > 0) {
+        const contentClone = document.createElement('div');
+        injectWeixinPicturePageImages(contentClone, picturePageImages);
         contentHtml = contentClone.innerHTML;
         blocks = parseBlocks(contentClone);
     }
@@ -149,7 +159,9 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
         }
     }
 
-    const images = extractImages(contentEl || document.body);
+    const contentForImages = document.createElement('div');
+    contentForImages.innerHTML = contentHtml;
+    const images = extractImages(contentForImages);
     const wordCount = stripHtml(contentHtml).length;
 
     return {
@@ -163,6 +175,317 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
         images,
         wordCount,
     };
+}
+
+interface WeixinPictureImage {
+    url: string;
+    normalizedUrl: string;
+    width?: number;
+    height?: number;
+}
+
+interface WeixinMetadataContext {
+    author?: string;
+    publishTime?: string;
+    ipWording?: string;
+}
+
+function getWeixinIpWording(): string | undefined {
+    const ipElement = document.querySelector('#js_ip_wording') as HTMLElement | null;
+    const ipText = ipElement?.innerText?.trim();
+    if (ipText) {
+        return ipText;
+    }
+
+    const win = window as Window & {
+        ip_wording?: {
+            countryName?: string;
+            country_name?: string;
+            countryId?: string;
+            country_id?: string;
+            provinceName?: string;
+            province_name?: string;
+        };
+    };
+
+    const ipWording = win.ip_wording;
+    if (!ipWording) {
+        return undefined;
+    }
+
+    const countryId = ipWording.countryId || ipWording.country_id;
+    const provinceName = ipWording.provinceName || ipWording.province_name;
+    const countryName = ipWording.countryName || ipWording.country_name;
+
+    if (countryId === '156' && provinceName) {
+        return provinceName.trim();
+    }
+
+    return countryName?.trim() || undefined;
+}
+
+function extractWeixinPicturePageImages(): WeixinPictureImage[] {
+    const images: WeixinPictureImage[] = [];
+    const seen = new Set<string>();
+
+    const addImage = (rawUrl: string | null | undefined, width?: number, height?: number): void => {
+        const sanitizedUrl = sanitizeWeixinImageUrl(rawUrl);
+        if (!sanitizedUrl) {
+            return;
+        }
+
+        const normalizedUrl = normalizeImageUrl(sanitizedUrl);
+        if (!normalizedUrl || seen.has(normalizedUrl)) {
+            return;
+        }
+
+        seen.add(normalizedUrl);
+        images.push({
+            url: sanitizedUrl,
+            normalizedUrl,
+            width,
+            height,
+        });
+    };
+
+    const scriptImages = extractWeixinPicturePageImagesFromScripts();
+    if (scriptImages.length > 0) {
+        scriptImages.forEach((image) => addImage(image.url, image.width, image.height));
+    } else {
+        document.querySelectorAll('#img_list img').forEach((img) => {
+            if (!(img instanceof HTMLImageElement)) {
+                return;
+            }
+
+            const width = parseInt(img.getAttribute('width') || '0', 10) || img.naturalWidth || undefined;
+            const height = parseInt(img.getAttribute('height') || '0', 10) || img.naturalHeight || undefined;
+            addImage(img.getAttribute('src') || img.currentSrc || img.src, width, height);
+        });
+    }
+
+    if (images.length > 0) {
+        console.log(`[extractor] 🖼️ Detected ${images.length} Weixin picture-page images`);
+    }
+
+    return images;
+}
+
+function extractWeixinPicturePageImagesFromScripts(): Array<{ url: string; width?: number; height?: number }> {
+    const picturePageScript = Array.from(document.scripts)
+        .map((script) => script.textContent || '')
+        .find((text) => text.includes('window.picture_page_info_list'));
+
+    if (!picturePageScript) {
+        return [];
+    }
+
+    const listMatch = picturePageScript.match(/window\.picture_page_info_list\s*=\s*\[(?<list>[\s\S]*?)\]\.slice\(/);
+    const listText = listMatch?.groups?.list;
+
+    if (!listText) {
+        return [];
+    }
+
+    const images: Array<{ url: string; width?: number; height?: number }> = [];
+    const itemPattern = /\{\s*width:\s*'(?<width>\d+)'\s*\*\s*1,\s*height:\s*'(?<height>\d+)'\s*\*\s*1,\s*cdn_url:\s*(?:JsDecode\()?['"](?<url>[^'"]+)['"]/g;
+
+    for (const match of listText.matchAll(itemPattern)) {
+        const url = sanitizeWeixinImageUrl(match.groups?.url);
+        if (!url) {
+            continue;
+        }
+
+        const width = parseInt(match.groups?.width || '0', 10) || undefined;
+        const height = parseInt(match.groups?.height || '0', 10) || undefined;
+        images.push({ url, width, height });
+    }
+
+    return images;
+}
+
+function injectWeixinPicturePageImages(container: HTMLElement, images: WeixinPictureImage[]): void {
+    if (images.length === 0) {
+        return;
+    }
+
+    const existingImageUrls = collectNormalizedImageUrls(container);
+    const fragment = document.createDocumentFragment();
+    let injectedCount = 0;
+
+    for (const image of images) {
+        if (existingImageUrls.has(image.normalizedUrl)) {
+            continue;
+        }
+
+        const figure = document.createElement('figure');
+        figure.className = 'mowen-weixin-picture-image';
+
+        const img = document.createElement('img');
+        img.src = image.url;
+        img.alt = '';
+
+        if (image.width) {
+            img.setAttribute('width', String(image.width));
+        }
+        if (image.height) {
+            img.setAttribute('height', String(image.height));
+        }
+
+        figure.appendChild(img);
+        fragment.appendChild(figure);
+        existingImageUrls.add(image.normalizedUrl);
+        injectedCount++;
+    }
+
+    if (injectedCount === 0) {
+        return;
+    }
+
+    container.prepend(fragment);
+    console.log(`[extractor] 🖼️ Injected ${injectedCount} Weixin picture-page images into clipped content`);
+}
+
+function removeWeixinMetadataArtifacts(root: HTMLElement, context: WeixinMetadataContext): void {
+    const selectors = [
+        '#js_ip_wording_wrp',
+        '#js_ip_wording',
+        '#publish_time',
+        '#js_name',
+        '#js_author_name',
+        '.account_nickname_inner',
+        '.rich_media_meta',
+        '.rich_media_meta_list',
+        '.rich_media_meta_primary',
+        '.rich_media_meta_nickname',
+        '.rich_media_meta_text',
+        '.profile_info_area',
+        '.profile_meta',
+        '#js_share_content_page_hd',
+        '#js_article_bottom_bar',
+        '#js_stream_bottom_bar',
+        '#unlogin_bottom_bar',
+        '.stream_bottom_bar_wrp',
+        '.bottom_bar_placeholder',
+        '.interaction_bar__wrap',
+        '.interaction_bar',
+        '.wx_expand_article',
+        '.wx_follow_context',
+        '.wx_follow_media',
+        '.wx_follow_nickname',
+        '.wx_stream_article_slide_tip',
+        '.share_media_swiper_placeholder',
+        '.share_media_swiper_tips_counter_area',
+        '.swiper_indicator_wrp',
+        '.swiper_indicator_wrp_pc',
+        '.right-bottom-area',
+    ];
+
+    selectors.forEach((selector) => {
+        root.querySelectorAll(selector).forEach((element) => element.remove());
+    });
+
+    pruneWeixinLeadingMetadataBlocks(root, context);
+}
+
+function pruneWeixinLeadingMetadataBlocks(root: HTMLElement, context: WeixinMetadataContext): void {
+    const metadataTokens = [context.author, context.publishTime, context.ipWording]
+        .map((text) => normalizeWeixinMetadataText(text || ''))
+        .filter(Boolean)
+        .sort((left, right) => right.length - left.length);
+
+    if (metadataTokens.length === 0) {
+        return;
+    }
+
+    const leadingChildren = Array.from(root.children).slice(0, 4);
+    for (const child of leadingChildren) {
+        if (!(child instanceof HTMLElement)) {
+            continue;
+        }
+
+        if (!shouldRemoveWeixinMetadataBlock(child, metadataTokens)) {
+            continue;
+        }
+
+        child.remove();
+    }
+}
+
+function shouldRemoveWeixinMetadataBlock(element: HTMLElement, metadataTokens: string[]): boolean {
+    if (element.querySelector('img, picture, figure, video, iframe, pre, code, table, ul, ol')) {
+        return false;
+    }
+
+    const normalizedText = normalizeWeixinMetadataText(element.innerText || '');
+    if (!normalizedText || normalizedText.length > 80) {
+        return false;
+    }
+
+    let remainingText = normalizedText;
+    for (const token of metadataTokens) {
+        remainingText = remainingText.split(token).join('');
+    }
+
+    remainingText = remainingText
+        .replace(/发布于|发表于|原创|作者|公众号|来自|中国/g, '')
+        .replace(/[年月日时分秒:：,，.\-—|·•()（）]/g, '');
+
+    return remainingText.length === 0;
+}
+
+function normalizeWeixinMetadataText(text: string): string {
+    return text
+        .replace(/\s+/g, '')
+        .replace(/\u00a0/g, '')
+        .trim();
+}
+
+function collectNormalizedImageUrls(container: HTMLElement): Set<string> {
+    const normalizedUrls = new Set<string>();
+    const attrNames = ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-actualsrc'];
+
+    container.querySelectorAll('img, source').forEach((element) => {
+        attrNames.forEach((attrName) => {
+            const value = element.getAttribute(attrName);
+            const normalizedValue = sanitizeWeixinImageUrl(value);
+            if (normalizedValue) {
+                normalizedUrls.add(normalizeImageUrl(normalizedValue));
+            }
+        });
+
+        const srcsetNames = ['srcset', 'data-srcset'];
+        srcsetNames.forEach((attrName) => {
+            const srcset = element.getAttribute(attrName);
+            if (!srcset) {
+                return;
+            }
+
+            srcset.split(',').forEach((item) => {
+                const candidateUrl = sanitizeWeixinImageUrl(item.trim().split(/\s+/)[0]);
+                if (candidateUrl) {
+                    normalizedUrls.add(normalizeImageUrl(candidateUrl));
+                }
+            });
+        });
+    });
+
+    return normalizedUrls;
+}
+
+function sanitizeWeixinImageUrl(url: string | null | undefined): string {
+    if (!url) {
+        return '';
+    }
+
+    const trimmed = url.trim();
+    if (!trimmed) {
+        return '';
+    }
+
+    return trimmed
+        .replace(/\\+x26amp;|\\+u0026amp;|&amp;/gi, '&')
+        .replace(/\\+x26|\\+u0026/gi, '&')
+        .replace(/^http:\/\//i, 'https://');
 }
 
 /**
@@ -1051,6 +1374,8 @@ function extractArticle(doc: Document): {
  *                   If false, only removes ads, social bars, comments (for image extraction).
  */
 export function cleanContent(element: HTMLElement, aggressive: boolean = true): void {
+    const preserveHiddenMedia = isWeixinArticle(window.location.href);
+
     // 1. Remove Junk (Ads, Social, Comments, Interaction Bars) - Always Safe
     for (const selector of JUNK_SELECTORS) {
         element.querySelectorAll(selector).forEach((el) => el.remove());
@@ -1075,8 +1400,22 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
 
     // Remove hidden elements
     element.querySelectorAll('*').forEach((el) => {
-        const style = window.getComputedStyle(el as HTMLElement);
-        if (style.display === 'none' || style.visibility === 'hidden') {
+        const currentElement = el as HTMLElement;
+        const style = window.getComputedStyle(currentElement);
+        const isHidden = style.display === 'none' || style.visibility === 'hidden';
+        if (!isHidden) {
+            return;
+        }
+
+        // WeChat articles often keep lazy images inside temporarily hidden wrappers.
+        // If we remove those wrappers, image extraction may still succeed from the
+        // original DOM, but the saved HTML no longer has matching <img> tags, so
+        // uploaded images cannot be injected back into the clipped result.
+        if (preserveHiddenMedia && containsDeferredMediaContent(currentElement)) {
+            return;
+        }
+
+        if (currentElement.parentNode) {
             el.remove();
         }
     });
@@ -1185,6 +1524,26 @@ export function cleanContent(element: HTMLElement, aggressive: boolean = true): 
             }
         });
     }
+}
+
+function containsDeferredMediaContent(element: HTMLElement): boolean {
+    const deferredMediaSelector = [
+        'img',
+        'picture',
+        'figure',
+        'source',
+        '[data-src]',
+        '[data-original]',
+        '[data-lazy-src]',
+        '[data-actualsrc]',
+        '[data-srcset]',
+    ].join(', ');
+
+    if (element.matches(deferredMediaSelector)) {
+        return true;
+    }
+
+    return Boolean(element.querySelector(deferredMediaSelector));
 }
 
 /**

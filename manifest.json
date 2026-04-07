@@ -54,7 +54,9 @@
         "public/pageContextHelper.js"
       ],
       "matches": [
+        "*://x.com/*",
         "*://*.x.com/*",
+        "*://twitter.com/*",
         "*://*.twitter.com/*"
       ]
     }

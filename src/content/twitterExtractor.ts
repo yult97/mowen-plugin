@@ -68,20 +68,67 @@ function extractNormalizedCodeBlock(pre: HTMLElement): { html: string; text: str
     };
 }
 
+function preserveTextNodeLineBreaks(root: HTMLElement): void {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+
+    let currentNode = walker.nextNode();
+    while (currentNode) {
+        if (currentNode instanceof Text) {
+            textNodes.push(currentNode);
+        }
+        currentNode = walker.nextNode();
+    }
+
+    textNodes.forEach((textNode) => {
+        const value = textNode.nodeValue || '';
+        if (!value.includes('\n') || !value.trim()) {
+            return;
+        }
+
+        const parent = textNode.parentNode;
+        if (!parent) {
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        const parts = value.split(/\n+/);
+
+        parts.forEach((part, index) => {
+            if (part) {
+                fragment.appendChild(document.createTextNode(part));
+            }
+            if (index < parts.length - 1) {
+                fragment.appendChild(document.createElement('br'));
+            }
+        });
+
+        parent.replaceChild(fragment, textNode);
+    });
+}
+
 function normalizeXArticleInlineHtml(element: HTMLElement): string {
     const clone = element.cloneNode(true) as HTMLElement;
 
-    Array.from(clone.querySelectorAll('div')).forEach((div) => {
+    Array.from(clone.querySelectorAll('div')).reverse().forEach((div) => {
         const parent = div.parentNode;
         if (!parent) {
             return;
         }
 
+        const fragment = document.createDocumentFragment();
         while (div.firstChild) {
-            parent.insertBefore(div.firstChild, div);
+            fragment.appendChild(div.firstChild);
         }
-        parent.removeChild(div);
+
+        if (div.nextSibling) {
+            fragment.appendChild(document.createElement('br'));
+        }
+
+        parent.replaceChild(fragment, div);
     });
+
+    preserveTextNodeLineBreaks(clone);
 
     clone.querySelectorAll('*').forEach((node) => {
         if (!(node instanceof HTMLElement)) {
@@ -106,6 +153,8 @@ function normalizeXArticleInlineHtml(element: HTMLElement): string {
 interface QuoteTweet {
     /** 原推文链接 */
     url: string;
+    /** 引用链接展示文案（优先使用标题） */
+    linkLabel?: string;
     /** 引用推文的文本内容 */
     text: string;
     /** 引用推文的 HTML 内容 */
@@ -113,6 +162,14 @@ interface QuoteTweet {
     /** 引用推文中的图片 */
     images: ImageCandidate[];
 }
+
+interface TweetTextSegment {
+    html: string;
+    text: string;
+    textOnly?: boolean;
+}
+
+const TWEET_PARAGRAPH_SPACER_HTML = '<p><br></p>';
 
 /**
  * 检测是否为 Twitter/X 页面
@@ -380,7 +437,15 @@ export async function extractTwitterContent(url: string, domain: string): Promis
     // 如果标题使用了正文前30字，从正文中去除这部分避免重复
     if (contentStart && finalBlocks.length > 0) {
         const firstBlock = finalBlocks[0];
-        if (firstBlock.text.startsWith(contentStart)) {
+        const firstLine = getFirstNonEmptyLine(firstBlock.text);
+
+        if (firstLine.startsWith(contentStart) && firstBlock.text.includes('\n')) {
+            finalBlocks.shift();
+            if (finalBlocks[0]?.text === '') {
+                finalBlocks.shift();
+            }
+            console.log(`[twitterExtractor] ✂️ 从正文中移除与标题重复的首个双语段: "${contentStart}"`);
+        } else if (firstBlock.text.startsWith(contentStart)) {
             // 从第一个块中移除标题文本
             const newText = firstBlock.text.substring(contentStart.length).trim();
             if (newText) {
@@ -439,6 +504,8 @@ function extractTitleWithMeta(container: HTMLElement, isXArticle: boolean): { ti
     if (isXArticle) {
         console.log('[twitterExtractor] 📄 提取 X Article 标题...');
 
+        const firstSegmentText = getFirstXArticleSegmentText();
+
         // 策略 1：优先使用页面标题 (document.title)
         let pageTitle = document.title;
         console.log(`[twitterExtractor] 📄 原始页面标题: "${pageTitle}"`);
@@ -458,6 +525,13 @@ function extractTitleWithMeta(container: HTMLElement, isXArticle: boolean): { ti
             console.log(`[twitterExtractor] 📄 策略1-清洗后的页面标题: "${contentPreview}"`);
         }
 
+        // 页面标题若是中英文直接拼接，优先使用正文首个真实段落作为标题
+        if (firstSegmentText && pageTitle && pageTitle.includes(firstSegmentText) && pageTitle !== firstSegmentText) {
+            contentPreview = firstSegmentText;
+            rawContentStart = firstSegmentText;
+            console.log(`[twitterExtractor] 📄 策略1b-使用首个正文子段替代拼接标题: "${contentPreview}"`);
+        }
+
         // 策略 2：如果页面标题不可用，查找 H1 或 Heading
         if (!contentPreview) {
             const headingObj = container.querySelector('h1') || container.querySelector('[role="heading"]');
@@ -475,7 +549,7 @@ function extractTitleWithMeta(container: HTMLElement, isXArticle: boolean): { ti
         if (!contentPreview && draftBlocks.length > 0) {
             for (let i = 0; i < Math.min(3, draftBlocks.length); i++) {
                 const block = draftBlocks[i] as HTMLElement;
-                const text = block.innerText?.trim() || '';
+                const text = getFirstXArticleSegmentText() || block.innerText?.trim() || '';
 
                 if (text && text.length > 2) {
                     contentPreview = text;
@@ -806,6 +880,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
 
     return {
         url: fullUrl || '(未知链接)',
+        linkLabel: getQuoteLinkLabel(fullUrl || '(未知链接)', text.trim()),
         text: text.trim(),
         html,
         images,
@@ -835,10 +910,627 @@ function cleanTwitterHtml(html: string): string {
     // <span>text</span> -> text（如果 span 没有其他作用）
     cleaned = cleaned.replace(/<span>([^<]*)<\/span>/gi, '$1');
 
-    // 保留换行符
-    cleaned = cleaned.replace(/\n/g, '<br>');
+    // 去掉 HTML 源码中的无意义换行（真正的换行已通过 <br> DOM 元素表示）
+    cleaned = cleaned.replace(/\n+/g, '');
 
     return cleaned.trim();
+}
+
+/**
+ * 将普通推文 tweetText 元素按换行拆分为多个独立段落
+ *
+ * Twitter 的 tweetText 中，作者的换行通过 DOM 中的 <br> 元素表示。
+ * 此函数将内容按 <br> 拆分为独立行，并对纯文本段落做中英文混合二次拆分。
+ */
+function splitTweetTextIntoSegments(element: HTMLElement): TweetTextSegment[] {
+    const fullText = (element.innerText || element.textContent || '').trim();
+
+    if (!fullText) return [];
+
+    const paragraphTexts = splitTweetTextParagraphs(fullText);
+    if (paragraphTexts.length > 1) {
+        return paragraphTexts.map((paragraphText) => ({
+            html: escapeHtml(paragraphText),
+            text: paragraphText,
+        }));
+    }
+
+    const rawHtml = element.innerHTML;
+    // 清理 HTML（保留链接等语义标签和 <br>，移除样式类）
+    const cleanedHtml = cleanTwitterHtml(rawHtml);
+
+    // 复用已有的按 <br> 拆分逻辑
+    const htmlSegments = splitXArticleInlineSegments(cleanedHtml);
+
+    if (htmlSegments.length <= 1) {
+        // 单段：检查是否包含中英文混合需要拆分
+        const hasInlineMarkup = /<(a|strong|em|code)\b/i.test(cleanedHtml);
+        if (!hasInlineMarkup) {
+            const mixedParts = splitMixedLanguageText(fullText);
+            if (mixedParts.length > 1) {
+                return mixedParts.map(part => ({
+                    html: escapeHtml(part),
+                    text: part,
+                }));
+            }
+        }
+        return [{ html: cleanedHtml, text: fullText }];
+    }
+
+    // 多段：对每段检查中英文混合（仅纯文本段落）
+    const result: Array<{ html: string; text: string }> = [];
+    for (const seg of htmlSegments) {
+        const segText = seg.text.trim();
+        if (!segText) continue;
+
+        // 含内联标签的段落不做中英文拆分（避免破坏链接结构）
+        const hasInlineMarkup = /<(a|strong|em|code)\b/i.test(seg.html);
+        if (!hasInlineMarkup) {
+            const mixedParts = splitMixedLanguageText(segText);
+            if (mixedParts.length > 1) {
+                mixedParts.forEach(part => {
+                    result.push({ html: escapeHtml(part), text: part });
+                });
+                continue;
+            }
+        }
+        result.push(seg);
+    }
+
+    return result;
+}
+
+function splitTweetTextParagraphs(text: string): string[] {
+    return text
+        .split(/\n\s*\n+/)
+        .map((paragraph) => paragraph.trim())
+        .filter(Boolean);
+}
+
+function getFirstNonEmptyLine(text: string): string {
+    return text
+        .split('\n')
+        .map((line) => line.trim())
+        .find(Boolean) || '';
+}
+
+function getQuoteLinkLabel(url: string, text: string): string {
+    const candidate = text
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) =>
+            line &&
+            line !== url &&
+            line !== '（引用推文内容请查看原文）' &&
+            line !== '（引用内容为图片）'
+        );
+
+    if (!candidate) {
+        return url;
+    }
+
+    return candidate.length > 80 ? `${candidate.substring(0, 80).trim()}...` : candidate;
+}
+
+function extractVisibleTextLines(element: HTMLElement): string[] {
+    return (element.innerText || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+}
+
+function getParagraphLanguageKind(text: string): 'english' | 'chinese' | 'other' {
+    const normalized = text.trim();
+    if (!normalized) {
+        return 'other';
+    }
+
+    const hanCount = countHanCharacters(normalized);
+    const latinWordCount = countLatinWords(normalized);
+
+    if (hanCount >= 2 && (latinWordCount === 0 || hanCount >= latinWordCount || hanCount >= 6)) {
+        return 'chinese';
+    }
+
+    if (
+        latinWordCount >= 2 &&
+        (hanCount === 0 || (hanCount <= 2 && /^[^\u4e00-\u9fff]*[A-Za-z]/.test(normalized)))
+    ) {
+        return 'english';
+    }
+
+    return 'other';
+}
+
+function getDominantParagraphLanguageKind(segments: Array<{ html: string; text: string }>): 'english' | 'chinese' | 'other' {
+    let englishCount = 0;
+    let chineseCount = 0;
+
+    for (const segment of segments) {
+        const kind = getParagraphLanguageKind(segment.text);
+        if (kind === 'english') {
+            englishCount += 1;
+        } else if (kind === 'chinese') {
+            chineseCount += 1;
+        }
+    }
+
+    if (englishCount === 0 && chineseCount === 0) {
+        return 'other';
+    }
+
+    return englishCount >= chineseCount ? 'english' : 'chinese';
+}
+
+function isTranslatedTweetParagraphPair(
+    firstSegments: TweetTextSegment[],
+    secondSegments: TweetTextSegment[]
+): boolean {
+    if (firstSegments.length === 0 || secondSegments.length === 0) {
+        return false;
+    }
+
+    if (firstSegments.length !== secondSegments.length || firstSegments.length < 3) {
+        return false;
+    }
+
+    const firstLanguage = getDominantParagraphLanguageKind(firstSegments);
+    const secondLanguage = getDominantParagraphLanguageKind(secondSegments);
+
+    if (firstLanguage === secondLanguage || firstLanguage === 'other' || secondLanguage === 'other') {
+        return false;
+    }
+
+    const headingLikeMatches = firstSegments.filter((segment, index) => {
+        const other = secondSegments[index];
+        if (!other) {
+            return false;
+        }
+
+        const firstText = segment.text.trim();
+        const secondText = other.text.trim();
+        if (!firstText || !secondText) {
+            return false;
+        }
+
+        return (
+            startsWithExplicitBlockMarker(firstText) === startsWithExplicitBlockMarker(secondText) ||
+            looksLikeStandaloneHeading(firstText, getXArticleSegmentLanguageKind(firstText)) ||
+            looksLikeStandaloneHeading(secondText, getXArticleSegmentLanguageKind(secondText))
+        );
+    }).length;
+
+    return headingLikeMatches >= Math.min(3, firstSegments.length);
+}
+
+function buildBilingualTweetParagraphSegments(
+    originalSegments: TweetTextSegment[],
+    translatedSegments: TweetTextSegment[]
+): TweetTextSegment[] {
+    const originalLanguage = getDominantParagraphLanguageKind(originalSegments);
+    const translatedLanguage = getDominantParagraphLanguageKind(translatedSegments);
+    const englishFirst = originalLanguage === 'english' || translatedLanguage !== 'english';
+
+    return originalSegments.map((segment, index) => {
+        const translated = translatedSegments[index];
+        const primary = englishFirst ? segment : translated;
+        const secondary = englishFirst ? translated : segment;
+        const text = secondary
+            ? `${primary.text}\n${secondary.text}`
+            : primary.text;
+
+        const html = secondary
+            ? `${escapeHtml(primary.text)}<br>${escapeHtml(secondary.text)}`
+            : primary.html;
+
+        return {
+            html,
+            text,
+            textOnly: Boolean(secondary),
+        };
+    });
+}
+
+function countHanCharacters(text: string): number {
+    return (text.match(/[\u4e00-\u9fff]/g) || []).length;
+}
+
+function countLatinWords(text: string): number {
+    return (text.match(/[A-Za-z]+(?:['’][A-Za-z]+)*/g) || []).length;
+}
+
+function trimMixedLanguageBoundary(text: string): string {
+    return text
+        .replace(/^[\s\u00a0,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+/, '')
+        .trim();
+}
+
+function startsWithLongEnglishPhrase(text: string): boolean {
+    const normalized = trimMixedLanguageBoundary(text);
+    if (!normalized || !/^[A-Za-z]/.test(normalized)) {
+        return false;
+    }
+
+    const head = normalized.slice(0, 80);
+    const firstWindow = head.slice(0, 24);
+    if (countHanCharacters(firstWindow) > 0) {
+        return false;
+    }
+
+    return countLatinWords(head) >= 3;
+}
+
+function startsWithLongHanPhrase(text: string): boolean {
+    const normalized = trimMixedLanguageBoundary(text);
+    if (!normalized) {
+        return false;
+    }
+
+    const head = normalized.slice(0, 40);
+    return countHanCharacters(head) >= 6 && countLatinWords(head.slice(0, 24)) <= 1;
+}
+
+function findPreviousScriptCharacter(text: string, startIndex: number): { index: number; char: string } | null {
+    for (let index = startIndex; index >= 0; index--) {
+        const char = text[index];
+        if (/[\u4e00-\u9fffA-Za-z]/.test(char)) {
+            return { index, char };
+        }
+    }
+
+    return null;
+}
+
+function findNextScriptCharacter(text: string, startIndex: number): { index: number; char: string } | null {
+    for (let index = startIndex; index < text.length; index++) {
+        const char = text[index];
+        if (/[\u4e00-\u9fffA-Za-z]/.test(char)) {
+            return { index, char };
+        }
+    }
+
+    return null;
+}
+
+function findMixedLanguageSplitIndex(text: string): number {
+    for (let cursor = 1; cursor < text.length; cursor++) {
+        const left = findPreviousScriptCharacter(text, cursor - 1);
+        const right = findNextScriptCharacter(text, cursor);
+
+        if (!left || !right || left.index >= right.index) {
+            continue;
+        }
+
+        const between = text.slice(left.index + 1, right.index);
+        if (between && !/^[\s\u00a0,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+$/.test(between)) {
+            continue;
+        }
+
+        const markerMatch = between.match(/[>→\-–—]/);
+        const splitIndex = markerMatch
+            ? left.index + 1 + (markerMatch.index ?? 0)
+            : right.index;
+
+        const prefix = text.slice(0, right.index);
+        const suffix = text.slice(right.index);
+        const leftIsHan = /[\u4e00-\u9fff]/.test(left.char);
+        const rightIsHan = /[\u4e00-\u9fff]/.test(right.char);
+        const leftIsLatin = /[A-Za-z]/.test(left.char);
+        const rightIsLatin = /[A-Za-z]/.test(right.char);
+
+        if (leftIsHan && rightIsLatin) {
+            // prefix 必须以中文为主（以中文开头），才算「中文段落 + 英文段落」可拆分
+            // 避免英文句子中嵌入少量中文被误拆
+            if (startsWithLongHanPhrase(prefix) && startsWithLongEnglishPhrase(suffix)) {
+                return splitIndex;
+            }
+        } else if (leftIsLatin && rightIsHan) {
+            // prefix 必须以英文为主（以英文开头），才算「英文段落 + 中文段落」可拆分
+            // 避免中文句子中嵌入英文专有名词（如 Claude Code）后被误拆
+            if (startsWithLongEnglishPhrase(prefix) && startsWithLongHanPhrase(suffix)) {
+                return splitIndex;
+            }
+        }
+
+        cursor = right.index;
+    }
+
+    return -1;
+}
+
+function splitMixedLanguageText(text: string): string[] {
+    const normalizedText = text.trim();
+    if (!normalizedText || countHanCharacters(normalizedText) === 0 || countLatinWords(normalizedText) === 0) {
+        return normalizedText ? [normalizedText] : [];
+    }
+
+    const parts: string[] = [];
+    let remaining = normalizedText;
+
+    for (let round = 0; round < 6; round++) {
+        const splitIndex = findMixedLanguageSplitIndex(remaining);
+        if (splitIndex <= 0 || splitIndex >= remaining.length) {
+            break;
+        }
+
+        const left = remaining.slice(0, splitIndex).trim();
+        const right = remaining.slice(splitIndex).trim();
+        if (!left || !right) {
+            break;
+        }
+
+        parts.push(left);
+        remaining = right;
+    }
+
+    parts.push(remaining);
+    return parts.filter(Boolean);
+}
+
+type XArticleSegmentLanguageKind = 'english' | 'chinese' | 'other';
+
+function getXArticleSegmentLanguageKind(text: string): XArticleSegmentLanguageKind {
+    const normalized = text.trim();
+    if (!normalized) {
+        return 'other';
+    }
+
+    const hanCount = countHanCharacters(normalized);
+    const latinWordCount = countLatinWords(normalized);
+
+    if (hanCount >= 2 && (latinWordCount === 0 || hanCount >= latinWordCount || hanCount >= 6)) {
+        return 'chinese';
+    }
+
+    if (
+        latinWordCount >= 2 &&
+        (hanCount === 0 || (hanCount <= 2 && /^[^\u4e00-\u9fff]*[A-Za-z]/.test(normalized)))
+    ) {
+        return 'english';
+    }
+
+    return 'other';
+}
+
+function endsWithHardParagraphBoundary(text: string): boolean {
+    return /[。！？!?；;:：]$/.test(text.trim());
+}
+
+function startsWithExplicitBlockMarker(text: string): boolean {
+    return /^([→➜•\-–—*]|\d+\.)\s*/.test(text.trim());
+}
+
+function looksLikeStandaloneHeading(text: string, kind: XArticleSegmentLanguageKind): boolean {
+    const normalized = text.trim();
+    if (!normalized || endsWithHardParagraphBoundary(normalized)) {
+        return false;
+    }
+
+    if (kind === 'english') {
+        const words = countLatinWords(normalized);
+        return words > 0 && words <= 8 && /^[A-Z0-9]/.test(normalized);
+    }
+
+    if (kind === 'chinese') {
+        const hanCount = countHanCharacters(normalized);
+        return hanCount > 0 && hanCount <= 10 && !/[，,]/.test(normalized);
+    }
+
+    return false;
+}
+
+function getSegmentJoiner(left: string, right: string, kind: XArticleSegmentLanguageKind): string {
+    const leftTrimmed = left.trimEnd();
+    const rightTrimmed = right.trimStart();
+    if (!leftTrimmed || !rightTrimmed) {
+        return '';
+    }
+
+    const leftLast = leftTrimmed[leftTrimmed.length - 1];
+    const rightFirst = rightTrimmed[0];
+    const leftIsLatin = /[A-Za-z0-9]/.test(leftLast);
+    const rightIsLatin = /[A-Za-z0-9]/.test(rightFirst);
+    const leftIsHan = /[\u4e00-\u9fff]/.test(leftLast);
+    const rightIsHan = /[\u4e00-\u9fff]/.test(rightFirst);
+
+    if (leftIsLatin && rightIsLatin) {
+        return ' ';
+    }
+
+    if (kind === 'english' && !/\s$/.test(leftTrimmed) && !/^\s/.test(rightTrimmed)) {
+        return ' ';
+    }
+
+    if (leftIsHan || rightIsHan) {
+        return '';
+    }
+
+    return '';
+}
+
+function mergeXArticleContinuationSegments(segments: Array<{ html: string; text: string }>): Array<{ html: string; text: string }> {
+    const merged: Array<{ html: string; text: string }> = [];
+
+    for (const segment of segments) {
+        const currentText = segment.text.trim();
+        const currentHtml = segment.html.trim();
+
+        if (!currentText || !currentHtml) {
+            continue;
+        }
+
+        const previous = merged[merged.length - 1];
+        if (!previous) {
+            merged.push({ html: currentHtml, text: currentText });
+            continue;
+        }
+
+        const previousKind = getXArticleSegmentLanguageKind(previous.text);
+        const currentKind = getXArticleSegmentLanguageKind(currentText);
+        const sameLanguage = previousKind !== 'other' && previousKind === currentKind;
+
+        if (
+            sameLanguage &&
+            !endsWithHardParagraphBoundary(previous.text) &&
+            !startsWithExplicitBlockMarker(currentText) &&
+            !looksLikeStandaloneHeading(previous.text, previousKind)
+        ) {
+            const joiner = getSegmentJoiner(previous.text, currentText, previousKind);
+            previous.text = `${previous.text.trimEnd()}${joiner}${currentText.trimStart()}`;
+            previous.html = `${previous.html}${joiner ? escapeHtml(joiner) : ''}${currentHtml}`;
+            continue;
+        }
+
+        merged.push({ html: currentHtml, text: currentText });
+    }
+
+    return merged;
+}
+
+function refineXArticleParagraphSegments(segments: Array<{ html: string; text: string }>): Array<{ html: string; text: string }> {
+    const refined = segments.flatMap((segment) => {
+        const text = segment.text.trim();
+        const html = segment.html.trim();
+
+        if (!text || !html) {
+            return [];
+        }
+
+        if (html.includes('<br') && !/<(a|strong|em|code)\b/i.test(html)) {
+            return splitNestedBrTextSegments(html);
+        }
+
+        if (html.includes('<br') || /<(a|strong|em|code)\b/i.test(html)) {
+            return [{ html, text }];
+        }
+
+        const splitParts = splitMixedLanguageText(text);
+        if (splitParts.length <= 1) {
+            return [{ html, text }];
+        }
+
+        return splitParts.map((part) => ({
+            html: escapeHtml(part),
+            text: part,
+        }));
+    });
+
+    return mergeXArticleContinuationSegments(refined);
+}
+
+/**
+ * Draft.js 有时会把同一段里的文本包成多层容器，flatten 后会留下嵌套 <br>。
+ * 这里先按文本行拆开，再交给 continuation merge 重新合并，避免把视觉换行误存成真实段落。
+ */
+function splitNestedBrTextSegments(html: string): Array<{ html: string; text: string }> {
+    const container = document.createElement('div');
+    container.innerHTML = html;
+
+    const textLines = (container.innerText || container.textContent || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    if (textLines.length === 0) {
+        return [];
+    }
+
+    return textLines.map((line) => ({
+        html: escapeHtml(line),
+        text: line,
+    }));
+}
+
+function extractXArticleParagraphSegments(element: HTMLElement): Array<{ html: string; text: string }> {
+    const visibleLines = extractVisibleTextLines(element);
+    const directChildDivs = Array.from(element.children)
+        .filter((child): child is HTMLElement => child instanceof HTMLElement && child.tagName === 'DIV')
+        .filter((child) => !!child.innerText?.trim());
+
+    if (directChildDivs.length > 1) {
+        const structuralSegments = refineXArticleParagraphSegments(directChildDivs
+            .map((child) => {
+                const html = normalizeXArticleInlineHtml(child);
+                const text = child.innerText?.trim() || '';
+                return { html, text };
+            })
+            .filter((segment) => !!segment.html && !!segment.text));
+
+        return structuralSegments;
+    }
+
+    const html = normalizeXArticleInlineHtml(element);
+    const segments = refineXArticleParagraphSegments(splitXArticleInlineSegments(html));
+    if (segments.length > 0) {
+        return segments;
+    }
+
+    if (visibleLines.length > 1) {
+        return refineXArticleParagraphSegments(visibleLines.map((line) => ({
+            html: escapeHtml(line),
+            text: line,
+        })));
+    }
+
+    const text = element.innerText?.trim() || '';
+    return html && text ? refineXArticleParagraphSegments([{ html, text }]) : [];
+}
+
+function splitXArticleInlineSegments(html: string): Array<{ html: string; text: string }> {
+    const container = document.createElement('div');
+    container.innerHTML = html;
+
+    const segments: Array<{ html: string; text: string }> = [];
+    let currentNodes: Node[] = [];
+
+    const flushSegment = () => {
+        if (currentNodes.length === 0) {
+            return;
+        }
+
+        const segmentContainer = document.createElement('div');
+        currentNodes.forEach((node) => segmentContainer.appendChild(node));
+
+        const segmentHtml = segmentContainer.innerHTML.trim();
+        const segmentText = (segmentContainer.innerText || segmentContainer.textContent || '').trim();
+
+        if (segmentHtml && segmentText) {
+            segments.push({
+                html: segmentHtml,
+                text: segmentText,
+            });
+        }
+
+        currentNodes = [];
+    };
+
+    Array.from(container.childNodes).forEach((node) => {
+        if (node.nodeName === 'BR') {
+            flushSegment();
+            return;
+        }
+
+        currentNodes.push(node.cloneNode(true));
+    });
+
+    flushSegment();
+
+    return segments;
+}
+
+function getFirstXArticleSegmentText(): string {
+    const draftBlocks = Array.from(document.querySelectorAll('.public-DraftStyleDefault-block'))
+        .filter((block): block is HTMLElement => block instanceof HTMLElement);
+
+    for (const block of draftBlocks) {
+        const segments = extractXArticleParagraphSegments(block);
+        const firstText = segments.find((segment) => !!segment.text)?.text;
+        if (firstText) {
+            return firstText;
+        }
+    }
+
+    return '';
 }
 
 /**
@@ -967,82 +1659,120 @@ async function extractTweetContent(container: HTMLElement, contentStart?: string
     let isFirstBlock = true;
     const normalizationStart = contentStart ? normalizeText(contentStart) : '';
 
-    mainTweetTextElements.forEach((block) => {
-        const element = block as HTMLElement;
-        const html = element.innerHTML;
-        let text = (element.innerText || element.textContent || '').trim();
+    for (let elementIndex = 0; elementIndex < mainTweetTextElements.length; elementIndex++) {
+        const element = mainTweetTextElements[elementIndex] as HTMLElement;
+        const fullText = (element.innerText || element.textContent || '').trim();
 
-        if (!text) return;
+        if (!fullText) continue;
 
-        // --- 核心修复：标题/正文去重 (归一化版本) ---
-        // 针对普通推文的优化策略：
-        // 如果正文首段与标题完全一致（归一化后），通常意味着这是一条短推文，
-        // 此时我们应该**保留**正文，否则笔记内容会变成空的（因为标题在 Note 中可能显示也可能不显示，且为了阅读体验，正文不应为空）。
+        // 按换行拆分为独立段落（修复换行丢失和中英文混合问题）
+        let segments = splitTweetTextIntoSegments(element);
+        if (segments.length === 0) continue;
+
+        const nextElement = mainTweetTextElements[elementIndex + 1] as HTMLElement | undefined;
+        const nextFullText = nextElement ? (nextElement.innerText || nextElement.textContent || '').trim() : '';
+        if (nextElement && nextFullText) {
+            const nextSegments = splitTweetTextIntoSegments(nextElement);
+            if (isTranslatedTweetParagraphPair(segments, nextSegments)) {
+                segments = buildBilingualTweetParagraphSegments(segments, nextSegments);
+                elementIndex += 1;
+            }
+        }
+
+        // --- 标题/正文去重 (归一化版本) ---
         if (isFirstBlock && normalizationStart) {
-            const normalizedText = normalizeText(text);
+            const normalizedText = normalizeText(fullText);
 
             // 情况 1: 完全匹配 -> 保留
             if (normalizedText === normalizationStart) {
-                console.log(`[twitterExtractor] ℹ️ 标题与正文首段完全一致，保留正文 (防止内容丢失): "${text.substring(0, 20)}..."`);
-                // 不执行 return，继续向下处理，将文本加入 blocks
+                console.log(`[twitterExtractor] ℹ️ 标题与正文首段完全一致，保留正文 (防止内容丢失): "${fullText.substring(0, 20)}..."`);
             }
-            // 情况 2: 正文是标题的超集 (Starting with title) -> 移除前缀
-            else if (normalizedText.startsWith(normalizationStart)) {
-                // 显式检查 contentStart 防止 lint 报错
-                if (contentStart) {
-                    console.log(`[twitterExtractor] ✂️ 移除段落开头的标题前缀 (Normalized): "${contentStart.substring(0, 20)}..."`);
-
-                    // 尝试用原始 contentStart 切分
-                    if (text.startsWith(contentStart)) {
-                        text = text.substring(contentStart.length).trim();
+            // 情况 2: 正文是标题的超集 -> 移除对应的首个 segment
+            else if (normalizedText.startsWith(normalizationStart) && contentStart) {
+                console.log(`[twitterExtractor] ✂️ 移除段落开头的标题前缀 (Normalized): "${contentStart.substring(0, 20)}..."`);
+                const firstSeg = segments[0];
+                const firstLine = getFirstNonEmptyLine(firstSeg.text);
+                if (firstSeg.textOnly && firstLine.startsWith(contentStart)) {
+                    console.log('[twitterExtractor] ✂️ 首段双语内容与标题重复，整段从正文中移除');
+                    segments = segments.slice(1);
+                } else if (firstSeg.text.startsWith(contentStart)) {
+                    const newText = firstSeg.text.substring(contentStart.length).trim();
+                    if (newText) {
+                        segments[0] = {
+                            ...firstSeg,
+                            html: escapeHtml(newText),
+                            text: newText,
+                        };
                     } else {
-                        // 如果原始文本不匹配（可能是标点差异），暂且保留原样，避免误切
-                        console.log(`[twitterExtractor] ⚠️ 归一化匹配但原始文本不匹配，保留原样以防误删`);
+                        segments = segments.slice(1);
                     }
-
-                    if (!text) {
-                        isFirstBlock = false;
-                        return;
-                    }
+                }
+                if (segments.length === 0) {
+                    isFirstBlock = false;
+                    continue;
                 }
             }
         }
         isFirstBlock = false;
 
-        // 去重：避免重复添加相同的文本块
-        if (seenTexts.has(text)) return;
-        seenTexts.add(text);
+        // 去重：用整体文本去重
+        if (seenTexts.has(fullText)) continue;
+        seenTexts.add(fullText);
 
-        contentParts.push(`<div class="tweet-text">${html}</div>`);
-        textParts.push(text);
-        blocks.push({
-            id: generateId(),
-            type: 'paragraph',
-            html: `<p>${html}</p>`,
-            text: text,
+        // 每个 segment 生成独立的 ContentBlock，并显式补回段落间空行。
+        // X 的 tweetText 真实段落边界来自空行文本，而墨问里相邻 paragraph 默认间距较紧，
+        // 因此这里插入一个空 paragraph 作为视觉分段，只作用于 Twitter/X 提取链路。
+        segments.forEach((seg, segmentIndex) => {
+            if (!seg.text.trim()) return;
+            contentParts.push(`<div class="tweet-text">${seg.html}</div>`);
+            textParts.push(seg.text);
+            blocks.push({
+                id: generateId(),
+                type: 'paragraph',
+                html: seg.textOnly ? '' : `<p>${seg.html}</p>`,
+                text: seg.text,
+            });
+
+            if (segmentIndex < segments.length - 1) {
+                contentParts.push(TWEET_PARAGRAPH_SPACER_HTML);
+                blocks.push({
+                    id: generateId(),
+                    type: 'paragraph',
+                    html: TWEET_PARAGRAPH_SPACER_HTML,
+                    text: '',
+                });
+            }
         });
-    });
+    }
 
     console.log(`[twitterExtractor] 📝 主推文提取: ${mainTweetTextElements.length} 个文本块, ${textParts.length} 个有效段落`);
 
     // 4. 拼装引用推文（严格遵循 Link -> Quote -> Images 顺序）
     quoteTweets.forEach((qt, qtIndex) => {
         // (1) 引用链接行
+        const linkLabel = escapeHtml(qt.linkLabel || qt.url);
         const linkBlock: ContentBlock = {
             id: generateId(),
             type: 'paragraph',
-            html: `<p>🔗 引用文章：<a href="${qt.url}">${qt.url}</a></p>`,
-            text: `🔗 引用文章：${qt.url}`,
+            html: `<p>🔗 引用文章：<a href="${qt.url}">${linkLabel}</a></p>`,
+            text: `🔗 引用文章：${qt.linkLabel || qt.url}`,
         };
         blocks.push(linkBlock);
         contentParts.push(linkBlock.html);
         textParts.push(linkBlock.text);
 
         // (2) 引用内容（在 quote 节点内）
+        // 将 <br> 分隔的内容转为多段落 <p>，确保换行正确显示
+        const quoteHtmlParagraphs = qt.html
+            .split(/<br\s*\/?>/gi)
+            .map(p => p.trim())
+            .filter(Boolean)
+            .map(p => `<p>${p}</p>`)
+            .join('');
         const quoteBlock: ContentBlock = {
             id: generateId(),
             type: 'quote',
-            html: `<blockquote>${qt.html}</blockquote>`,
+            html: `<blockquote>${quoteHtmlParagraphs || qt.html}</blockquote>`,
             text: qt.text,
         };
         blocks.push(quoteBlock);
@@ -1313,11 +2043,12 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                     quoteTweetContainers.push(element);
 
                     // (1) 引用链接行
+                    const linkLabel = escapeHtml(quoteTweet.linkLabel || quoteTweet.url);
                     const linkBlock: ContentBlock = {
                         id: generateId(),
                         type: 'paragraph',
-                        html: `<p>🔗 引用文章：<a href="${quoteTweet.url}">${quoteTweet.url}</a></p>`,
-                        text: `🔗 引用文章：${quoteTweet.url}`,
+                        html: `<p>🔗 引用文章：<a href="${quoteTweet.url}">${linkLabel}</a></p>`,
+                        text: `🔗 引用文章：${quoteTweet.linkLabel || quoteTweet.url}`,
                     };
                     blocks.push(linkBlock);
                     contentParts.push(linkBlock.html);
@@ -1377,7 +2108,7 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
             if (element.classList.contains('public-DraftStyleDefault-block')) {
                 processed.add(element);
                 const text = element.innerText?.trim() || '';
-                const html = normalizeXArticleInlineHtml(element);
+                const segments = extractXArticleParagraphSegments(element);
 
                 if (text && !seenTexts.has(text)) {
                     // 去重逻辑：移除标题
@@ -1393,13 +2124,20 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                     isFirstBlock = false;
 
                     seenTexts.add(text);
-                    contentParts.push(`<div class="article-block">${html}</div>`);
                     textParts.push(text);
-                    blocks.push({
-                        id: generateId(),
-                        type: 'paragraph',
-                        html: `<p>${html}</p>`,
-                        text: text,
+
+                    const paragraphSegments = segments.length > 0
+                        ? segments
+                        : [];
+
+                    paragraphSegments.forEach((segment) => {
+                        contentParts.push(`<p>${segment.html}</p>`);
+                        blocks.push({
+                            id: generateId(),
+                            type: 'paragraph',
+                            html: `<p>${segment.html}</p>`,
+                            text: segment.text,
+                        });
                     });
                 }
                 stack.pop(); // 不再递归处理文字块内部
