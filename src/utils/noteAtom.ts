@@ -21,7 +21,6 @@
 import {
   findMixedLanguageSplitBoundaries,
   MIXED_LANGUAGE_NONBREAKING_GAP,
-  MIXED_LANGUAGE_SPACE,
   MIXED_LANGUAGE_WORD_JOINER,
   needsHanLatinSpace,
   needsMetadataLabelWordJoiner,
@@ -96,6 +95,18 @@ interface ProtectedCodeBlock {
   language: string | null;
 }
 
+interface ProtectedInlineParagraph {
+  placeholder: string;
+  content: string;
+}
+
+interface HtmlToNoteAtomOptions {
+  preserveInlineParagraphs?: boolean;
+}
+
+const PRESERVE_INLINE_PARAGRAPH_ATTR = 'data-mowen-preserve-inline-paragraph';
+const INLINE_BREAK_SENTINEL = '\uE000';
+
 // Block-level tags are handled inline in parseBlockContent
 
 function protectCodeBlocks(html: string): { html: string; codeBlocks: ProtectedCodeBlock[] } {
@@ -144,7 +155,7 @@ function protectCodeBlocks(html: string): { html: string; codeBlocks: ProtectedC
 /**
  * Main conversion function
  */
-export function htmlToNoteAtom(html: string): NoteAtom {
+export function htmlToNoteAtom(html: string, options: HtmlToNoteAtomOptions = {}): NoteAtom {
   const stats: ConvertStats = {
     source: 'block-parser',
     total: 0,
@@ -176,7 +187,7 @@ export function htmlToNoteAtom(html: string): NoteAtom {
     });
 
     // 3. Parse blocks
-    const blocks = parseBlockContent(processed, images, stats, protectedCode.codeBlocks);
+    const blocks = parseBlockContent(processed, images, stats, protectedCode.codeBlocks, options);
     stats.total = blocks.length;
 
     // 4. Ensure at least one block
@@ -205,7 +216,8 @@ function parseBlockContent(
   html: string,
   images: ImageData[],
   stats: ConvertStats,
-  protectedCodeBlocks: ProtectedCodeBlock[] = []
+  protectedCodeBlocks: ProtectedCodeBlock[] = [],
+  options: HtmlToNoteAtomOptions = {}
 ): NoteAtom[] {
   const blocks: NoteAtom[] = [];
 
@@ -238,6 +250,17 @@ function parseBlockContent(
     return convertListItems(content, true);
   });
 
+  // 5.1 保护需要“禁止二次按中英混排拆段”的段落（例如 X Article 原文/译文对照）
+  const protectedInlineParagraphs: ProtectedInlineParagraph[] = [];
+  normalized = normalized.replace(
+    new RegExp(`<p\\b([^>]*)${PRESERVE_INLINE_PARAGRAPH_ATTR}=["']1["']([^>]*)>([\\s\\S]*?)<\\/p>`, 'gi'),
+    (_m, _beforeAttrs, _afterAttrs, content) => {
+      const placeholder = `@@MOWEN_PRESERVE_PARAGRAPH_${protectedInlineParagraphs.length}@@`;
+      protectedInlineParagraphs.push({ placeholder, content });
+      return `\n${placeholder}\n`;
+    }
+  );
+
   // 5. Normalize block boundaries: ensure each block-level element creates a clear boundary
   // Close tags + open tags both create boundaries
   normalized = normalized
@@ -250,6 +273,7 @@ function parseBlockContent(
   normalized = normalized
     .replace(/(<!--QUOTE:\d+-->)/g, '\n$1\n')
     .replace(/(@@MOWEN_CODE_BLOCK_\d+@@)/g, '\n$1\n')
+    .replace(/(@@MOWEN_PRESERVE_PARAGRAPH_\d+@@)/g, '\n$1\n')
     .replace(/(<!--IMG:\d+-->)/g, '$1');
 
   // 7. Split by block boundaries
@@ -290,6 +314,16 @@ function parseBlockContent(
             blocks.push(imageBlock);
             stats.image++;
           }
+        }
+        continue;
+      }
+
+      const protectedParagraphMatch = trimmed.match(/^@@MOWEN_PRESERVE_PARAGRAPH_(\d+)@@$/);
+      if (protectedParagraphMatch) {
+        const protectedParagraphIndex = parseInt(protectedParagraphMatch[1], 10);
+        const protectedParagraph = protectedInlineParagraphs[protectedParagraphIndex];
+        if (protectedParagraph) {
+          appendPreservedInlineParagraphBlock(blocks, stats, protectedParagraph.content);
         }
         continue;
       }
@@ -397,7 +431,7 @@ function parseBlockContent(
             // Check if this text looks like a continuation or a new paragraph
             // For now, we add it as a paragraph, but we should make sure we don't add empty ones
             // if the text is just a spacer.
-            appendParagraphBlocks(blocks, stats, partTrimmed);
+            appendParagraphBlocks(blocks, stats, partTrimmed, options);
           }
         }
         continue;
@@ -420,7 +454,7 @@ function parseBlockContent(
           }
         } else {
           // Non-empty part -> Parse Content
-          appendParagraphBlocks(blocks, stats, partTrimmed);
+          appendParagraphBlocks(blocks, stats, partTrimmed, options);
         }
       }
     }
@@ -807,13 +841,18 @@ function hasRealContent(inline: NoteAtom[]): boolean {
   return false;
 }
 
-function appendParagraphBlocks(blocks: NoteAtom[], stats: ConvertStats, html: string): void {
+function appendParagraphBlocks(
+  blocks: NoteAtom[],
+  stats: ConvertStats,
+  html: string,
+  options: HtmlToNoteAtomOptions = {}
+): void {
   const inline = normalizeInlineTypography(parseInlineContent(html));
   if (inline.length === 0 || !hasRealContent(inline)) {
     return;
   }
 
-  const paragraphSegments = splitParagraphInlineContent(inline);
+  const paragraphSegments = splitParagraphInlineContent(inline, options);
   for (const content of paragraphSegments) {
     if (!hasRealContent(content)) {
       continue;
@@ -824,12 +863,29 @@ function appendParagraphBlocks(blocks: NoteAtom[], stats: ConvertStats, html: st
   }
 }
 
-function splitParagraphInlineContent(inline: NoteAtom[]): NoteAtom[][] {
+function appendPreservedInlineParagraphBlock(
+  blocks: NoteAtom[],
+  stats: ConvertStats,
+  html: string
+): void {
+  const inline = normalizeInlineTypography(parseInlineContent(html, { preserveLineBreaks: true }));
+  if (inline.length === 0 || !hasRealContent(inline)) {
+    return;
+  }
+
+  blocks.push({ type: 'paragraph', content: inline });
+  stats.paragraph++;
+}
+
+function splitParagraphInlineContent(
+  inline: NoteAtom[],
+  options: HtmlToNoteAtomOptions = {}
+): NoteAtom[][] {
   const text = inline
     .map((node) => (node.type === 'text' ? node.text || '' : ''))
     .join('');
 
-  if (shouldPreserveInlineParagraph(text)) {
+  if (options.preserveInlineParagraphs || shouldPreserveInlineParagraph(text)) {
     return [inline];
   }
 
@@ -999,7 +1055,7 @@ function normalizeInlineTypography(inline: NoteAtom[]): NoteAtom[] {
       }
 
       if (needsHanLatinSpace(previous.text, current.text)) {
-        previous.text = `${previous.text.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_SPACE}`;
+        previous.text = `${previous.text.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_NONBREAKING_GAP}`;
         continue;
       }
 
@@ -1015,11 +1071,18 @@ function normalizeInlineTypography(inline: NoteAtom[]): NoteAtom[] {
 /**
  * Parse inline content with marks (bold, italic, links, etc.)
  */
-function parseInlineContent(html: string): NoteAtom[] {
+function parseInlineContent(
+  html: string,
+  options: { preserveLineBreaks?: boolean } = {}
+): NoteAtom[] {
   const result: NoteAtom[] = [];
+  const { preserveLineBreaks = false } = options;
 
   // Remove placeholders
   html = html.replace(/<!--(?:IMG|QUOTE):\d+-->|@@MOWEN_CODE_BLOCK_\d+@@/g, '');
+  if (preserveLineBreaks) {
+    html = html.replace(/<br\s*\/?>/gi, INLINE_BREAK_SENTINEL);
+  }
 
   // Parse inline elements
   const inlineRegex = /<(strong|b|em|i|mark|a|code|span)(\s[^>]*)?>|<\/(strong|b|em|i|mark|a|code|span)>/gi;
@@ -1032,7 +1095,9 @@ function parseInlineContent(html: string): NoteAtom[] {
   while ((match = inlineRegex.exec(html)) !== null) {
     // Add text before this tag
     if (match.index > lastIndex) {
-      const text = stripHtmlAndDecode(html.slice(lastIndex, match.index));
+      const text = preserveLineBreaks
+        ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex, match.index))
+        : stripHtmlAndDecode(html.slice(lastIndex, match.index));
       if (text) {
         result.push(...createTextNodesWithAutoLinks(text, currentMarks));
       }
@@ -1105,7 +1170,9 @@ function parseInlineContent(html: string): NoteAtom[] {
 
   // Add remaining text
   if (lastIndex < html.length) {
-    const text = stripHtmlAndDecode(html.slice(lastIndex));
+    const text = preserveLineBreaks
+      ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex))
+      : stripHtmlAndDecode(html.slice(lastIndex));
     if (text) {
       result.push(...createTextNodesWithAutoLinks(text, currentMarks));
     }
@@ -1113,7 +1180,9 @@ function parseInlineContent(html: string): NoteAtom[] {
 
   // Fallback: if no content extracted but there's text, do simple strip
   if (result.length === 0) {
-    const plainText = stripHtmlAndDecode(html);
+    const plainText = preserveLineBreaks
+      ? stripHtmlAndDecodePreserveLineBreaks(html)
+      : stripHtmlAndDecode(html);
     if (plainText && plainText.trim()) {
       result.push(...createTextNodesWithAutoLinks(plainText, []));
     }
@@ -1362,6 +1431,17 @@ function stripHtmlAndDecode(html: string): string {
   text = decodeHtmlEntities(text);
   // Normalize whitespace (but preserve single spaces)
   text = text.replace(/[\t\r\n]+/g, ' ').replace(/  +/g, ' ');
+  return text;
+}
+
+function stripHtmlAndDecodePreserveLineBreaks(html: string): string {
+  let text = html.replace(/<[^>]+>/g, '');
+  text = decodeHtmlEntities(text);
+  text = text.split(INLINE_BREAK_SENTINEL).join('\n');
+  text = text.replace(/\r/g, '').replace(/\t/g, ' ');
+  text = text.replace(/[ ]{2,}/g, ' ');
+  text = text.replace(/ *\n */g, '\n');
+  text = text.replace(/\n{3,}/g, '\n\n');
   return text;
 }
 
@@ -1751,7 +1831,7 @@ function normalizeMixedLanguageTextNodes(
         if (isCurrentLinkText && needsMetadataLabelWordJoiner(state.previousTextNode.nodeValue, textNode.nodeValue)) {
           state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_WORD_JOINER}`;
         } else if (needsHanLatinSpace(state.previousTextNode.nodeValue, textNode.nodeValue)) {
-          state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_SPACE}`;
+          state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_NONBREAKING_GAP}`;
         } else if (needsLatinHanWordJoiner(state.previousTextNode.nodeValue, textNode.nodeValue)) {
           state.previousTextNode.nodeValue = `${state.previousTextNode.nodeValue.replace(/[ \t\u00a0\u2060]+$/g, '')}${MIXED_LANGUAGE_NONBREAKING_GAP}`;
         }

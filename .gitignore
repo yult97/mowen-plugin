@@ -72,3 +72,6 @@ release_package/
 
 # Temporary development files
 reproduce_layout.ts
+.omx/
+tmp/noteAtom.bundle.mjs
+tmp/omx-agents-merged.md

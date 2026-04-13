@@ -40,12 +40,19 @@ export interface ExtractResult {
   wordCount: number;
 }
 
+export interface ContentBlockLayout {
+  preserveInlineParagraphs?: boolean;
+  groupId?: string;
+  role?: 'original' | 'translation' | 'spacer' | 'normal';
+}
+
 export interface ContentBlock {
   id: string;
   type: 'heading' | 'paragraph' | 'list' | 'quote' | 'code' | 'image' | 'other';
   html: string;
   text: string;
   level?: number; // for headings
+  layout?: ContentBlockLayout;
 }
 
 export interface ImageCandidate {

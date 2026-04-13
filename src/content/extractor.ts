@@ -6,7 +6,7 @@
  */
 
 import { Readability } from '@mozilla/readability';
-import { ExtractResult, ContentBlock } from '../types';
+import { ExtractResult, ContentBlock, ImageCandidate } from '../types';
 import { generateId, isWeixinArticle, getDomain, stripHtml, isValidPageTitle, extractTitleFromText } from '../utils/helpers';
 import { extractImages, removeLinkedBadgeImages } from './images';
 import { normalizeImageUrl } from './imageNormalizer';
@@ -488,6 +488,79 @@ function sanitizeWeixinImageUrl(url: string | null | undefined): string {
         .replace(/^http:\/\//i, 'https://');
 }
 
+function isWeiboPage(url: string): boolean {
+    try {
+        const hostname = new URL(url).hostname.toLowerCase();
+        return hostname === 'weibo.com'
+            || hostname.endsWith('.weibo.com')
+            || hostname === 'weibo.cn'
+            || hostname.endsWith('.weibo.cn');
+    } catch {
+        return false;
+    }
+}
+
+function isLikelyWeiboContentImage(image: ImageCandidate): boolean {
+    try {
+        const hostname = new URL(image.normalizedUrl || image.url).hostname.toLowerCase();
+        if (!/(^|\.)sinaimg\.cn$/i.test(hostname)) {
+            return false;
+        }
+
+        if (!/^(wx|ww)\d*\./i.test(hostname)) {
+            return false;
+        }
+    } catch {
+        return false;
+    }
+
+    const width = image.width || 0;
+    const height = image.height || 0;
+    if ((width > 0 && width < 80) || (height > 0 && height < 80)) {
+        return false;
+    }
+
+    return !/default_w_|default_.*\.gif/i.test(image.normalizedUrl || image.url);
+}
+
+function escapeHtmlAttribute(value: string): string {
+    return value.replace(/[&<>"']/g, (char) => (
+        char === '&' ? '&amp;' :
+            char === '<' ? '&lt;' :
+                char === '>' ? '&gt;' :
+                    char === '"' ? '&quot;' : '&#39;'
+    ));
+}
+
+function supplementWeiboImages(contentHtml: string, url: string): string {
+    if (!isWeiboPage(url)) {
+        return contentHtml;
+    }
+
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = contentHtml;
+    const existingUrls = collectNormalizedImageUrls(tempDiv);
+
+    const pageImages = extractImages(document.body).filter(isLikelyWeiboContentImage);
+    const missingImages = pageImages.filter((image) => !existingUrls.has(image.normalizedUrl));
+
+    if (missingImages.length === 0) {
+        return contentHtml;
+    }
+
+    console.log(`[extractor] 🖼️ Weibo supplement: found ${pageImages.length} page images, injecting ${missingImages.length}`);
+
+    const injectedHtml = missingImages
+        .map((image) => {
+            const src = escapeHtmlAttribute(image.url);
+            const alt = escapeHtmlAttribute(image.alt || '');
+            return `<figure class="weibo-inline-image"><img src="${src}" alt="${alt}" /></figure>`;
+        })
+        .join('');
+
+    return `${contentHtml}${injectedHtml}`;
+}
+
 /**
  * General article extraction using Mozilla Readability library with adapter layer.
  * 包含完整的适配逻辑：DOM预处理 -> Readability解析 -> 失败验证 -> 格式规范化 -> 转换
@@ -626,6 +699,8 @@ export function extractWithReadability(url: string, domain: string): ExtractResu
         }
     }
 
+    contentHtml = supplementWeiboImages(contentHtml, url);
+
     // 5.6 【新增】移除正文中的重复标题
     // 某些网站（如纽约时报中文网）的 <h1> 标题位于 <article> 内部，
     // 导致 Readability 将其作为正文一部分提取，与 title 字段重复。
@@ -701,11 +776,12 @@ function extractWithFallback(url: string, domain: string): ExtractResult {
         imageEl = article.imageElement || article.contentElement || document.body;
     }
 
-    const images = extractImages(imageEl);
     const tempDiv = document.createElement('div');
-    tempDiv.innerHTML = contentHtml;
+    tempDiv.innerHTML = supplementWeiboImages(contentHtml, url);
     const blocks = parseBlocks(tempDiv);
-    const wordCount = stripHtml(contentHtml).length;
+    const finalContentHtml = tempDiv.innerHTML;
+    const images = isWeiboPage(url) ? extractImages(tempDiv) : extractImages(imageEl);
+    const wordCount = stripHtml(finalContentHtml).length;
 
     return {
         title,
@@ -713,7 +789,7 @@ function extractWithFallback(url: string, domain: string): ExtractResult {
         domain,
         author: article.author,
         publishTime: article.publishTime,
-        contentHtml,
+        contentHtml: finalContentHtml,
         blocks,
         images,
         wordCount,

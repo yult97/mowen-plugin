@@ -15,7 +15,7 @@ const SCRIPT_CHARACTER_REGEX = /[\u4e00-\u9fffA-Za-z]/;
 const HAN_CHARACTER_REGEX = /[\u4e00-\u9fff]/;
 const HAN_CHARACTER_MATCH_REGEX = /[\u4e00-\u9fff]/g;
 const LATIN_WORD_REGEX = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
-const BOUNDARY_FILLER_REGEX = /^[\s\u00a0,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+$/;
+const BOUNDARY_FILLER_REGEX = /^[\s\u00a0\u2060,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+$/;
 const LATIN_TAIL_REGEX = /[A-Za-z0-9.,!?;:)\]'"“”‘’_-]$/;
 const LATIN_HEAD_REGEX = /^[A-Za-z]/;
 const HAN_TAIL_REGEX = /[\u4e00-\u9fff]$/;
@@ -40,13 +40,13 @@ function countLatinWords(text: string): number {
 
 function trimMixedLanguageBoundary(text: string): string {
   return text
-    .replace(/^[\s\u00a0,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+/, '')
+    .replace(/^[\s\u00a0\u2060,，.。!！?？;；:：、\-–—>→()（）[\]【】"“”'‘’/]+/, '')
     .trim();
 }
 
 function trimMixedLanguageBoundaryTail(text: string): string {
   return text
-    .replace(/[\s\u00a0,，.。!！?？;；、\-–—>→()（）[\]【】"“”'‘’/]+$/, '')
+    .replace(/[\s\u00a0\u2060,，.。!！?？;；、\-–—>→()（）[\]【】"“”'‘’/]+$/, '')
     .trim();
 }
 
@@ -123,10 +123,10 @@ function isShortStandalonePrefix(prefix: string, script: 'han' | 'latin'): boole
 
   if (script === 'han') {
     const hanCount = countHanCharacters(normalized);
-    return hanCount >= 2 && hanCount <= 10;
+    return hanCount >= 2 && hanCount <= 10 && countLatinWords(normalized) === 0;
   }
 
-  return countLatinWords(normalized) >= 2;
+  return countLatinWords(normalized) >= 2 && countHanCharacters(normalized) === 0;
 }
 
 function findMixedLanguageSplitIndex(text: string): number {
@@ -165,7 +165,12 @@ function findMixedLanguageSplitIndex(text: string): number {
       }
     } else if (leftIsLatin && rightIsHan && startsWithLongHanPhrase(suffix)) {
       if (countLatinWords(prefix) >= 3) {
-        return splitIndex;
+        // 确保英文前缀包含空格分隔的多个独立词，
+        // 避免把连字符连接的单一标识符（如 "tmux-cli-driver"）误判为长英文短语
+        const trimmedPrefix = trimMixedLanguageBoundaryTail(prefix);
+        if (/[A-Za-z0-9]\s+[A-Za-z]/.test(trimmedPrefix)) {
+          return splitIndex;
+        }
       }
 
       if (isShortStandalonePrefix(prefix, 'latin')) {
@@ -205,20 +210,20 @@ export function findMixedLanguageSplitBoundaries(text: string): number[] {
 }
 
 /**
- * Normalize mixed Chinese/English spacing while keeping the Chinese token that
- * follows a Latin token on the same line.
+ * Normalize mixed Chinese/English spacing while keeping both sides of a
+ * mixed-script boundary on the same line.
  *
  * Rules:
- * - Han + Latin => insert one visible space
+ * - Han + Latin => insert one visible space plus a word joiner
  * - Latin + Han => insert one visible space plus a word joiner
  *
  * Examples:
  * - "渲染markdown文件" -> "渲染 markdown 文件"
- * - "Obsidian查看" -> "Obsidian 查看" (with a hidden no-break joiner after the space)
+ * - "在Claude Code中" -> "在 Claude Code 中" (with hidden no-break joiners)
  */
 export function stabilizeLatinHanLineBreaks(text: string): string {
   return text
-    .replace(HAN_TO_LATIN_BOUNDARY_REGEX, MIXED_LANGUAGE_SPACE)
+    .replace(HAN_TO_LATIN_BOUNDARY_REGEX, MIXED_LANGUAGE_NONBREAKING_GAP)
     .replace(LATIN_TO_HAN_BOUNDARY_REGEX, MIXED_LANGUAGE_NONBREAKING_GAP);
 }
 

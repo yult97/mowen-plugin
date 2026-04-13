@@ -3,6 +3,8 @@ import { formatDate, formatErrorForLog, parseErrorCode } from '../utils/helpers'
 import { htmlToNoteAtom } from '../utils/noteAtom';
 
 const API_BASE_URL = 'https://open.mowen.cn/api/open/api/v1';
+const WEIBO_IMAGE_REFERER = 'https://weibo.com/';
+const WEIBO_IMAGE_RULE_ID = 94021;
 
 // Rate limiting: 1000ms between upload API calls (per official docs: 1 req/sec)
 const UPLOAD_RATE_LIMIT_MS = 1000;
@@ -672,6 +674,136 @@ async function waitForRateLimit(): Promise<void> {
   lastUploadApiTime = Date.now();
 }
 
+function isWeiboImageUrl(imageUrl: string): boolean {
+  try {
+    const parsed = new URL(imageUrl);
+    return /(^|\.)sinaimg\.cn$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function buildWeiboImageCandidates(imageUrl: string): string[] {
+  try {
+    const parsed = new URL(imageUrl);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments.length < 2) {
+      return [imageUrl];
+    }
+
+    const currentSize = segments[0];
+    const fileName = segments.slice(1).join('/');
+    const highPrioritySizes = ['large', 'mw2000', 'orj1080', 'mw1024', 'mw690'];
+    const lowPrioritySizes = ['orj480', 'orj360', 'bmiddle', 'thumbnail'];
+    const orderedSizes = Array.from(new Set([
+      ...highPrioritySizes,
+      currentSize,
+      ...lowPrioritySizes,
+    ]));
+
+    const candidates = orderedSizes.map((size) => {
+      const nextUrl = new URL(parsed.href);
+      nextUrl.pathname = `/${size}/${fileName}`;
+      return nextUrl.href;
+    });
+
+    return Array.from(new Set(candidates));
+  } catch {
+    return [imageUrl];
+  }
+}
+
+function isWeiboPlaceholderUrl(url: string): boolean {
+  return /\/images\/default_[^/]+\.(gif|png|jpe?g)(?:[#?].*)?$/i.test(url)
+    || /default_w_/i.test(url);
+}
+
+/**
+ * 微博图片 CDN（sinaimg.cn）会校验 Referer。
+ * 扩展后台请求默认没有有效微博来源，因此需要临时为这一次抓图请求补上 Referer。
+ */
+async function withTemporaryWeiboRefererRule<T>(work: () => Promise<T>): Promise<T> {
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [WEIBO_IMAGE_RULE_ID],
+    addRules: [{
+      id: WEIBO_IMAGE_RULE_ID,
+      priority: 1,
+      action: {
+        type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
+        requestHeaders: [{
+          header: 'referer',
+          operation: chrome.declarativeNetRequest.HeaderOperation.SET,
+          value: WEIBO_IMAGE_REFERER,
+        }],
+      },
+      condition: {
+        requestDomains: ['sinaimg.cn'],
+        requestMethods: [chrome.declarativeNetRequest.RequestMethod.GET],
+      },
+    }],
+  });
+
+  try {
+    return await work();
+  } finally {
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [WEIBO_IMAGE_RULE_ID],
+      });
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.warn(`[img] weibo rule cleanup fail: ${errMsg}`);
+    }
+  }
+}
+
+/**
+ * 微博图片需要带微博 Referer 才能稳定返回真实图片。
+ * 这里在 Service Worker 中临时加 Referer，再直接拉取 blob。
+ */
+async function fetchWeiboImageWithReferer(imageUrl: string): Promise<Blob | null> {
+  const candidates = buildWeiboImageCandidates(imageUrl);
+  console.log(`[img] weibo fetch with referer: ${imageUrl.substring(0, 60)}..., candidates=${candidates.length}`);
+
+  try {
+    return await withTemporaryWeiboRefererRule(async () => {
+      for (const candidateUrl of candidates) {
+        const response = await fetch(candidateUrl, {
+          method: 'GET',
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: {
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+          },
+        });
+
+        if (!response.ok) {
+          console.log(`[img] weibo candidate fail: status=${response.status}, url=${candidateUrl.substring(0, 80)}...`);
+          continue;
+        }
+
+        if (isWeiboPlaceholderUrl(response.url)) {
+          console.log(`[img] weibo candidate placeholder: finalUrl=${response.url}`);
+          continue;
+        }
+
+        const blob = await response.blob();
+        if (blob.size > 0) {
+          console.log(`[img] weibo fetch ok: size=${blob.size}, type=${blob.type}, url=${candidateUrl.substring(0, 80)}...`);
+          return blob;
+        }
+      }
+
+      console.log('[img] weibo fetch returned no valid candidate');
+      return null;
+    });
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : 'Unknown error';
+    console.log(`[img] weibo fetch exception: ${errMsg}`);
+    return null;
+  }
+}
+
 /**
  * Fetch WeChat image using no-referrer policy to bypass anti-hotlinking
  * This works in Service Worker context where we can control the referrer policy
@@ -1059,6 +1191,57 @@ export async function uploadImageWithFallback(
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : 'Unknown error';
       console.log(`[img] idx=${imageIndex} weixin no-referrer exception: ${errMsg}`);
+    }
+  }
+
+  const isWeiboImage = isWeiboImageUrl(imageUrl);
+  if (isWeiboImage && !imageUrl.startsWith('data:') && !imageUrl.startsWith('blob:')) {
+    console.log(`[img] idx=${imageIndex} weibo referer fetch start`);
+    try {
+      const weiboBlob = await fetchWeiboImageWithReferer(imageUrl);
+      if (weiboBlob && weiboBlob.size > 0) {
+        console.log(`[img] idx=${imageIndex} weibo referer fetch ok, size=${weiboBlob.size}`);
+
+        const MAX_LOCAL_SIZE = 50 * 1024 * 1024;
+        if (weiboBlob.size > MAX_LOCAL_SIZE) {
+          console.log(`[img] idx=${imageIndex} weibo skip: size ${weiboBlob.size} exceeds 50MB`);
+        } else {
+          const fileName = generateFileName(imageUrl, weiboBlob.type);
+          await waitForRateLimit();
+          const prepareResult = await uploadPrepare(apiKey, fileName);
+
+          if (prepareResult.success && prepareResult.endpoint && prepareResult.form) {
+            const deliverResult = await uploadLocalFile(
+              prepareResult.endpoint,
+              prepareResult.form,
+              weiboBlob,
+              fileName
+            );
+
+            if (deliverResult.success) {
+              const uploadedFile = deliverResult.uploadedFile;
+              const uuid = uploadedFile?.fileId || uploadedFile?.uid;
+              console.log(`[img] idx=${imageIndex} weibo upload success uuid=${uuid}`);
+              return {
+                success: true,
+                uploadMethod: 'local',
+                uuid: uuid,
+                url: uploadedFile?.url,
+                fileId: uploadedFile?.fileId,
+                uid: uploadedFile?.uid,
+              };
+            }
+            console.log(`[img] idx=${imageIndex} weibo deliver fail: ${deliverResult.error}`);
+          } else {
+            console.log(`[img] idx=${imageIndex} weibo prepare fail: ${prepareResult.error}`);
+          }
+        }
+      } else {
+        console.log(`[img] idx=${imageIndex} weibo referer fetch returned empty`);
+      }
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.log(`[img] idx=${imageIndex} weibo referer fetch exception: ${errMsg}`);
     }
   }
 
