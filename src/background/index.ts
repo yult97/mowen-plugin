@@ -1,6 +1,8 @@
 console.log('[墨问 Background] 🏁 Service Worker Script Loaded');
 import {
+  ClipKind,
   ContentBlock,
+  CreateNoteRequest,
   ExtractResult,
   ImageCandidate,
   ImageProcessResult,
@@ -40,6 +42,7 @@ import {
   createSplitNotes,
   prepareContentForSave,
 } from './saveNoteFlow';
+import { planTwitterSaveRequests } from './twitterSavePlan';
 
 const SAFE_LIMIT = LIMITS.SAFE_CONTENT_LENGTH;
 const MAX_RETRY_ROUNDS = LIMITS.MAX_RETRY_ROUNDS;
@@ -67,15 +70,6 @@ interface NoteAtomDoc {
 interface NoteBlockEntry {
   node: NoteAtomNode;
   groupId?: string;
-}
-
-interface NoteSplitPart {
-  index: number;
-  total: number;
-  title: string;
-  content?: string;
-  body?: NoteAtomDoc;
-  isIndex?: boolean;
 }
 
 registerSidePanelHandlers({ formatErrorForLog });
@@ -447,15 +441,27 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       return finalizeSaveTask(tabId, taskId, { success: false, error: '已取消保存', errorCode: 'CANCELLED' }, formatErrorForLog, { clearTask: true });
     }
 
-    const parts = splitContent(
-      extractResult.title,
-      extractResult.sourceUrl,
-      processedContent,
-      SAFE_LIMIT,
-      processedBlocks
-    );
+    const clipKind = resolveClipKind(extractResult);
+    const normalizedTitle = extractResult.title;
 
-    console.log(`[note] create start title="${extractResult.title.substring(0, 30)}..." partsCount=${parts.length}`);
+    const parts = clipKind === 'twitter-post' || clipKind === 'x-longform'
+      ? planTwitterSaveRequests({
+        clipKind,
+        title: normalizedTitle,
+        sourceUrl: extractResult.sourceUrl,
+        content: processedContent,
+        limit: SAFE_LIMIT,
+        blocks: processedBlocks,
+      })
+      : splitContent(
+        normalizedTitle,
+        extractResult.sourceUrl,
+        processedContent,
+        SAFE_LIMIT,
+        processedBlocks
+      );
+
+    console.log(`[note] create start title="${normalizedTitle.substring(0, 30)}..." partsCount=${parts.length}`);
     logToContentScript(`创建 ${parts.length} 篇笔记...`, tabId);
     let createdNotes = await createSplitNotes({
       parts,
@@ -486,7 +492,7 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       createIndexNote,
       parts,
       createdNotes,
-      title: extractResult.title,
+      title: normalizedTitle,
       sourceUrl: extractResult.sourceUrl,
       apiKey: settings.apiKey,
       isPublic,
@@ -796,454 +802,23 @@ function isTwitterSourceUrl(sourceUrl: string): boolean {
   return /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\//i.test(sourceUrl);
 }
 
-function countNoteTextHanCharacters(text: string): number {
-  return (text.match(/[\u4e00-\u9fff]/g) || []).length;
-}
-
-function countNoteTextLatinWords(text: string): number {
-  return (text.match(/[A-Za-z]+(?:['’][A-Za-z]+)*/g) || []).length;
-}
-
-function getNoteBlockLanguageKind(text: string): 'english' | 'chinese' | 'other' {
-  const normalized = text.trim();
-  if (!normalized) {
-    return 'other';
+function resolveClipKind(extractResult: ExtractResult): ClipKind {
+  if (!isTwitterSourceUrl(extractResult.sourceUrl)) {
+    return 'default';
   }
 
-  const hanCount = countNoteTextHanCharacters(normalized);
-  const latinWordCount = countNoteTextLatinWords(normalized);
-
-  if (hanCount >= 2 && (latinWordCount === 0 || hanCount >= latinWordCount || hanCount >= 6)) {
-    return 'chinese';
+  if (extractResult.clipKind === 'twitter-post' || extractResult.clipKind === 'x-longform') {
+    return extractResult.clipKind;
   }
 
-  if (
-    latinWordCount >= 2 &&
-    (hanCount === 0 || (hanCount <= 2 && /^[^\u4e00-\u9fff]*[A-Za-z]/.test(normalized)))
-  ) {
-    return 'english';
-  }
-
-  return 'other';
-}
-
-function isTwitterMetadataText(text: string): boolean {
-  const normalized = text.trim();
-  return /^([📄🔗]\s*)?(来源：|引用文章：)/.test(normalized);
-}
-
-function isRebalanceCandidateEntry(entry: NoteBlockEntry): boolean {
-  const text = getNodeText(entry.node).trim();
-  return (
-    entry.node.type === 'paragraph' &&
-    !isTwitterMetadataText(text) &&
-    text.length > 0
-  );
-}
-
-function buildTwitterBilingualEntryPairs(
-  primaryRun: NoteBlockEntry[],
-  secondaryRun: NoteBlockEntry[]
-): NoteBlockEntry[] {
-  const result: NoteBlockEntry[] = [];
-  const total = Math.max(primaryRun.length, secondaryRun.length);
-
-  for (let index = 0; index < total; index++) {
-    const primary = primaryRun[index];
-    const secondary = secondaryRun[index];
-
-    if (primary) {
-      result.push(cloneNoteBlockEntry(primary));
-    }
-
-    if (secondary) {
-      result.push(cloneNoteBlockEntry(secondary));
-    }
-
-    if (index < total - 1) {
-      result.push({
-        node: {
-          type: 'paragraph',
-          content: [],
-        },
-      });
-    }
-  }
-
-  return result;
-}
-
-function isStrongParagraphBoundaryText(text: string): boolean {
-  const normalized = text.trim();
-  if (!normalized) {
-    return false;
-  }
-
-  return (
-    /[。！？!?；;：:]$/.test(normalized) ||
-    /^([→➜•\-–—*]|\d+\.)\s*/.test(normalized)
-  );
-}
-
-function getMergedEntryJoiner(leftText: string, rightText: string): string {
-  const leftTrimmed = leftText.trimEnd();
-  const rightTrimmed = rightText.trimStart();
-  if (!leftTrimmed || !rightTrimmed) {
-    return '';
-  }
-
-  if (isStrongParagraphBoundaryText(leftTrimmed) || /^([→➜•\-–—*]|\d+\.)\s*/.test(rightTrimmed)) {
-    return '\n';
-  }
-
-  const leftLast = leftTrimmed[leftTrimmed.length - 1];
-  const rightFirst = rightTrimmed[0];
-  const leftIsAsciiWord = /[A-Za-z0-9]/.test(leftLast);
-  const rightIsAsciiWord = /[A-Za-z0-9]/.test(rightFirst);
-  const leftIsHan = /[\u4e00-\u9fff]/.test(leftLast);
-  const rightIsHan = /[\u4e00-\u9fff]/.test(rightFirst);
-
-  if ((leftIsAsciiWord && rightIsAsciiWord) || (leftIsAsciiWord && rightIsHan) || (leftIsHan && rightIsAsciiWord)) {
-    return ' ';
-  }
-
-  return '';
-}
-
-function mergeNoteBlockEntries(entries: NoteBlockEntry[]): NoteBlockEntry {
-  if (entries.length === 0) {
-    return {
-      node: {
-        type: 'paragraph',
-        content: [],
-      },
-    };
-  }
-
-  if (entries.length === 1) {
-    return cloneNoteBlockEntry(entries[0]);
-  }
-
-  const firstEntry = entries[0];
-  const firstNodeType = firstEntry.node.type;
-  const canMergeAsStructuredNode = entries.every((entry) =>
-    entry.node.type === firstNodeType &&
-    (entry.node.type === 'paragraph' || entry.node.type === 'quote') &&
-    Array.isArray(entry.node.content)
-  );
-
-  const mergedGroupId = firstEntry.groupId;
-  const textParts = entries.map((entry) => getNodeText(entry.node).trim()).filter(Boolean);
-
-  if (!canMergeAsStructuredNode) {
-    const mergedText = textParts.reduce((acc, text, index) => {
-      if (index === 0) {
-        return text;
-      }
-      return `${acc}${getMergedEntryJoiner(textParts[index - 1], text)}${text}`;
-    }, '');
-
-    return {
-      node: {
-        type: firstNodeType,
-        content: [{ type: 'text', text: mergedText }],
-      },
-      groupId: mergedGroupId,
-    };
-  }
-
-  const mergedContent: NoteAtomNode[] = [];
-  let previousText = '';
-
-  for (const entry of entries) {
-    const currentText = getNodeText(entry.node).trim();
-    if (!currentText) {
-      continue;
-    }
-
-    if (mergedContent.length > 0) {
-      const joiner = getMergedEntryJoiner(previousText, currentText);
-      if (joiner) {
-        mergedContent.push({ type: 'text', text: joiner });
-      }
-    }
-
-    mergedContent.push(...(entry.node.content || []).map((node) => cloneNoteAtomNode(node)));
-    previousText = currentText;
-  }
-
-  return {
-    node: {
-      ...cloneNoteAtomNode(firstEntry.node),
-      content: mergedContent,
-      text: undefined,
-    },
-    groupId: mergedGroupId,
-  };
-}
-
-function getEntryTextLengths(entries: NoteBlockEntry[]): number[] {
-  return entries.map((entry) => Math.max(getEntryTextLength(entry), 1));
-}
-
-function countStrongMergeBoundaries(entries: NoteBlockEntry[], start: number, end: number): number {
-  let count = 0;
-
-  for (let index = start + 1; index < end; index++) {
-    const previousText = getNodeText(entries[index - 1].node).trim();
-    const currentText = getNodeText(entries[index].node).trim();
-    if (!previousText || !currentText) {
-      continue;
-    }
-
-    if (isStrongParagraphBoundaryText(previousText) || /^([→➜•\-–—*]|\d+\.)\s*/.test(currentText)) {
-      count += 1;
-    }
-  }
-
-  return count;
-}
-
-function alignLongerRunToReference(
-  longerRun: NoteBlockEntry[],
-  referenceRun: NoteBlockEntry[]
-): NoteBlockEntry[] {
-  if (longerRun.length <= referenceRun.length) {
-    return longerRun.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const targetGroups = referenceRun.length;
-  const sourceLength = longerRun.length;
-  const longerLengths = getEntryTextLengths(longerRun);
-  const referenceLengths = getEntryTextLengths(referenceRun);
-  const longerPrefix = [0];
-  const referencePrefix = [0];
-
-  for (const length of longerLengths) {
-    longerPrefix.push(longerPrefix[longerPrefix.length - 1] + length);
-  }
-  for (const length of referenceLengths) {
-    referencePrefix.push(referencePrefix[referencePrefix.length - 1] + length);
-  }
-
-  const longerTotal = longerPrefix[longerPrefix.length - 1] || 1;
-  const referenceTotal = referencePrefix[referencePrefix.length - 1] || 1;
-  const dp: number[][] = Array.from({ length: sourceLength + 1 }, () => Array(targetGroups + 1).fill(Number.POSITIVE_INFINITY));
-  const prev: number[][] = Array.from({ length: sourceLength + 1 }, () => Array(targetGroups + 1).fill(-1));
-  dp[0][0] = 0;
-
-  for (let groupIndex = 1; groupIndex <= targetGroups; groupIndex++) {
-    for (let sourceIndex = groupIndex; sourceIndex <= sourceLength - (targetGroups - groupIndex); sourceIndex++) {
-      for (let previousIndex = groupIndex - 1; previousIndex < sourceIndex; previousIndex++) {
-        if (!Number.isFinite(dp[previousIndex][groupIndex - 1])) {
-          continue;
-        }
-
-        const sourceRatio = longerPrefix[sourceIndex] / longerTotal;
-        const referenceRatio = referencePrefix[groupIndex] / referenceTotal;
-        const boundaryError = Math.abs(sourceRatio - referenceRatio) * 100;
-        const groupLength = longerPrefix[sourceIndex] - longerPrefix[previousIndex];
-        const referenceGroupLength = referenceLengths[groupIndex - 1];
-        const groupLengthError = Math.abs(groupLength / longerTotal - referenceGroupLength / referenceTotal) * 180;
-        const mergePenalty = Math.max(0, sourceIndex - previousIndex - 1) * 8;
-        const strongBoundaryPenalty = countStrongMergeBoundaries(longerRun, previousIndex, sourceIndex) * 25;
-        const cost =
-          dp[previousIndex][groupIndex - 1] +
-          boundaryError +
-          groupLengthError +
-          mergePenalty +
-          strongBoundaryPenalty;
-
-        if (cost < dp[sourceIndex][groupIndex]) {
-          dp[sourceIndex][groupIndex] = cost;
-          prev[sourceIndex][groupIndex] = previousIndex;
-        }
-      }
-    }
-  }
-
-  if (!Number.isFinite(dp[sourceLength][targetGroups])) {
-    return longerRun.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const groups: Array<{ start: number; end: number }> = [];
-  let sourceIndex = sourceLength;
-  let groupIndex = targetGroups;
-
-  while (groupIndex > 0) {
-    const previousIndex = prev[sourceIndex][groupIndex];
-    if (previousIndex < 0) {
-      return longerRun.map((entry) => cloneNoteBlockEntry(entry));
-    }
-    groups.unshift({ start: previousIndex, end: sourceIndex });
-    sourceIndex = previousIndex;
-    groupIndex -= 1;
-  }
-
-  return groups.map(({ start, end }) => mergeNoteBlockEntries(longerRun.slice(start, end)));
-}
-
-function rebalanceTwitterBilingualRun(entries: NoteBlockEntry[]): NoteBlockEntry[] {
-  const candidates = entries.filter(isRebalanceCandidateEntry);
-  if (candidates.length < 6) {
-    return entries.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const languageRuns = candidates.reduce<Array<{
-    language: 'english' | 'chinese' | 'other';
-    entries: NoteBlockEntry[];
-  }>>((runs, entry) => {
-    const language = getNoteBlockLanguageKind(getNodeText(entry.node));
-    const lastRun = runs[runs.length - 1];
-
-    if (!lastRun || lastRun.language !== language) {
-      runs.push({
-        language,
-        entries: [entry],
-      });
-      return runs;
-    }
-
-    lastRun.entries.push(entry);
-    return runs;
-  }, []);
-
-  if (languageRuns.length !== 2) {
-    return entries.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const [firstRun, secondRun] = languageRuns;
-  if (
-    firstRun.language === 'other' ||
-    secondRun.language === 'other' ||
-    firstRun.language === secondRun.language
-  ) {
-    return entries.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const firstCount = firstRun.entries.length;
-  const secondCount = secondRun.entries.length;
-  const ratio = Math.min(firstCount, secondCount) / Math.max(firstCount, secondCount);
-  if (ratio < 0.5) {
-    return entries.map((entry) => cloneNoteBlockEntry(entry));
-  }
-
-  const englishFirst = firstRun.language === 'english'
-    ? true
-    : secondRun.language === 'english'
-      ? false
-      : true;
-  const primaryRun = englishFirst ? firstRun.entries : secondRun.entries;
-  const secondaryRun = englishFirst ? secondRun.entries : firstRun.entries;
-  const alignedPrimaryRun = primaryRun.length > secondaryRun.length
-    ? alignLongerRunToReference(primaryRun, secondaryRun)
-    : primaryRun.map((entry) => cloneNoteBlockEntry(entry));
-  const alignedSecondaryRun = secondaryRun.length > primaryRun.length
-    ? alignLongerRunToReference(secondaryRun, primaryRun)
-    : secondaryRun.map((entry) => cloneNoteBlockEntry(entry));
-
-  console.log(
-    `[bg] Rebalancing Twitter bilingual note blocks: ${firstRun.language}/${secondRun.language}, counts=${firstCount}/${secondCount}`
-  );
-
-  return buildTwitterBilingualEntryPairs(alignedPrimaryRun, alignedSecondaryRun);
-}
-
-function rebalanceTwitterBilingualEntries(entries: NoteBlockEntry[]): NoteBlockEntry[] {
-  const result: NoteBlockEntry[] = [];
-  let currentRun: NoteBlockEntry[] = [];
-
-  const flushRun = () => {
-    if (currentRun.length === 0) {
-      return;
-    }
-    result.push(...rebalanceTwitterBilingualRun(currentRun));
-    currentRun = [];
-  };
-
-  for (const entry of entries) {
-    const entryText = getNodeText(entry.node).trim();
-    if (
-      entry.node.type === 'image' ||
-      entry.node.type === 'codeblock' ||
-      entry.node.type === 'note' ||
-      entry.node.type === 'file' ||
-      entry.node.type === 'quote' ||
-      isTwitterMetadataText(entryText)
-    ) {
-      flushRun();
-      result.push(cloneNoteBlockEntry(entry));
-      continue;
-    }
-
-    currentRun.push(entry);
-  }
-
-  flushRun();
-  return result;
-}
-
-function shouldSkipLeadingTitleDedup(blocks?: ContentBlock[]): boolean {
-  return Boolean(blocks?.some((block) => block.layout?.preserveInlineParagraphs));
-}
-
-function unwrapParagraphHtml(html: string): string {
-  const trimmed = html.trim();
-  const match = trimmed.match(/^<p\b[^>]*>([\s\S]*)<\/p>$/i);
-  return match ? match[1] : trimmed;
-}
-
-function isXArticleBilingualPair(
-  current: ContentBlock | undefined,
-  next: ContentBlock | undefined
-): boolean {
-  if (!current || !next) {
-    return false;
-  }
-
-  return (
-    current.type === 'paragraph' &&
-    next.type === 'paragraph' &&
-    current.layout?.preserveInlineParagraphs === true &&
-    next.layout?.preserveInlineParagraphs === true &&
-    Boolean(current.layout?.groupId) &&
-    current.layout?.groupId === next.layout?.groupId &&
-    current.layout?.role === 'original' &&
-    next.layout?.role === 'translation'
-  );
-}
-
-function mergeXArticleBilingualParagraphBlock(
-  original: ContentBlock,
-  translation: ContentBlock
-): ContentBlock {
-  const mergedHtml = `<p data-mowen-preserve-inline-paragraph="1">${unwrapParagraphHtml(original.html)}<br>${unwrapParagraphHtml(translation.html)}</p>`;
-  const mergedText = [original.text.trim(), translation.text.trim()]
-    .filter(Boolean)
-    .join('\n');
-
-  return {
-    ...original,
-    html: mergedHtml,
-    text: mergedText,
-    layout: {
-      ...original.layout,
-      role: 'normal',
-    },
-  };
+  return 'twitter-post';
 }
 
 function convertExtractBlocksToNoteBlocks(blocks: ContentBlock[]): NoteBlockEntry[] {
   const noteBlocks: NoteBlockEntry[] = [];
 
   for (let index = 0; index < blocks.length; index++) {
-    let block = blocks[index];
-    const nextBlock = blocks[index + 1];
-
-    if (isXArticleBilingualPair(block, nextBlock)) {
-      block = mergeXArticleBilingualParagraphBlock(block, nextBlock!);
-      index += 1;
-    }
+    const block = blocks[index];
 
     if (block.layout?.preserveInlineParagraphs === true && block.layout?.role === 'spacer') {
       noteBlocks.push({
@@ -1526,7 +1101,13 @@ function groupEntriesByLimit(entries: NoteBlockEntry[], limit: number): NoteBloc
   return groupedEntries;
 }
 
-function splitContent(title: string, sourceUrl: string, content: string, limit: number, blocks?: ContentBlock[]): NoteSplitPart[] {
+function splitContent(
+  title: string,
+  sourceUrl: string,
+  content: string,
+  limit: number,
+  blocks?: ContentBlock[]
+): CreateNoteRequest[] {
   const convertedBlockEntries = blocks && blocks.length > 0
     ? convertExtractBlocksToNoteBlocks(blocks)
     : null;
@@ -1535,44 +1116,52 @@ function splitContent(title: string, sourceUrl: string, content: string, limit: 
     : (htmlToNoteAtom(content) as unknown as NoteAtomDoc);
   const rawContentBlocks = Array.isArray(contentBody.content) ? contentBody.content : [];
   const contentEntries = convertedBlockEntries
-    ? (shouldSkipLeadingTitleDedup(blocks)
-      ? convertedBlockEntries.map((entry) => cloneNoteBlockEntry(entry))
-      : removeLeadingDuplicateTitleBlocks(convertedBlockEntries, title))
+    ? removeLeadingDuplicateTitleBlocks(convertedBlockEntries, title)
     : rawContentBlocks.map((block) => ({ node: cloneNoteAtomNode(block) }));
-  const normalizedContentEntries = isTwitterSourceUrl(sourceUrl)
-    ? rebalanceTwitterBilingualEntries(contentEntries)
-    : contentEntries;
-  const totalTextLength = normalizedContentEntries.reduce((sum, entry) => sum + getEntryTextLength(entry), 0);
+  const totalTextLength = contentEntries.reduce((sum, entry) => sum + getEntryTextLength(entry), 0);
 
   if (totalTextLength <= limit) {
+    if (blocks && blocks.length > 0) {
+      return [{
+        createMode: 'body',
+        index: 0,
+        total: 1,
+        title,
+        body: buildMultipartBody(title, sourceUrl, contentEntries.map((entry) => entry.node)),
+      }];
+    }
+
     return [{
+      createMode: 'html',
       index: 0,
-      title,
-      ...(blocks && blocks.length > 0
-        ? { body: buildMultipartBody(title, sourceUrl, normalizedContentEntries.map((entry) => entry.node)) }
-        : { content }),
       total: 1,
+      title,
+      content,
+      sourceUrl,
     }];
   }
 
   console.log(`[bg] Text length ${totalTextLength} > ${limit}, splitting by NoteAtom blocks...`);
 
-  const normalizedEntries = normalizedContentEntries.flatMap((entry) => splitOversizedEntry(entry, limit));
+  const normalizedEntries = contentEntries.flatMap((entry) => splitOversizedEntry(entry, limit));
   const groupedBlocks = groupEntriesByLimit(normalizedEntries, limit);
 
   const total = groupedBlocks.length;
   if (total <= 1) {
     return [{
+      createMode: 'html',
       index: 0,
       total: 1,
       title,
       content,
+      sourceUrl,
     }];
   }
 
   return groupedBlocks.map((blocks, index) => {
     const partTitle = index === 0 ? title : `${title} (${index + 1})`;
     return {
+      createMode: 'body' as const,
       index,
       total,
       title: partTitle,
@@ -1581,7 +1170,11 @@ function splitContent(title: string, sourceUrl: string, content: string, limit: 
   });
 }
 
-function buildMultipartBody(title: string, sourceUrl: string, blocks: NoteAtomNode[]): NoteAtomDoc {
+function buildMultipartBody(
+  title: string,
+  sourceUrl: string,
+  blocks: NoteAtomNode[]
+): NoteAtomDoc {
   const metaBody = buildNoteBody(title, '', sourceUrl) as unknown as NoteAtomDoc;
   const metaBlocks = Array.isArray(metaBody.content)
     ? metaBody.content.map((block) => cloneNoteAtomNode(block))

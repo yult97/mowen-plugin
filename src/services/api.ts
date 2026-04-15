@@ -354,6 +354,7 @@ export async function createNote(
     }
 
     const requestData = {
+      ...(title?.trim() ? { title: title.trim() } : {}),
       body,
       settings: {
         autoPublish: isPublic,
@@ -443,14 +444,24 @@ export async function createNote(
 export async function createNoteWithBody(
   apiKey: string,
   body: Record<string, unknown>,
-  isPublic: boolean = false,
-  enableAutoTag?: boolean,
-  signal?: AbortSignal
+  options: {
+    isPublic?: boolean;
+    enableAutoTag?: boolean;
+    signal?: AbortSignal;
+    title?: string;
+  } = {}
 ): Promise<NoteCreateResult> {
   console.log(`[sw] createNoteWithBody: starting with body type=${body?.type}`);
+  const {
+    isPublic = false,
+    enableAutoTag,
+    signal,
+    title,
+  } = options;
 
   try {
     const requestData = {
+      ...(title?.trim() ? { title: title.trim() } : {}),
       body,
       settings: {
         autoPublish: isPublic,

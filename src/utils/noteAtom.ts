@@ -863,11 +863,27 @@ function appendParagraphBlocks(
   }
 }
 
+function isBlankPreservedInlineParagraphHtml(html: string): boolean {
+  const normalized = html
+    .replace(/<br\s*\/?>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .trim();
+
+  return normalized.length === 0;
+}
+
 function appendPreservedInlineParagraphBlock(
   blocks: NoteAtom[],
   stats: ConvertStats,
   html: string
 ): void {
+  if (isBlankPreservedInlineParagraphHtml(html)) {
+    blocks.push({ type: 'paragraph' });
+    stats.paragraph++;
+    return;
+  }
+
   const inline = normalizeInlineTypography(parseInlineContent(html, { preserveLineBreaks: true }));
   if (inline.length === 0 || !hasRealContent(inline)) {
     return;
@@ -1441,6 +1457,12 @@ function stripHtmlAndDecodePreserveLineBreaks(html: string): string {
   text = text.replace(/\r/g, '').replace(/\t/g, ' ');
   text = text.replace(/[ ]{2,}/g, ' ');
   text = text.replace(/ *\n */g, '\n');
+
+  // Pure spacer paragraphs are restored earlier as empty paragraph blocks.
+  // For non-empty preserved-inline paragraphs, trim boundary <br> runs so they
+  // do not stack with block-level spacers later in the save pipeline, while
+  // still preserving one intentional blank line inside the paragraph.
+  text = text.replace(/^\n+|\n+$/g, '');
   text = text.replace(/\n{3,}/g, '\n\n');
   return text;
 }

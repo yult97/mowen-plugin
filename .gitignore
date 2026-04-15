@@ -75,3 +75,6 @@ reproduce_layout.ts
 .omx/
 tmp/noteAtom.bundle.mjs
 tmp/omx-agents-merged.md
+tests/x-twitter-regression.test.ts
+scripts/verify-x-twitter-regressions.mjs
+docs/markdown-import-prd.md

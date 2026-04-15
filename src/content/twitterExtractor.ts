@@ -6,13 +6,48 @@
  * 支持提取 Quote Tweet（引用推文）并格式化为引用块。
  */
 
-import { ExtractResult, ContentBlock, ImageCandidate } from '../types';
+import { ClipKind, ExtractResult, ContentBlock, ImageCandidate } from '../types';
 import { generateId } from '../utils/helpers';
-import { findMixedLanguageSplitBoundaries } from '../utils/mixedLanguage';
 import { extractImages } from './images';
 import { TWITTER_SELECTORS } from '../config/site-selectors';
 import { normalizeImageUrl } from './imageNormalizer';
 import { detectCodeLanguage } from '../utils/shikiLanguages';
+import {
+    alignBilingualSegmentRuns,
+    buildBilingualTweetParagraphSegments,
+    createTweetParagraphSpacerSegment,
+    isTranslatedTweetParagraphPair,
+    normalizeStructuredSequence,
+} from './twitter/bilingual';
+import type { BilingualAlignmentOptions } from './twitter/bilingual';
+import {
+    createStructuredTwitterSpacerBlock,
+    isStructuredTwitterSpacerBlock,
+    normalizeStructuredTwitterBlocks,
+} from './twitter/blockLayout';
+import {
+    buildTwitterCardSegments,
+    isTwitterCardMetadataText,
+} from './twitter/card';
+import { classifyTwitterContent } from './twitter/classify';
+import {
+    detectTwitterSegmentLanguage,
+    getDominantTwitterLanguage,
+    getSegmentJoiner,
+    looksLikeStandaloneHeading,
+    splitMixedLanguageText,
+    startsWithExplicitBlockMarker,
+    endsWithHardParagraphBoundary,
+} from './twitter/language';
+import {
+    deriveTwitterTitle,
+    getFirstNonEmptyLine,
+} from './twitter/title';
+import { TranslationPairSegment, TwitterClipKind, TwitterTextSegment } from './twitter/types';
+
+function toExtractClipKind(kind: TwitterClipKind): Exclude<ClipKind, 'default'> {
+    return kind === 'tweet' ? 'twitter-post' : 'x-longform';
+}
 
 /**
  * 翻译插件 DOM 选择器常量
@@ -54,6 +89,7 @@ const TRANSLATION_INNER_WRAPPER_SELECTORS = [
 const TRANSLATION_PLUGIN_SELECTOR = TRANSLATION_PLUGIN_SELECTORS.join(', ');
 const TRANSLATION_OUTER_WRAPPER_SELECTOR = TRANSLATION_OUTER_WRAPPER_SELECTORS.join(', ');
 const TRANSLATION_INNER_WRAPPER_SELECTOR = TRANSLATION_INNER_WRAPPER_SELECTORS.join(', ');
+const TWITTER_CARD_DETAIL_SELECTOR = '[data-testid^="card.layout"][data-testid$=".detail"], [data-testid*="card.layout"][data-testid$=".detail"]';
 
 /**
  * 辅助函数：修剪提取到的文本段
@@ -367,14 +403,20 @@ function buildOriginalParagraphSegments(element: HTMLElement): Array<{ html: str
             ...segment,
             anchorTemplate: getFirstAnchorTemplateFromHtml(segment.html) || undefined,
         }));
+    segments = refineXArticleParagraphSegments(segments).map((segment) => ({
+        ...segment,
+        anchorTemplate: getFirstAnchorTemplateFromHtml(segment.html) || undefined,
+    }));
 
     const originalText = trimExtractedSegmentText(originalClone.innerText || originalClone.textContent || '');
     const textParagraphs = splitTweetTextParagraphs(originalText);
     if (textParagraphs.length > segments.length) {
-        segments = textParagraphs.map((paragraphText, index) => ({
+        segments = refineXArticleParagraphSegments(textParagraphs.map((paragraphText) => ({
             html: escapeHtml(paragraphText),
             text: paragraphText,
-            anchorTemplate: segments[index]?.anchorTemplate,
+        }))).map((segment) => ({
+            ...segment,
+            anchorTemplate: getFirstAnchorTemplateFromHtml(segment.html) || undefined,
         }));
     }
 
@@ -419,7 +461,16 @@ function buildTranslationParagraphSegments(
         }
 
         const normalizedHtml = normalizeXArticleInlineHtml(fragmentContainer, { insertBreakBeforeTranslation: false });
-        const paragraphSegments = splitHtmlIntoParagraphSegments(normalizedHtml, { singleBreakAsBoundary: true });
+        let paragraphSegments = refineXArticleParagraphSegments(
+            splitHtmlIntoParagraphSegments(normalizedHtml, { singleBreakAsBoundary: true })
+        );
+        const textParagraphs = splitTweetTextParagraphs(fragmentText);
+        if (textParagraphs.length > paragraphSegments.length) {
+            paragraphSegments = refineXArticleParagraphSegments(textParagraphs.map((paragraphText) => ({
+                html: escapeHtml(paragraphText),
+                text: paragraphText,
+            })));
+        }
 
         if (paragraphSegments.length > 0) {
             segments.push(...paragraphSegments);
@@ -444,26 +495,140 @@ interface XArticleBilingualGroup {
     translation?: { html: string; text: string };
 }
 
+interface XArticleOrderedSegment {
+    kind: 'original' | 'translation';
+    segments: Array<{ html: string; text: string; anchorTemplate?: HTMLAnchorElement }>;
+}
+
+interface XArticleRangeBoundary {
+    container: Node;
+    offset: number;
+}
+
+function atomizeSegmentsForBilingualAlignment(
+    segments: Array<{ html: string; text: string }>
+): Array<{ html: string; text: string }> {
+    return segments.flatMap((segment) => {
+        const trimmedText = segment.text.trim();
+        const trimmedHtml = segment.html.trim();
+        if (!trimmedText || !trimmedHtml) {
+            return [];
+        }
+
+        const textLines = trimmedText
+            .split(/\n+/)
+            .flatMap((line) => splitXArticleAtomicTextUnits(line))
+            .map((line) => line.trim())
+            .filter(Boolean);
+        if (textLines.length <= 1) {
+            return [{ html: trimmedHtml, text: trimmedText }];
+        }
+
+        const atomicSegments = mergeXArticleContinuationSegments(
+            textLines.map((line) => ({
+                html: escapeHtml(line),
+                text: line,
+            }))
+        );
+
+        return atomicSegments.length > 0 ? atomicSegments : [{ html: trimmedHtml, text: trimmedText }];
+    });
+}
+
+function canSplitBeforeInlineBlockMarker(text: string, markerIndex: number): boolean {
+    let cursor = markerIndex - 1;
+
+    while (cursor >= 0 && /\s/.test(text[cursor])) {
+        cursor -= 1;
+    }
+
+    if (cursor < 0) {
+        return true;
+    }
+
+    return /[\n。！？!?；;:：]/.test(text[cursor]);
+}
+
+function splitXArticleAtomicTextUnits(text: string): string[] {
+    const normalized = text.trim();
+    if (!normalized) {
+        return [];
+    }
+
+    const markerRegex = /([→➜•\-–—*]|\d+\s*[-.:：)]|[A-Za-z]\)|[A-Za-z]\.)\s+/g;
+    const splitIndexes: number[] = [0];
+    let match: RegExpExecArray | null;
+
+    while ((match = markerRegex.exec(normalized)) !== null) {
+        const markerIndex = match.index;
+        if (markerIndex <= 0) {
+            continue;
+        }
+
+        const hasInlineListContext =
+            startsWithExplicitBlockMarker(normalized) ||
+            splitIndexes.length > 1;
+        const hasWhitespaceBeforeMarker = /\s/.test(normalized[markerIndex - 1] || '');
+        const shouldSplit =
+            canSplitBeforeInlineBlockMarker(normalized, markerIndex) ||
+            (hasInlineListContext && hasWhitespaceBeforeMarker);
+
+        if (!shouldSplit) {
+            continue;
+        }
+
+        splitIndexes.push(markerIndex);
+    }
+
+    if (splitIndexes.length === 1) {
+        return [normalized];
+    }
+
+    splitIndexes.push(normalized.length);
+
+    const segments: string[] = [];
+    for (let index = 0; index < splitIndexes.length - 1; index++) {
+        const segmentText = normalized
+            .slice(splitIndexes[index], splitIndexes[index + 1])
+            .trim();
+
+        if (segmentText) {
+            segments.push(segmentText);
+        }
+    }
+
+    return segments.length > 0 ? segments : [normalized];
+}
+
 function buildXArticleBilingualGroups(
     originalSegments: Array<{ html: string; text: string }>,
-    translationSegments: Array<{ html: string; text: string }>
+    translationSegments: Array<{ html: string; text: string }>,
+    options: BilingualAlignmentOptions = {}
 ): XArticleBilingualGroup[] {
     if (originalSegments.length === 0 || translationSegments.length === 0) {
         return [];
     }
 
-    if (originalSegments.length !== translationSegments.length) {
+    const balancedSegments = alignBilingualSegmentRuns(
+        atomizeSegmentsForBilingualAlignment(originalSegments),
+        atomizeSegmentsForBilingualAlignment(translationSegments),
+        options
+    );
+    const alignedOriginalSegments = balancedSegments.originalSegments;
+    const alignedTranslationSegments = balancedSegments.translationSegments;
+
+    if (alignedOriginalSegments.length !== alignedTranslationSegments.length) {
         console.warn(
-            `[twitterExtractor] ⚠️ X Article 双语段落数不一致，按顺序对齐: original=${originalSegments.length}, translation=${translationSegments.length}`
+            `[twitterExtractor] ⚠️ X Article 双语段落数不一致，按顺序对齐: original=${alignedOriginalSegments.length}, translation=${alignedTranslationSegments.length}`
         );
     }
 
-    const total = Math.max(originalSegments.length, translationSegments.length);
+    const total = Math.max(alignedOriginalSegments.length, alignedTranslationSegments.length);
     const groups: XArticleBilingualGroup[] = [];
 
     for (let index = 0; index < total; index++) {
-        const original = originalSegments[index];
-        const translation = translationSegments[index];
+        const original = alignedOriginalSegments[index];
+        const translation = alignedTranslationSegments[index];
 
         if (!original && !translation) {
             continue;
@@ -479,22 +644,214 @@ function buildXArticleBilingualGroups(
     return groups;
 }
 
-function summarizeXArticleSegmentsForLog(
-    segments: Array<{ text: string }>
-): string {
-    return segments
-        .slice(0, 3)
-        .map((segment, index) => {
-            const snippet = segment.text
-                .trim()
-                .replace(/\s+/g, ' ')
-                .slice(0, 36);
-            return `${index + 1}:${snippet}`;
-        })
-        .join(' | ');
+function getNodeChildIndex(node: Node): number {
+    if (!node.parentNode) {
+        return -1;
+    }
+
+    return Array.prototype.indexOf.call(node.parentNode.childNodes, node);
 }
 
-function shouldUseXArticleTranslationPairing(
+function cloneXArticleRangeContainer(
+    start: XArticleRangeBoundary,
+    end: XArticleRangeBoundary
+): HTMLElement {
+    const range = document.createRange();
+    range.setStart(start.container, start.offset);
+    range.setEnd(end.container, end.offset);
+
+    const container = document.createElement('div');
+    container.appendChild(range.cloneContents());
+    return container;
+}
+
+function buildXArticleOrderedSegments(element: HTMLElement): XArticleOrderedSegment[] {
+    const root = element.cloneNode(true) as HTMLElement;
+    const translationNodes = getTopLevelTranslationNodes(root);
+
+    if (translationNodes.length === 0) {
+        return [];
+    }
+
+    const orderedSegments: XArticleOrderedSegment[] = [];
+    let start: XArticleRangeBoundary = {
+        container: root,
+        offset: 0,
+    };
+
+    translationNodes.forEach((translationNode) => {
+        const parent = translationNode.parentNode;
+        const offset = getNodeChildIndex(translationNode);
+        if (!parent || offset < 0) {
+            return;
+        }
+
+        const originalContainer = cloneXArticleRangeContainer(start, {
+            container: parent,
+            offset,
+        });
+        const originalSegments = buildOriginalParagraphSegments(originalContainer);
+        if (originalSegments.length > 0) {
+            orderedSegments.push({
+                kind: 'original',
+                segments: originalSegments,
+            });
+        }
+
+        const translationContainer = document.createElement('div');
+        translationContainer.appendChild(translationNode.cloneNode(true));
+        const translationSegments = buildTranslationParagraphSegments(translationContainer, originalSegments);
+        if (translationSegments.length > 0) {
+            orderedSegments.push({
+                kind: 'translation',
+                segments: translationSegments,
+            });
+        }
+
+        start = {
+            container: parent,
+            offset: offset + 1,
+        };
+    });
+
+    const trailingContainer = cloneXArticleRangeContainer(start, {
+        container: root,
+        offset: root.childNodes.length,
+    });
+    const trailingOriginalSegments = buildOriginalParagraphSegments(trailingContainer);
+    if (trailingOriginalSegments.length > 0) {
+        orderedSegments.push({
+            kind: 'original',
+            segments: trailingOriginalSegments,
+        });
+    }
+
+    return orderedSegments.filter((segment) => segment.segments.length > 0);
+}
+
+function buildXArticleBilingualGroupsFromOrderedSegments(
+    orderedSegments: XArticleOrderedSegment[],
+    options: BilingualAlignmentOptions = {}
+): XArticleBilingualGroup[] {
+    const groups: XArticleBilingualGroup[] = [];
+    let index = 0;
+
+    while (index < orderedSegments.length) {
+        const current = orderedSegments[index];
+        const next = orderedSegments[index + 1];
+
+        if (current.kind === 'original' && next?.kind === 'translation') {
+            groups.push(...buildXArticleBilingualGroups(current.segments, next.segments, options));
+            index += 2;
+            continue;
+        }
+
+        current.segments.forEach((segment) => {
+            groups.push({
+                id: generateId(),
+                ...(current.kind === 'original'
+                    ? { original: { html: segment.html, text: segment.text } }
+                    : { translation: { html: segment.html, text: segment.text } }),
+            });
+        });
+        index += 1;
+    }
+
+    return groups;
+}
+
+function buildStructuredTweetSegmentsFromBilingualGroups(
+    groups: XArticleBilingualGroup[]
+): TweetTextSegment[] | null {
+    const result: TweetTextSegment[] = [];
+    let bilingualPairCount = 0;
+
+    groups.forEach((group, index) => {
+        const currentSegments: TweetTextSegment[] = [];
+        const originalLanguage = group.original ? detectTwitterSegmentLanguage(group.original.text) : 'other';
+        const translationLanguage = group.translation ? detectTwitterSegmentLanguage(group.translation.text) : 'other';
+        const isReliableBilingualPair = Boolean(
+            group.original &&
+            group.translation &&
+            originalLanguage !== 'other' &&
+            translationLanguage !== 'other' &&
+            originalLanguage !== translationLanguage
+        );
+
+        if (group.original) {
+            currentSegments.push({
+                html: group.original.html,
+                text: group.original.text,
+                role: isReliableBilingualPair ? 'original' : 'normal',
+                groupId: group.id,
+            });
+        }
+
+        if (group.translation) {
+            currentSegments.push({
+                html: group.translation.html,
+                text: group.translation.text,
+                role: isReliableBilingualPair ? 'translation' : 'normal',
+                groupId: group.id,
+            });
+        }
+
+        if (currentSegments.length === 0) {
+            return;
+        }
+
+        if (isReliableBilingualPair) {
+            bilingualPairCount += 1;
+        }
+
+        result.push(...currentSegments);
+
+        if (index < groups.length - 1) {
+            result.push(createTweetParagraphSpacerSegment(group.id));
+        }
+    });
+
+    return bilingualPairCount > 0 ? result : null;
+}
+
+function extractStructuredInlineTranslationSegments(
+    element: HTMLElement,
+    options: BilingualAlignmentOptions = {}
+): TweetTextSegment[] | null {
+    const orderedSegments = buildXArticleOrderedSegments(element);
+    if (orderedSegments.length === 0) {
+        return null;
+    }
+
+    const hasOriginal = orderedSegments.some((segment) => segment.kind === 'original');
+    const hasTranslation = orderedSegments.some((segment) => segment.kind === 'translation');
+    if (!hasOriginal || !hasTranslation) {
+        return null;
+    }
+
+    const groups = buildXArticleBilingualGroupsFromOrderedSegments(orderedSegments, options);
+    const structuredSegments = buildStructuredTweetSegmentsFromBilingualGroups(groups);
+    if (!structuredSegments || structuredSegments.length === 0) {
+        return null;
+    }
+
+    console.log(
+        `[twitterExtractor] 🌐 普通推文结构化双语提取成功: groups=${groups.length}, segments=${structuredSegments.length}`
+    );
+
+    return structuredSegments;
+}
+
+function getCombinedSegmentTextLength(
+    segments: Array<{ text: string }>
+): number {
+    return segments.reduce((sum, segment) => {
+        const normalized = trimExtractedSegmentText(segment.text).replace(/\s+/g, '');
+        return sum + normalized.length;
+    }, 0);
+}
+
+function shouldUseInlineTranslationPairing(
     originalSegments: Array<{ html: string; text: string }>,
     translationSegments: Array<{ html: string; text: string }>
 ): boolean {
@@ -504,44 +861,36 @@ function shouldUseXArticleTranslationPairing(
 
     const originalCount = originalSegments.length;
     const translationCount = translationSegments.length;
-    const maxCount = Math.max(originalCount, translationCount);
-    const minCount = Math.min(originalCount, translationCount);
-    const ratio = minCount / maxCount;
-    const diff = maxCount - minCount;
+    if (originalCount !== translationCount) {
+        console.log(
+            `[twitterExtractor] ⚠️ 普通推文翻译段落数不一致，跳过逐段配对: original=${originalCount}, translation=${translationCount}`
+        );
+        return false;
+    }
 
-    const originalLanguage = getDominantParagraphLanguageKind(originalSegments);
-    const translationLanguage = getDominantParagraphLanguageKind(translationSegments);
+    const originalLanguage = getDominantTwitterLanguage(originalSegments);
+    const translationLanguage = getDominantTwitterLanguage(translationSegments);
     if (
         originalLanguage === 'other' ||
         translationLanguage === 'other' ||
         originalLanguage === translationLanguage
     ) {
         console.log(
-            `[twitterExtractor] ⚠️ X Article 翻译对语言不可靠，跳过精确配对: original=${originalLanguage}, translation=${translationLanguage}`
-        );
-        console.log(
-            `[twitterExtractor] ↪️ 原文示例: ${summarizeXArticleSegmentsForLog(originalSegments)}`
-        );
-        console.log(
-            `[twitterExtractor] ↪️ 译文示例: ${summarizeXArticleSegmentsForLog(translationSegments)}`
+            `[twitterExtractor] ⚠️ 普通推文翻译语言判定不可靠，跳过逐段配对: original=${originalLanguage}, translation=${translationLanguage}`
         );
         return false;
     }
 
-    const hasSevereCountMismatch =
-        (maxCount >= 3 && minCount <= 1) ||
-        ratio < 0.5 ||
-        (diff >= 2 && ratio < 0.67);
+    const originalLength = getCombinedSegmentTextLength(originalSegments);
+    const translationLength = getCombinedSegmentTextLength(translationSegments);
+    if (originalLength === 0 || translationLength === 0) {
+        return false;
+    }
 
-    if (hasSevereCountMismatch) {
+    const lengthRatio = Math.min(originalLength, translationLength) / Math.max(originalLength, translationLength);
+    if (lengthRatio < 0.18) {
         console.log(
-            `[twitterExtractor] ⚠️ X Article 翻译对段落数差异过大，回退到通用重排: original=${originalCount}, translation=${translationCount}, ratio=${ratio.toFixed(2)}`
-        );
-        console.log(
-            `[twitterExtractor] ↪️ 原文示例: ${summarizeXArticleSegmentsForLog(originalSegments)}`
-        );
-        console.log(
-            `[twitterExtractor] ↪️ 译文示例: ${summarizeXArticleSegmentsForLog(translationSegments)}`
+            `[twitterExtractor] ⚠️ 普通推文翻译覆盖率过低，跳过逐段配对: originalLen=${originalLength}, translationLen=${translationLength}, ratio=${lengthRatio.toFixed(2)}`
         );
         return false;
     }
@@ -554,6 +903,10 @@ function extractTranslationPairSegments(element: HTMLElement): TranslationPairSe
     const translationSegments = buildTranslationParagraphSegments(element, originalSegments);
 
     if (originalSegments.length === 0 || translationSegments.length === 0) {
+        return null;
+    }
+
+    if (!shouldUseInlineTranslationPairing(originalSegments, translationSegments)) {
         return null;
     }
 
@@ -581,24 +934,33 @@ function extractTranslationPairSegments(element: HTMLElement): TranslationPairSe
  * 如果元素中不存在翻译插件注入的 DOM 节点，返回 null（走现有路径）。
  */
 function extractXArticleTranslationPairSegments(
-    element: HTMLElement
+    element: HTMLElement,
+    options: BilingualAlignmentOptions = {}
 ): XArticleBilingualGroup[] | null {
-    const originalSegments = buildOriginalParagraphSegments(element);
-    const translationSegments = buildTranslationParagraphSegments(element, originalSegments);
-
-    if (originalSegments.length === 0 || translationSegments.length === 0) {
+    const orderedSegments = buildXArticleOrderedSegments(element);
+    if (orderedSegments.length === 0) {
         return null;
     }
 
-    if (!shouldUseXArticleTranslationPairing(originalSegments, translationSegments)) {
+    const hasOriginal = orderedSegments.some((segment) => segment.kind === 'original');
+    const hasTranslation = orderedSegments.some((segment) => segment.kind === 'translation');
+    if (!hasOriginal || !hasTranslation) {
         return null;
     }
 
-    const originalTextLength = originalSegments.reduce((sum, segment) => sum + segment.text.length, 0);
-    const translationTextLength = translationSegments.reduce((sum, segment) => sum + segment.text.length, 0);
-    console.log(`[twitterExtractor] 🌐 翻译对检测成功: 原文 ${originalTextLength} 字, 译文 ${translationTextLength} 字, 段落 ${originalSegments.length}/${translationSegments.length}`);
+    const originalTextLength = orderedSegments
+        .filter((segment) => segment.kind === 'original')
+        .flatMap((segment) => segment.segments)
+        .reduce((sum, segment) => sum + segment.text.length, 0);
+    const translationTextLength = orderedSegments
+        .filter((segment) => segment.kind === 'translation')
+        .flatMap((segment) => segment.segments)
+        .reduce((sum, segment) => sum + segment.text.length, 0);
+    console.log(
+        `[twitterExtractor] 🌐 X Article 结构锚点配对成功: 原文 ${originalTextLength} 字, 译文 ${translationTextLength} 字, 单元 ${orderedSegments.length}`
+    );
 
-    return buildXArticleBilingualGroups(originalSegments, translationSegments);
+    return buildXArticleBilingualGroupsFromOrderedSegments(orderedSegments, options);
 }
 
 
@@ -670,66 +1032,23 @@ interface QuoteTweet {
     url: string;
     /** 引用链接展示文案（优先使用标题） */
     linkLabel?: string;
-    /** 引用推文拆分后的段落序列（仅 X 剪藏链路使用） */
-    segments?: TweetTextSegment[];
-    /** 引用推文的文本内容 */
-    text: string;
-    /** 引用推文的 HTML 内容 */
-    html: string;
+    /** 引用内容的有序块（正文/图片按最终保存顺序） */
+    blocks: ContentBlock[];
     /** 引用推文中的图片 */
     images: ImageCandidate[];
 }
 
-interface TweetTextSegment {
-    html: string;
-    text: string;
-    textOnly?: boolean;
-    role?: 'original' | 'translation' | 'spacer' | 'normal';
-}
+type TweetTextSegment = TwitterTextSegment;
 
-interface TranslationPairSegment {
-    original: TweetTextSegment[];
-    translation: TweetTextSegment[];
-}
-
-const TWEET_PARAGRAPH_SPACER_HTML = '<p data-mowen-preserve-inline-paragraph="1"><br></p>';
-
-function createTweetParagraphSpacerSegment(): TweetTextSegment {
-    return {
-        html: TWEET_PARAGRAPH_SPACER_HTML,
-        text: '',
-        role: 'spacer',
-    };
-}
-
-function renderTweetTextSegmentsToHtml(segments: TweetTextSegment[]): string {
-    let html = '';
-    let shouldInsertBreakBeforeNext = false;
-
-    for (const segment of segments) {
-        if (segment.role === 'spacer') {
-            if (html) {
-                html = html.replace(/(?:<br\s*\/?>\s*)+$/gi, '');
-                html += '<br><br>';
-            }
-            shouldInsertBreakBeforeNext = false;
-            continue;
-        }
-
-        const segmentHtml = segment.html?.trim();
-        if (!segmentHtml) {
-            continue;
-        }
-
-        if (shouldInsertBreakBeforeNext && html) {
-            html += '<br>';
-        }
-
-        html += segmentHtml;
-        shouldInsertBreakBeforeNext = true;
-    }
-
-    return html;
+function normalizeStructuredTweetSegments(segments: TwitterTextSegment[]): TwitterTextSegment[] {
+    return normalizeStructuredSequence(segments, {
+        clone: (segment, groupId) => ({ ...segment, ...(groupId ? { groupId } : {}) }),
+        createSpacer: createTweetParagraphSpacerSegment,
+        getGroupId: (segment) => segment.groupId,
+        getRole: (segment) => segment.role,
+        hasText: (segment) => Boolean(segment.text.trim()),
+        isSpacer: (segment) => segment.role === 'spacer',
+    });
 }
 
 function extractQuoteDraftArticleSegments(quoteContainer: HTMLElement): TweetTextSegment[] {
@@ -745,7 +1064,9 @@ function extractQuoteDraftArticleSegments(quoteContainer: HTMLElement): TweetTex
     const quoteContentParts: string[] = [];
 
     draftBlocks.forEach((block, blockIndex) => {
-        const translationPairGroups = extractXArticleTranslationPairSegments(block.cloneNode(true) as HTMLElement);
+        const translationPairGroups = extractXArticleTranslationPairSegments(block.cloneNode(true) as HTMLElement, {
+            allowReferenceDrivenSplit: false,
+        });
 
         if (translationPairGroups && translationPairGroups.length > 0) {
             translationPairGroups.forEach((group, groupIndex) => {
@@ -795,10 +1116,10 @@ function extractQuoteDraftArticleSegments(quoteContainer: HTMLElement): TweetTex
         }
     });
 
-    const normalizedBlocks = insertXArticleSpacing(rebalanceXArticleBilingualBlocks(quoteBlocks));
+    const normalizedBlocks = normalizeStructuredTwitterBlocks(quoteBlocks);
     const segments: TweetTextSegment[] = normalizedBlocks.flatMap((block) => {
-        if (isXArticleSpacerBlock(block)) {
-            return [createTweetParagraphSpacerSegment()];
+        if (isStructuredTwitterSpacerBlock(block)) {
+            return [createTweetParagraphSpacerSegment(block.layout?.groupId)];
         }
 
         const trimmedText = block.text.trim();
@@ -816,69 +1137,232 @@ function extractQuoteDraftArticleSegments(quoteContainer: HTMLElement): TweetTex
             html: inlineHtml,
             text: trimmedText,
             role: block.layout?.role || 'normal',
+            groupId: block.layout?.groupId,
         }];
     });
 
     return segments;
 }
 
-function appendQuoteTweetContentBlocks(
+function extractQuoteDraftBlockSegments(block: HTMLElement): TweetTextSegment[] {
+    const quoteBlocks: ContentBlock[] = [];
+    const quoteContentParts: string[] = [];
+
+    const translationPairGroups = extractXArticleTranslationPairSegments(block.cloneNode(true) as HTMLElement, {
+        allowReferenceDrivenSplit: false,
+    });
+
+    if (translationPairGroups && translationPairGroups.length > 0) {
+        translationPairGroups.forEach((group, groupIndex) => {
+            if (group.original?.text) {
+                appendXArticleParagraphBlock(quoteBlocks, quoteContentParts, group.original, {
+                    groupId: group.id,
+                    role: 'original',
+                });
+            }
+
+            if (group.translation?.text) {
+                appendXArticleParagraphBlock(quoteBlocks, quoteContentParts, group.translation, {
+                    groupId: group.id,
+                    role: 'translation',
+                });
+            }
+
+            if (groupIndex < translationPairGroups.length - 1) {
+                appendXArticleSpacerBlock(quoteBlocks, quoteContentParts, group.id);
+            }
+        });
+    } else {
+        const paragraphSegments = extractXArticleParagraphSegments(block);
+        paragraphSegments.forEach((segment, segmentIndex) => {
+            const trimmedText = segment.text.trim();
+            if (!trimmedText) {
+                return;
+            }
+
+            const groupId = generateId();
+            appendXArticleParagraphBlock(quoteBlocks, quoteContentParts, {
+                html: segment.html,
+                text: trimmedText,
+            }, {
+                groupId,
+                role: 'normal',
+            });
+
+            if (segmentIndex < paragraphSegments.length - 1) {
+                appendXArticleSpacerBlock(quoteBlocks, quoteContentParts, groupId);
+            }
+        });
+    }
+
+    const normalizedBlocks = normalizeStructuredTwitterBlocks(quoteBlocks);
+    return normalizedBlocks.flatMap((contentBlock) => {
+        if (isStructuredTwitterSpacerBlock(contentBlock)) {
+            return [createTweetParagraphSpacerSegment(contentBlock.layout?.groupId)];
+        }
+
+        const trimmedText = contentBlock.text.trim();
+        if (contentBlock.type !== 'paragraph' || !trimmedText) {
+            return [];
+        }
+
+        const match = contentBlock.html.trim().match(/^<p\b[^>]*>([\s\S]*)<\/p>$/i);
+        const inlineHtml = (match ? match[1] : contentBlock.html).trim();
+        if (!inlineHtml) {
+            return [];
+        }
+
+        return [{
+            html: inlineHtml,
+            text: trimmedText,
+            role: contentBlock.layout?.role || 'normal',
+            groupId: contentBlock.layout?.groupId,
+        }];
+    });
+}
+
+function cloneContentBlock(block: ContentBlock): ContentBlock {
+    return {
+        ...block,
+        id: generateId(),
+        layout: block.layout ? { ...block.layout } : block.layout,
+    };
+}
+
+function appendContentBlocks(
     blocks: ContentBlock[],
     contentParts: string[],
     textParts: string[],
-    quoteTweet: QuoteTweet
+    sourceBlocks: ContentBlock[]
 ): void {
-    const segments = quoteTweet.segments || [];
-
-    if (segments.length === 0) {
-        const quoteBlock: ContentBlock = {
-            id: generateId(),
-            type: 'quote',
-            html: `<blockquote>${quoteTweet.html}</blockquote>`,
-            text: quoteTweet.text,
-        };
-        blocks.push(quoteBlock);
-        contentParts.push(quoteBlock.html);
-        textParts.push(quoteTweet.text);
-        return;
-    }
-
-    const htmlParts: string[] = [];
-    const textPartsInQuote: string[] = [];
-
-    segments.forEach((segment) => {
-        if (segment.role === 'spacer') {
-            htmlParts.push('<p><br></p>');
-            if (textPartsInQuote.length > 0 && textPartsInQuote[textPartsInQuote.length - 1] !== '') {
-                textPartsInQuote.push('');
-            }
-            return;
+    sourceBlocks.forEach((block) => {
+        const clonedBlock = cloneContentBlock(block);
+        blocks.push(clonedBlock);
+        contentParts.push(clonedBlock.html);
+        if (clonedBlock.text.trim()) {
+            textParts.push(clonedBlock.text);
         }
-
-        const trimmedText = segment.text.trim();
-        const trimmedHtml = segment.html.trim();
-        if (!trimmedText || !trimmedHtml) {
-            return;
-        }
-
-        htmlParts.push(`<p data-mowen-preserve-inline-paragraph="1">${trimmedHtml}</p>`);
-        textPartsInQuote.push(trimmedText);
     });
+}
 
-    const quoteText = textPartsInQuote.join('\n');
-    if (!quoteText.trim()) {
-        return;
+function hasTextualContentBlocks(blocks: ContentBlock[]): boolean {
+    return blocks.some((block) =>
+        block.type !== 'image' &&
+        block.text.trim().length > 0
+    );
+}
+
+function hasImageContentBlocks(blocks: ContentBlock[]): boolean {
+    return blocks.some((block) => block.type === 'image');
+}
+
+function createImageContentBlock(image: ImageCandidate): ContentBlock {
+    const rawAlt = (image.alt || '').trim();
+    const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+        rawAlt === 'null' || rawAlt === 'undefined';
+    const altText = (rawAlt && !isGeneric) ? rawAlt : '';
+
+    return {
+        id: generateId(),
+        type: 'image',
+        html: `<img src="${image.url}" alt="${altText}" data-mowen-id="${image.id}" />`,
+        text: altText,
+    };
+}
+
+function createQuoteContentBlock(text: string, html: string): ContentBlock | null {
+    const trimmedText = text.trim();
+    if (!trimmedText) {
+        return null;
     }
 
-    const quoteBlock: ContentBlock = {
+    const trimmedHtml = html.trim();
+    return {
         id: generateId(),
         type: 'quote',
-        html: `<blockquote>${htmlParts.join('')}</blockquote>`,
-        text: quoteText,
+        html: `<blockquote>${trimmedHtml || `<p>${escapeHtml(trimmedText)}</p>`}</blockquote>`,
+        text: trimmedText,
     };
-    blocks.push(quoteBlock);
-    contentParts.push(quoteBlock.html);
-    textParts.push(quoteText);
+}
+
+function buildQuoteContentBlocksFromSegments(segments: TweetTextSegment[]): ContentBlock[] {
+    if (segments.length === 0) {
+        return [];
+    }
+
+    return buildQuoteBlocksFromSegments(segments.map((segment) => (
+        segment.role ? segment : { ...segment, role: 'normal' }
+    )));
+}
+
+function getContentBlocksText(blocks: ContentBlock[]): string {
+    return blocks
+        .filter((block) => block.type !== 'image')
+        .map((block) => block.text.trim())
+        .filter(Boolean)
+        .join('\n');
+}
+
+export function appendQuoteTweetContentBlocks(
+    blocks: ContentBlock[],
+    contentParts: string[],
+    textParts: string[],
+    quoteTweet: Pick<QuoteTweet, 'blocks'>
+): void {
+    if (quoteTweet.blocks.length === 0) {
+        return;
+    }
+
+    appendContentBlocks(blocks, contentParts, textParts, quoteTweet.blocks);
+}
+
+function createQuoteReferenceLinkBlock(
+    quoteTweet: Pick<QuoteTweet, 'url' | 'linkLabel'>
+): ContentBlock {
+    const linkLabel = escapeHtml(quoteTweet.linkLabel || quoteTweet.url);
+
+    return {
+        id: generateId(),
+        type: 'paragraph',
+        html: `<p data-mowen-preserve-inline-paragraph="1">🔗 引用文章：<a href="${quoteTweet.url}">${linkLabel}</a></p>`,
+        text: `🔗 引用文章：${quoteTweet.linkLabel || quoteTweet.url}`,
+        layout: {
+            preserveInlineParagraphs: true,
+        },
+    };
+}
+
+function appendQuoteTweetBlocks(
+    blocks: ContentBlock[],
+    contentParts: string[],
+    textParts: string[],
+    quoteTweet: Pick<QuoteTweet, 'url' | 'linkLabel' | 'blocks' | 'images'>,
+    options: {
+        onImage?: (image: ImageCandidate) => void;
+    } = {}
+): void {
+    const { onImage } = options;
+    const linkBlock = createQuoteReferenceLinkBlock(quoteTweet);
+    blocks.push(linkBlock);
+    contentParts.push(linkBlock.html);
+    textParts.push(linkBlock.text);
+
+    appendQuoteTweetContentBlocks(blocks, contentParts, textParts, quoteTweet);
+
+    const quoteBlocksIncludeImages = Boolean(quoteTweet.blocks?.some((block) => block.type === 'image'));
+    if (!quoteBlocksIncludeImages) {
+        quoteTweet.images.forEach((image) => {
+            const imageBlock = createImageContentBlock(image);
+            blocks.push(imageBlock);
+            contentParts.push(imageBlock.html);
+            onImage?.(image);
+        });
+        return;
+    }
+
+    quoteTweet.images.forEach((image) => {
+        onImage?.(image);
+    });
 }
 
 /**
@@ -897,6 +1381,7 @@ function buildInlineTranslationPairSegments(
     const result: TweetTextSegment[] = [];
 
     for (let index = 0; index < total; index++) {
+        const groupId = generateId();
         const original = originalSegments[index];
         const translation = translationSegments[index];
 
@@ -908,6 +1393,7 @@ function buildInlineTranslationPairSegments(
             result.push({
                 ...original,
                 role: 'original',
+                groupId,
             });
         }
 
@@ -915,15 +1401,97 @@ function buildInlineTranslationPairSegments(
             result.push({
                 ...translation,
                 role: 'translation',
+                groupId,
             });
         }
 
         if (index < total - 1) {
-            result.push(createTweetParagraphSpacerSegment());
+            result.push(createTweetParagraphSpacerSegment(groupId));
         }
     }
 
     return result;
+}
+
+function appendTwitterParagraphSegments(
+    blocks: ContentBlock[],
+    contentParts: string[],
+    segments: TweetTextSegment[],
+    options: {
+        insertSpacerBetweenParagraphs?: boolean;
+    } = {}
+): void {
+    const { insertSpacerBetweenParagraphs = true } = options;
+
+    segments.forEach((segment, segmentIndex) => {
+        if (segment.role === 'spacer') {
+            appendXArticleSpacerBlock(blocks, contentParts, segment.groupId);
+            return;
+        }
+
+        const trimmedText = segment.text.trim();
+        if (!trimmedText) {
+            return;
+        }
+
+        const effectiveGroupId = segment.groupId || (
+            !segment.role || segment.role === 'normal'
+                ? generateId()
+                : undefined
+        );
+
+        appendXArticleParagraphBlock(blocks, contentParts, {
+            html: segment.html,
+            text: trimmedText,
+        }, {
+            groupId: effectiveGroupId,
+            role: segment.role === 'original' || segment.role === 'translation' ? segment.role : 'normal',
+        });
+
+        const nextSegment = segments[segmentIndex + 1];
+        const shouldInsertSpacer =
+            insertSpacerBetweenParagraphs &&
+            nextSegment &&
+            nextSegment.role !== 'spacer' &&
+            segment.role !== 'original' &&
+            nextSegment.role !== 'translation';
+
+        if (shouldInsertSpacer) {
+            appendXArticleSpacerBlock(blocks, contentParts, effectiveGroupId);
+        }
+    });
+}
+
+function buildTwitterSegmentsFromXArticleTranslationGroups(
+    groups: XArticleBilingualGroup[]
+): TweetTextSegment[] {
+    const segments: TweetTextSegment[] = [];
+
+    groups.forEach((group, groupIndex) => {
+        if (group.original) {
+            segments.push({
+                html: group.original.html,
+                text: group.original.text,
+                role: 'original',
+                groupId: group.id,
+            });
+        }
+
+        if (group.translation) {
+            segments.push({
+                html: group.translation.html,
+                text: group.translation.text,
+                role: 'translation',
+                groupId: group.id,
+            });
+        }
+
+        if (groupIndex < groups.length - 1) {
+            segments.push(createTweetParagraphSpacerSegment(group.id));
+        }
+    });
+
+    return segments;
 }
 
 /**
@@ -944,8 +1512,13 @@ function appendXArticleParagraphBlock(
         return;
     }
 
+    const normalizedHtml = normalizePreservedInlineSegmentHtml(segment.html);
+    if (!normalizedHtml) {
+        return;
+    }
+
     const block = createXArticleParagraphContentBlock(
-        { html: `<p data-mowen-preserve-inline-paragraph="1">${segment.html}</p>`, text: trimmedText },
+        { html: `<p data-mowen-preserve-inline-paragraph="1">${normalizedHtml}</p>`, text: trimmedText },
         options
     );
     contentParts.push(block.html);
@@ -957,7 +1530,7 @@ function appendXArticleSpacerBlock(
     contentParts: string[],
     groupId?: string
 ): void {
-    const block = createXArticleSpacerContentBlock(groupId);
+    const block = createStructuredTwitterSpacerBlock(groupId);
     contentParts.push(block.html);
     blocks.push(block);
 }
@@ -982,302 +1555,57 @@ function createXArticleParagraphContentBlock(
     };
 }
 
-function createXArticleSpacerContentBlock(groupId?: string): ContentBlock {
-    return {
-        id: generateId(),
-        type: 'paragraph',
-        html: TWEET_PARAGRAPH_SPACER_HTML,
-        text: '',
-        layout: {
-            preserveInlineParagraphs: true,
-            ...(groupId ? { groupId } : {}),
-            role: 'spacer',
-        },
-    };
-}
-
-function isPlainXArticleParagraphBlock(block: ContentBlock): boolean {
-    return (
-        block.type === 'paragraph' &&
-        block.layout?.preserveInlineParagraphs === true &&
-        (block.layout.role === 'normal' || !block.layout.role) &&
-        Boolean(block.text.trim())
-    );
-}
-
-function isXArticleTextBlock(block: ContentBlock): boolean {
-    return (
-        block.type === 'paragraph' &&
-        block.layout?.preserveInlineParagraphs === true &&
-        block.layout.role !== 'spacer' &&
-        Boolean(block.text.trim())
-    );
-}
-
-function isXArticleSpacerBlock(block: ContentBlock): boolean {
-    return (
-        block.type === 'paragraph' &&
-        block.layout?.preserveInlineParagraphs === true &&
-        block.layout.role === 'spacer'
-    );
-}
-
-function splitXArticleParagraphContentBlock(block: ContentBlock): ContentBlock[] {
-    if (!isPlainXArticleParagraphBlock(block)) {
-        return [block];
-    }
-
+function normalizePreservedInlineSegmentHtml(html: string): string {
     const container = document.createElement('div');
-    container.innerHTML = block.html;
-
-    const paragraphElement = container.firstElementChild instanceof HTMLElement &&
-        container.firstElementChild.tagName === 'P'
-        ? container.firstElementChild
-        : null;
-    const inlineHtml = (paragraphElement?.innerHTML || container.innerHTML || '').trim();
-    const inlineText = trimExtractedSegmentText(block.text);
-
-    if (!inlineHtml || !inlineText) {
-        return [block];
-    }
-
-    let segments = splitHtmlIntoParagraphSegments(inlineHtml, { singleBreakAsBoundary: true });
-
-    if (segments.length <= 1 && inlineHtml.includes('<br')) {
-        const splitSegments = refineXArticleParagraphSegments(splitXArticleInlineSegments(inlineHtml));
-        if (splitSegments.length > 1) {
-            segments = splitSegments;
-        }
-    }
-
-    if (segments.length <= 1 && inlineText.includes('\n')) {
-        const lineSegments = inlineText
-            .split(/\n+/)
-            .map((line) => line.trim())
-            .filter(Boolean)
-            .map((line) => ({
-                html: escapeHtml(line),
-                text: line,
-            }));
-
-        if (lineSegments.length > 1) {
-            segments = refineXArticleParagraphSegments(lineSegments);
-        }
-    }
-
-    if (segments.length <= 1) {
-        return [block];
-    }
-
-    return segments.map((segment) => createXArticleParagraphContentBlock(
-        { html: `<p>${segment.html}</p>`, text: segment.text },
-        { role: 'normal' }
-    ));
+    container.innerHTML = html;
+    trimBoundaryBreakNodes(container);
+    return container.innerHTML.trim();
 }
 
-function buildXArticleBilingualRun(
-    primaryBlocks: ContentBlock[],
-    secondaryBlocks: ContentBlock[]
-): ContentBlock[] | null {
-    const expandedPrimary = primaryBlocks.flatMap(splitXArticleParagraphContentBlock);
-    const expandedSecondary = secondaryBlocks.flatMap(splitXArticleParagraphContentBlock);
-
-    if (expandedPrimary.length === 0 || expandedSecondary.length === 0) {
-        return null;
-    }
-
-    const primaryLanguage = getXArticleSegmentLanguageKind(expandedPrimary[0]?.text || '');
-    const secondaryLanguage = getXArticleSegmentLanguageKind(expandedSecondary[0]?.text || '');
-    const englishFirst = primaryLanguage === 'english' || secondaryLanguage !== 'english';
-    const originalBlocks = englishFirst ? expandedPrimary : expandedSecondary;
-    const translationBlocks = englishFirst ? expandedSecondary : expandedPrimary;
-
-    if (expandedPrimary.length !== expandedSecondary.length) {
-        console.log(
-            `[twitterExtractor] ⚠️ X Article 连续段落数不一致，按顺序兜底配对：primary=${expandedPrimary.length}, secondary=${expandedSecondary.length}`
-        );
-    }
-
-    const result: ContentBlock[] = [];
-    const total = Math.max(originalBlocks.length, translationBlocks.length);
-
-    for (let index = 0; index < total; index++) {
-        const groupId = generateId();
-        const original = originalBlocks[index];
-        const translation = translationBlocks[index];
-
-        if (original) {
-            result.push(createXArticleParagraphContentBlock(
-                { html: original.html, text: original.text },
-                { groupId, role: 'original' }
-            ));
-        }
-
-        if (translation) {
-            result.push(createXArticleParagraphContentBlock(
-                { html: translation.html, text: translation.text },
-                { groupId, role: 'translation' }
-            ));
-        }
-
-        if (index < total - 1) {
-            result.push(createXArticleSpacerContentBlock(groupId));
-        }
-    }
-
-    return result;
+function isBlankTwitterParagraphBlock(block: ContentBlock): boolean {
+    return block.type === 'paragraph' && !block.text.trim();
 }
 
-function rebalanceXArticleParagraphRun(blocks: ContentBlock[]): ContentBlock[] {
-    const candidates = blocks.filter((block) => Boolean(block.text.trim()));
-    if (candidates.length < 2) {
-        return blocks;
-    }
-
-    const languageRuns = candidates.reduce<Array<{
-        language: XArticleSegmentLanguageKind;
-        blocks: ContentBlock[];
-    }>>((runs, block) => {
-        const language = getXArticleSegmentLanguageKind(block.text);
-        const lastRun = runs[runs.length - 1];
-
-        if (!lastRun || lastRun.language !== language) {
-            runs.push({
-                language,
-                blocks: [block],
-            });
-            return runs;
-        }
-
-        lastRun.blocks.push(block);
-        return runs;
-    }, []);
-
-    if (languageRuns.length < 2) {
-        return blocks;
-    }
-
-    const result: ContentBlock[] = [];
-    let runIndex = 0;
-
-    while (runIndex < languageRuns.length) {
-        const currentRun = languageRuns[runIndex];
-        const nextRun = languageRuns[runIndex + 1];
-
-        if (
-            currentRun.language !== 'other' &&
-            nextRun &&
-            nextRun.language !== 'other' &&
-            currentRun.language !== nextRun.language
-        ) {
-            const rebalanced = buildXArticleBilingualRun(currentRun.blocks, nextRun.blocks);
-            if (rebalanced) {
-                console.log(
-                    `[twitterExtractor] 🔁 X Article 相邻双语段重排成功: ${currentRun.language}/${nextRun.language}, original=${currentRun.blocks.length}, translation=${nextRun.blocks.length}`
-                );
-                result.push(...rebalanced);
-                runIndex += 2;
-                continue;
-            }
-        }
-
-        result.push(...currentRun.blocks);
-        runIndex += 1;
-    }
-
-    return result;
-}
-
-function rebalanceXArticleBilingualBlocks(blocks: ContentBlock[]): ContentBlock[] {
-    const result: ContentBlock[] = [];
-    let currentRun: ContentBlock[] = [];
-
-    const flushRun = () => {
-        if (currentRun.length === 0) {
-            return;
-        }
-
-        result.push(...rebalanceXArticleParagraphRun(currentRun));
-        currentRun = [];
-    };
+function compactTwitterParagraphSpacing(blocks: ContentBlock[]): ContentBlock[] {
+    const normalized: ContentBlock[] = [];
+    let pendingSpacer: ContentBlock | null = null;
 
     for (const block of blocks) {
-        if (isPlainXArticleParagraphBlock(block)) {
-            currentRun.push(block);
+        if (isBlankTwitterParagraphBlock(block)) {
+            if (normalized.length === 0) {
+                continue;
+            }
+
+            pendingSpacer = pendingSpacer || block;
             continue;
         }
 
-        if (isXArticleSpacerBlock(block)) {
-            continue;
+        if (pendingSpacer) {
+            normalized.push(pendingSpacer);
+            pendingSpacer = null;
         }
 
-        flushRun();
-        result.push(block);
+        normalized.push(block);
     }
 
-    flushRun();
-    return result;
+    return normalized;
 }
 
-function insertXArticleSpacing(blocks: ContentBlock[]): ContentBlock[] {
-    const result: ContentBlock[] = [];
+function finalizeTwitterContentBlocks(blocks: ContentBlock[]): {
+    blocks: ContentBlock[];
+    contentHtml: string;
+    textContent: string;
+} {
+    const normalizedBlocks = compactTwitterParagraphSpacing(normalizeStructuredTwitterBlocks(blocks));
 
-    const getNextNonSpacerBlockIndex = (startIndex: number): number => {
-        for (let index = startIndex; index < blocks.length; index++) {
-            if (!isXArticleSpacerBlock(blocks[index])) {
-                return index;
-            }
-        }
-        return -1;
+    return {
+        blocks: normalizedBlocks,
+        contentHtml: normalizedBlocks.map((block) => block.html).join(''),
+        textContent: normalizedBlocks
+            .map((block) => block.text.trim())
+            .filter(Boolean)
+            .join('\n'),
     };
-
-    const shouldKeepSpacerBetween = (
-        previous: ContentBlock | undefined,
-        next: ContentBlock | undefined
-    ): boolean => {
-        if (!previous || !next || !isXArticleTextBlock(previous) || !isXArticleTextBlock(next)) {
-            return false;
-        }
-
-        const previousGroupId = previous.layout?.groupId;
-        const nextGroupId = next.layout?.groupId;
-        const isBilingualPair =
-            Boolean(previousGroupId) &&
-            previousGroupId === nextGroupId &&
-            previous.layout?.role === 'original' &&
-            next.layout?.role === 'translation';
-
-        return !isBilingualPair;
-    };
-
-    for (let index = 0; index < blocks.length; index++) {
-        const current = blocks[index];
-        if (isXArticleSpacerBlock(current)) {
-            const previous = result[result.length - 1];
-            const nextIndex = getNextNonSpacerBlockIndex(index + 1);
-            const next = nextIndex >= 0 ? blocks[nextIndex] : undefined;
-            if (shouldKeepSpacerBetween(previous, next)) {
-                result.push(current);
-            }
-            continue;
-        }
-
-        result.push(current);
-
-        const nextIndex = getNextNonSpacerBlockIndex(index + 1);
-        const next = nextIndex >= 0 ? blocks[nextIndex] : undefined;
-        if (!shouldKeepSpacerBetween(current, next)) {
-            continue;
-        }
-
-        const hasExplicitSpacerAhead = nextIndex > index + 1;
-
-        if (!hasExplicitSpacerAhead) {
-            result.push(createXArticleSpacerContentBlock(current.layout?.groupId));
-        }
-    }
-
-    return result;
 }
 
 function debugLogXArticleBlockSequence(stage: string, blocks: ContentBlock[]): void {
@@ -1286,7 +1614,7 @@ function debugLogXArticleBlockSequence(stage: string, blocks: ContentBlock[]): v
         .slice(0, 40)
         .map((block, index) => {
             const role = block.layout?.role || 'normal';
-            const language = getXArticleSegmentLanguageKind(block.text);
+            const language = detectTwitterSegmentLanguage(block.text);
             const groupId = block.layout?.groupId ? block.layout.groupId.slice(0, 8) : '-';
             const snippet = block.text.trim().replace(/\s+/g, ' ').slice(0, 48);
             return `${index + 1}. ${role}/${language}/g=${groupId} ${snippet || '[empty]'}`;
@@ -1450,11 +1778,23 @@ export async function extractTwitterContent(url: string, domain: string): Promis
         return createEmptyResult(url, domain);
     }
 
-    // 1. 检测是否为 X Article
-    const isXArticle = detectXArticle(container);
+    const primaryTweetText = (container.querySelector('[data-testid="tweetText"]') ||
+        document.querySelector('[data-testid="primaryColumn"] [data-testid="tweet"] [data-testid="tweetText"]')) as HTMLElement | null;
+    const primaryTweetSegments = primaryTweetText ? splitTweetTextIntoSegments(primaryTweetText) : [];
+    const classification = classifyTwitterContent({
+        container,
+        primaryTweetText,
+        primarySegments: primaryTweetSegments,
+    });
+    const { isXArticle, kind: clipKind } = classification;
 
     // 2. 提取标题
-    const { title, contentStart } = extractTitleWithMeta(container, isXArticle);
+    const { title, contentStart } = extractTitleWithMeta({
+        container,
+        clipKind,
+        primaryTweetText,
+        primaryTweetSegments,
+    });
 
     let baseContentHtml: string;
     let baseBlocks: ContentBlock[];
@@ -1576,10 +1916,13 @@ export async function extractTwitterContent(url: string, domain: string): Promis
             // 从第一个块中移除标题文本
             const newText = firstBlock.text.substring(contentStart.length).trim();
             if (newText) {
+                const preservedInlineHtml = firstBlock.layout?.preserveInlineParagraphs === true
+                    ? `<p data-mowen-preserve-inline-paragraph="1">${escapeHtml(newText)}</p>`
+                    : `<p>${escapeHtml(newText)}</p>`;
                 finalBlocks[0] = {
                     ...firstBlock,
                     text: newText,
-                    html: `<p>${newText}</p>`,
+                    html: preservedInlineHtml,
                 };
             } else {
                 // 如果移除后为空，删除这个块
@@ -1597,6 +1940,7 @@ export async function extractTwitterContent(url: string, domain: string): Promis
         domain,
         author: extractAuthor(),
         publishTime: extractPublishTime(),
+        clipKind: toExtractClipKind(clipKind),
         contentHtml: finalContentHtml,
         blocks: finalBlocks,
         images,
@@ -1604,138 +1948,42 @@ export async function extractTwitterContent(url: string, domain: string): Promis
     };
 }
 
-/**
- * 提取页面标题（带元数据）
- * 使用格式：「作者名：正文前 30 字」
- * 对于 X Article，优先使用文章标题
- * 
- * @returns { title: 最终标题, contentStart: 返回用于去重的原始文本（不截断） }
- */
-function extractTitleWithMeta(container: HTMLElement, isXArticle: boolean): { title: string; contentStart?: string } {
-    // 尝试从主推文提取作者名
+function extractTitleWithMeta(options: {
+    container: HTMLElement;
+    clipKind: TwitterClipKind;
+    primaryTweetText: HTMLElement | null;
+    primaryTweetSegments: TwitterTextSegment[];
+}): { title: string; contentStart?: string } {
+    const { container, clipKind, primaryTweetText, primaryTweetSegments } = options;
     const authorElement = container.querySelector('[data-testid="User-Name"]') ||
         document.querySelector('[data-testid="primaryColumn"] [data-testid="tweet"] [data-testid="User-Name"]');
-    let authorName = '';
-    if (authorElement) {
-        // 取第一个 span 作为显示名
-        const nameSpan = authorElement.querySelector('span');
-        if (nameSpan) {
-            authorName = nameSpan.textContent?.trim() || '';
-        }
-    }
+    const authorName = authorElement?.querySelector('span')?.textContent?.trim() || '';
+    const headingText = container.querySelector('h1, [role="heading"]')?.textContent || '';
+    const draftBlockTexts = Array.from(document.querySelectorAll('.public-DraftStyleDefault-block'))
+        .filter((block): block is HTMLElement => block instanceof HTMLElement)
+        .slice(0, 3)
+        .map((block) => block.innerText || block.textContent || '');
+    const orderedOriginalText = primaryTweetText
+        ? buildXArticleOrderedSegments(primaryTweetText)
+            .filter((segment) => segment.kind === 'original')
+            .flatMap((segment) => segment.segments)
+            .find((segment) => segment.text.trim())
+            ?.text
+        : '';
+    const result = deriveTwitterTitle({
+        authorName,
+        clipKind,
+        documentTitle: document.title,
+        draftBlockTexts,
+        firstXArticleSegmentText: clipKind === 'x-article' ? getFirstXArticleSegmentText() : '',
+        headingText,
+        orderedOriginalText,
+        primarySegments: primaryTweetSegments,
+        primaryTweetText: primaryTweetText?.textContent?.trim() || '',
+    });
 
-    const draftBlocks = document.querySelectorAll('.public-DraftStyleDefault-block');
-    let contentPreview = '';
-    let rawContentStart = ''; // 新增：用于去重的原始文本
-    let shouldSkipContentStartDedup = false;
-
-    if (isXArticle) {
-        console.log('[twitterExtractor] 📄 提取 X Article 标题...');
-
-        const firstSegmentText = getFirstXArticleSegmentText();
-
-        // 策略 1：优先使用页面标题 (document.title)
-        let pageTitle = document.title;
-        console.log(`[twitterExtractor] 📄 原始页面标题: "${pageTitle}"`);
-
-        // 清理常用后缀和前缀
-        pageTitle = pageTitle.replace(/\s*\/\s*(X|Twitter)$/i, ''); // " / X"
-        pageTitle = pageTitle.replace(/\s+on\s+(X|Twitter)$/i, ''); // " on X"
-        pageTitle = pageTitle.replace(/^\(\d+\+?\)\s*/, '');  // "(1) " 通知数
-        pageTitle = pageTitle.trim();
-        pageTitle = pageTitle.replace(/^[""]|[""]$/g, ''); // 移除首尾引号
-
-        // 排除通用标题
-        const genericTitles = ['X', 'Twitter', 'Home', 'Notification', 'Search', 'Profile'];
-        if (pageTitle && !genericTitles.includes(pageTitle) && pageTitle.length > 2) {
-            contentPreview = pageTitle;
-            rawContentStart = pageTitle; // 假设页面标题就是正文第一行
-            console.log(`[twitterExtractor] 📄 策略1-清洗后的页面标题: "${contentPreview}"`);
-        }
-
-        // 页面标题若是中英文直接拼接，优先使用正文首个真实段落作为标题
-        if (firstSegmentText && pageTitle && pageTitle.includes(firstSegmentText) && pageTitle !== firstSegmentText) {
-            contentPreview = firstSegmentText;
-            rawContentStart = firstSegmentText;
-            console.log(`[twitterExtractor] 📄 策略1b-使用首个正文子段替代拼接标题: "${contentPreview}"`);
-        }
-
-        // 策略 2：如果页面标题不可用，查找 H1 或 Heading
-        if (!contentPreview) {
-            const headingObj = container.querySelector('h1') || container.querySelector('[role="heading"]');
-            if (headingObj) {
-                const headingText = headingObj.textContent?.trim();
-                if (headingText && headingText.length > 2 && !headingText.includes('Timeline')) {
-                    contentPreview = headingText;
-                    rawContentStart = headingText;
-                    console.log(`[twitterExtractor] 📄 策略2-语义化标题: "${contentPreview}"`);
-                }
-            }
-        }
-
-        // 策略 3：如果还没找到，从正文区域提取
-        if (!contentPreview && draftBlocks.length > 0) {
-            for (let i = 0; i < Math.min(3, draftBlocks.length); i++) {
-                const block = draftBlocks[i] as HTMLElement;
-                const text = getFirstXArticleSegmentText() || block.innerText?.trim() || '';
-
-                if (text && text.length > 2) {
-                    contentPreview = text;
-                    rawContentStart = text; // 这种情况下这一段必定是正文开头
-                    console.log(`[twitterExtractor] 📄 策略3-首个正文块: "${contentPreview}"`);
-                    break;
-                }
-            }
-        }
-    } else {
-        // 普通推文：取第一行作为标题
-        const mainTweetText = document.querySelector('[data-testid="primaryColumn"] [data-testid="tweet"] [data-testid="tweetText"]');
-        if (mainTweetText) {
-            const titleSegments = splitTweetTextIntoSegments(mainTweetText as HTMLElement);
-            const hasBilingualSegments =
-                titleSegments.some((segment) => segment.role === 'original') &&
-                titleSegments.some((segment) => segment.role === 'translation');
-
-            const preferredTitleSegment = titleSegments.find((segment) =>
-                segment.role === 'original' && segment.text.trim()
-            ) || titleSegments.find((segment) => segment.role !== 'spacer' && segment.text.trim());
-
-            const fullText = mainTweetText.textContent?.trim() || '';
-            // 取第一行（优先结构化首个原文段，否则回退到 textContent）
-            const firstLine = preferredTitleSegment
-                ? getFirstNonEmptyLine(preferredTitleSegment.text)
-                : fullText.split('\n')[0].trim();
-            // 如果第一行太长，截取前 50 字用于显示
-            contentPreview = firstLine.length > 50 ? firstLine.substring(0, 50) + '...' : firstLine;
-            // 单语推文才允许用首行做正文去重；双语首段如果继续去重，会误删首个原文段。
-            rawContentStart = firstLine;
-            shouldSkipContentStartDedup = hasBilingualSegments;
-
-            if (contentPreview) {
-                console.log(`[twitterExtractor] 📝 普通推文，使用第一行: "${contentPreview}" (raw length: ${rawContentStart.length}, bilingual=${hasBilingualSegments})`);
-            }
-        }
-    }
-
-    if (contentPreview) {
-        if (isXArticle || shouldSkipContentStartDedup) {
-            // X Article 的双语正文结构高度依赖首段顺序。
-            // 这里如果继续把首段正文当成 contentStart 去重，会在后续提取链路里
-            // 误删英文原文块，导致原文与译文错位。
-            return { title: contentPreview };
-        }
-        return { title: contentPreview, contentStart: rawContentStart };
-    } else if (authorName) {
-        return { title: `${authorName} 的推文` };
-    }
-
-    // Fallback: 使用原始页面标题
-    let title = document.title;
-    title = title.replace(/^\(\d+\)\s*/, '');
-    title = title.replace(/\s+on X:\s*/, ': ');
-    title = title.replace(/\s*\/\s*X$/, '');
-    title = title.replace(/^[""]|[""]$/g, '');
-    return { title: title.trim() || '推文' };
+    console.log(`[twitterExtractor] 📄 标题解析: kind=${clipKind}, title="${result.title}"${result.contentStart ? ', with contentStart' : ''}`);
+    return result;
 }
 
 /**
@@ -1847,6 +2095,63 @@ function findQuoteTweetContainers(container: HTMLElement): HTMLElement[] {
     return containers;
 }
 
+interface QuoteContentCandidate {
+    source: 'ordered' | 'draft' | 'tweetText' | 'generic' | 'placeholder';
+    blocks: ContentBlock[];
+    text: string;
+    priority: number;
+}
+
+function createQuoteContentCandidate(
+    source: QuoteContentCandidate['source'],
+    priority: number,
+    blocks: ContentBlock[]
+): QuoteContentCandidate | null {
+    if (blocks.length === 0) {
+        return null;
+    }
+
+    return {
+        source,
+        blocks,
+        text: getContentBlocksText(blocks),
+        priority,
+    };
+}
+
+function getQuoteContentCandidateScore(candidate: QuoteContentCandidate): number {
+    const textLength = candidate.text.replace(/\s+/g, '').length;
+    const textBonus = hasTextualContentBlocks(candidate.blocks) ? 10_000 : 0;
+    const textualBlockCount = candidate.blocks.filter((block) =>
+        block.type !== 'image' && block.text.trim().length > 0
+    ).length;
+    const structureBonus = textualBlockCount > 1 ? 5_000 : 0;
+    const bilingualBonus = candidate.blocks.some((block) =>
+        block.layout?.role === 'original' || block.layout?.role === 'translation'
+    ) ? 2_000 : 0;
+    const spacerBonus = candidate.blocks.some((block) => block.layout?.role === 'spacer') ? 1_000 : 0;
+    return textBonus + structureBonus + bilingualBonus + spacerBonus + textualBlockCount * 50 + textLength * 10 + candidate.priority;
+}
+
+function selectBestQuoteContentCandidate(candidates: QuoteContentCandidate[]): QuoteContentCandidate | null {
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    return [...candidates]
+        .sort((left, right) => getQuoteContentCandidateScore(right) - getQuoteContentCandidateScore(left))[0] || null;
+}
+
+export function shouldAppendGenericQuoteFallback(
+    candidates: Array<Pick<QuoteContentCandidate, 'source' | 'blocks'>>
+): boolean {
+    return !candidates.some((candidate) =>
+        candidate.source !== 'generic' &&
+        candidate.source !== 'placeholder' &&
+        hasTextualContentBlocks(candidate.blocks)
+    );
+}
+
 /**
  * 提取单个 Quote Tweet 的内容
  * (重命名为 extractQuotedTweet 以符合新规范)
@@ -1862,20 +2167,17 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
     // 提取原推文链接 (优先级: DOM属性 > 内存缓存 > 重新提取)
     let fullUrl = savedUrl || cachedUrl || '';
 
+    if (!fullUrl) {
+        fullUrl = extractExternalQuoteCardHref(quoteContainer);
+    }
+
     // 1. 泛化链接查找：查找任何看起来像内容链接的 href
     const potentialLinks = quoteContainer.querySelectorAll('a[href]');
     for (const link of potentialLinks) {
         const href = link.getAttribute('href');
-        if (href && (
-            href.includes('/status/') ||
-            href.includes('/article/') ||
-            href.includes('/events/') ||
-            href.includes('/i/')
-        )) {
-            if (!href.includes('/photo/') && !href.includes('/video/') && !href.includes('/people/')) {
-                fullUrl = href.startsWith('http') ? href : `https://x.com${href}`;
-                break;
-            }
+        if (href && isPrimaryQuoteContentHref(href)) {
+            fullUrl = href.startsWith('http') ? href : `https://x.com${href}`;
+            break;
         }
     }
 
@@ -1888,13 +2190,18 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
         if (roleLink) {
             const containerHref = roleLink.getAttribute('href');
             if (containerHref && containerHref.length > 5) {
-                fullUrl = containerHref.startsWith('http') ? containerHref : `https://x.com${containerHref}`;
+                const normalizedHref = normalizeQuoteTweetUrl(
+                    containerHref.startsWith('http') ? containerHref : `https://x.com${containerHref}`
+                );
+                fullUrl = normalizedHref;
             } else if (!containerHref) {
                 // 如果 wrapper 自身没 href，找它里面的第一个有效链接
                 const innerLink = roleLink.querySelector('a[href*="/status/"], a[href*="/article/"]');
                 if (innerLink) {
                     const href = innerLink.getAttribute('href');
-                    if (href) fullUrl = href.startsWith('http') ? href : `https://x.com${href}`;
+                    if (href && isPrimaryQuoteContentHref(href)) {
+                        fullUrl = href.startsWith('http') ? href : `https://x.com${href}`;
+                    }
                 }
             }
         }
@@ -1907,7 +2214,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
             const attrs = ['data-url', 'data-permalink-path', 'href'];
             for (const attr of attrs) {
                 const val = el.getAttribute(attr);
-                if (val && (val.includes('/status/') || val.includes('/article/'))) {
+                if (val && isPrimaryQuoteContentHref(val)) {
                     fullUrl = val.startsWith('http') ? val : `https://x.com${val}`;
                     break;
                 }
@@ -1966,6 +2273,7 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
         console.log('[twitterExtractor] ⚠️ 未找到引用推文原始链接');
         fullUrl = '(未知链接)';
     } else {
+        fullUrl = normalizeQuoteTweetUrl(fullUrl);
         // 成功提取：保存到 DOM 属性和内存缓存
         if (!savedUrl) {
             quoteContainer.setAttribute('data-mowen-saved-url', fullUrl);
@@ -1976,32 +2284,49 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
         }
     }
 
-    // 提取文本
     const textEl = quoteContainer.querySelector('[data-testid="tweetText"]');
-    let text = '';
-    let html = '';
-    let segments: TweetTextSegment[] = [];
+    const orderedQuoteContent = extractQuoteOrderedBlocks(quoteContainer);
+    const referenceImages = orderedQuoteContent?.images || extractQuoteTweetImages(quoteContainer);
+    const candidates: QuoteContentCandidate[] = [];
+
+    const orderedCandidate = orderedQuoteContent
+        ? createQuoteContentCandidate('ordered', 4, orderedQuoteContent.blocks)
+        : null;
+    if (orderedCandidate) {
+        candidates.push(orderedCandidate);
+    }
 
     const draftArticleSegments = extractQuoteDraftArticleSegments(quoteContainer);
     if (draftArticleSegments.length > 0) {
-        segments = draftArticleSegments;
-        text = segments.map((segment) => trimExtractedSegmentText(segment.text)).filter(Boolean).join('\n');
-        html = renderTweetTextSegmentsToHtml(segments);
-    }
-
-    if (!text && textEl) {
-        segments = splitTweetTextIntoSegments(textEl as HTMLElement);
-        if (segments.length > 0) {
-            text = segments.map((segment) => trimExtractedSegmentText(segment.text)).filter(Boolean).join('\n');
-            html = renderTweetTextSegmentsToHtml(segments);
-        } else {
-            text = (textEl as HTMLElement).innerText || textEl.textContent || '';
-            html = cleanTwitterHtml((textEl as HTMLElement).innerHTML);
+        const draftCandidate = createQuoteContentCandidate(
+            'draft',
+            3,
+            buildQuoteContentBlocksFromSegments(draftArticleSegments)
+        );
+        if (draftCandidate) {
+            candidates.push(draftCandidate);
         }
     }
 
-    // 策略：通用文本提取 (如果找不到标准 tweetText)
-    if (!text.trim()) {
+    if (textEl) {
+        const tweetTextSegments = splitTweetTextIntoSegments(textEl as HTMLElement, {
+            allowReferenceDrivenSplit: false,
+        });
+        const tweetTextBlocks = tweetTextSegments.length > 0
+            ? buildQuoteContentBlocksFromSegments(tweetTextSegments)
+            : (() => {
+                const fallbackText = (textEl as HTMLElement).innerText || textEl.textContent || '';
+                const fallbackHtml = cleanTwitterHtml((textEl as HTMLElement).innerHTML);
+                const fallbackBlock = createQuoteContentBlock(fallbackText, fallbackHtml);
+                return fallbackBlock ? [fallbackBlock] : [];
+            })();
+        const tweetTextCandidate = createQuoteContentCandidate('tweetText', 2, tweetTextBlocks);
+        if (tweetTextCandidate) {
+            candidates.push(tweetTextCandidate);
+        }
+    }
+
+    if (shouldAppendGenericQuoteFallback(candidates)) {
         const clonedContainer = quoteContainer.cloneNode(true) as HTMLElement;
         const toRemove = clonedContainer.querySelectorAll(
             '[data-testid="User-Name"], time, [role="button"], svg, ' +
@@ -2009,42 +2334,62 @@ async function extractQuotedTweet(quoteContainer: HTMLElement): Promise<QuoteTwe
         );
         toRemove.forEach(el => el.remove());
 
-        text = clonedContainer.innerText?.trim() || '';
-        // 简单清理
-        text = text.replace(/^文章\n?/gm, '').replace(/^Article\n?/gm, '').trim();
-        html = `<p>${text.split('\n').join('</p><p>')}</p>`;
-    }
-
-    // 最终检查
-    if (!text.trim()) {
-        if (fullUrl) {
-            text = `（引用推文内容请查看原文）`;
-            html = text;
-        } else {
-            // 只要有图片，也算有效引用
-            const hasImages = quoteContainer.querySelector('img');
-            if (hasImages) {
-                text = `（引用内容为图片）`;
-                html = text;
-            } else {
-                // 没有URL，没有文字，没有图片 -> 放弃
-                return null;
-            }
+        const genericText = (clonedContainer.innerText?.trim() || '')
+            .replace(/^文章\n?/gm, '')
+            .replace(/^Article\n?/gm, '')
+            .trim();
+        const genericBlock = createQuoteContentBlock(
+            genericText,
+            genericText ? `<p>${genericText.split('\n').join('</p><p>')}</p>` : ''
+        );
+        const genericCandidate = genericBlock
+            ? createQuoteContentCandidate('generic', 1, [genericBlock])
+            : null;
+        if (genericCandidate) {
+            candidates.push(genericCandidate);
         }
     }
 
-    // 提取图片
-    const images = extractQuoteTweetImages(quoteContainer);
+    if (candidates.length === 0) {
+        let placeholderText = '';
+        if (fullUrl) {
+            placeholderText = '（引用推文内容请查看原文）';
+        } else if (referenceImages.length > 0 || quoteContainer.querySelector('img')) {
+            placeholderText = '（引用内容为图片）';
+        } else {
+            return null;
+        }
 
-    console.log(`[twitterExtractor] 🔍 Quote Tweet 提取结果: url=${fullUrl}, textLen=${text.length}, images=${images.length}`);
+        const placeholderBlock = createQuoteContentBlock(placeholderText, escapeHtml(placeholderText));
+        const placeholderCandidate = placeholderBlock
+            ? createQuoteContentCandidate('placeholder', 0, [placeholderBlock])
+            : null;
+        if (placeholderCandidate) {
+            candidates.push(placeholderCandidate);
+        }
+    }
+
+    const selectedCandidate = selectBestQuoteContentCandidate(candidates);
+    if (!selectedCandidate) {
+        return null;
+    }
+
+    const blocks = selectedCandidate.blocks.map((block) => cloneContentBlock(block));
+    if (referenceImages.length > 0 && !hasImageContentBlocks(blocks)) {
+        blocks.push(...referenceImages.map((image) => createImageContentBlock(image)));
+    }
+
+    const quoteText = selectedCandidate.text.trim();
+
+    console.log(
+        `[twitterExtractor] 🔍 Quote Tweet 提取结果: url=${fullUrl}, source=${selectedCandidate.source}, textLen=${quoteText.length}, images=${referenceImages.length}`
+    );
 
     return {
         url: fullUrl || '(未知链接)',
-        linkLabel: getQuoteLinkLabel(fullUrl || '(未知链接)', text.trim()),
-        segments,
-        text: text.trim(),
-        html,
-        images,
+        linkLabel: getQuoteLinkLabelFromBlocks(fullUrl || '(未知链接)', blocks),
+        blocks,
+        images: referenceImages,
     };
 }
 
@@ -2083,12 +2428,22 @@ function cleanTwitterHtml(html: string): string {
  * Twitter 的 tweetText 中，作者的换行通过 DOM 中的 <br> 元素表示。
  * 此函数将内容按 <br> 拆分为独立行，并对纯文本段落做中英文混合二次拆分。
  */
-function splitTweetTextIntoSegments(element: HTMLElement): TweetTextSegment[] {
+function splitTweetTextIntoSegments(
+    element: HTMLElement,
+    options: BilingualAlignmentOptions = {}
+): TweetTextSegment[] {
+    const structuredTranslationSegments = extractStructuredInlineTranslationSegments(element, options);
+    if (structuredTranslationSegments) {
+        return normalizeStructuredTweetSegments(structuredTranslationSegments);
+    }
+
     const translationPair = extractTranslationPairSegments(element);
     if (translationPair) {
-        return buildInlineTranslationPairSegments(
-            translationPair.original,
-            translationPair.translation
+        return normalizeStructuredTweetSegments(
+            buildInlineTranslationPairSegments(
+                translationPair.original,
+                translationPair.translation
+            )
         );
     }
 
@@ -2161,11 +2516,399 @@ function splitTweetTextParagraphs(text: string): string[] {
         .filter(Boolean);
 }
 
-function getFirstNonEmptyLine(text: string): string {
-    return text
-        .split('\n')
-        .map((line) => line.trim())
-        .find(Boolean) || '';
+export function normalizeQuoteTweetUrl(url: string): string {
+    return url
+        .replace(/\/(?:photo|video)\/\d+(?:\?.*)?$/i, '')
+        .replace(/[?#]$/, '');
+}
+
+function isPrimaryQuoteContentHref(href: string): boolean {
+    return Boolean(
+        href &&
+        (href.includes('/status/') || href.includes('/article/') || href.includes('/events/') || href.includes('/i/')) &&
+        !href.includes('/photo/') &&
+        !href.includes('/video/') &&
+        !href.includes('/people/')
+    );
+}
+
+export function buildQuoteBlocksFromSegments(segments: TweetTextSegment[]): ContentBlock[] {
+    if (segments.length === 0) {
+        return [];
+    }
+
+    const blocks: ContentBlock[] = [];
+
+    segments.forEach((segment) => {
+        if (segment.role === 'spacer') {
+            blocks.push(createStructuredTwitterSpacerBlock(segment.groupId));
+            return;
+        }
+
+        const trimmedText = segment.text.trim();
+        const trimmedHtml = segment.html.trim();
+        if (!trimmedText || !trimmedHtml) {
+            return;
+        }
+
+        blocks.push({
+            id: generateId(),
+            type: 'quote',
+            html: `<blockquote><p data-mowen-preserve-inline-paragraph="1">${trimmedHtml}</p></blockquote>`,
+            text: trimmedText,
+            layout: {
+                preserveInlineParagraphs: true,
+                ...(segment.groupId ? { groupId: segment.groupId } : {}),
+                role: segment.role === 'original' || segment.role === 'translation'
+                    ? segment.role
+                    : 'normal',
+            },
+        });
+    });
+
+    return normalizeStructuredTwitterBlocks(blocks);
+}
+
+function extractQuoteImageCandidate(
+    node: Element,
+    seenUrls: Set<string>
+): { image: ImageCandidate; block: ContentBlock } | null {
+    const img = (node instanceof HTMLImageElement
+        ? node
+        : node.querySelector('img')) as HTMLImageElement | null;
+
+    if (!img) {
+        return null;
+    }
+
+    const src = img.src || img.getAttribute('data-src') || '';
+    if (!src || src.startsWith('data:')) {
+        return null;
+    }
+
+    if (
+        src.includes('profile_images') ||
+        src.includes('emoji') ||
+        src.includes('twemoji') ||
+        src.includes('hashflags') ||
+        src.includes('abs.twimg.com')
+    ) {
+        return null;
+    }
+
+    const imgWidth = img.naturalWidth || img.width || 0;
+    const imgHeight = img.naturalHeight || img.height || 0;
+    const isTwimgMedia = src.includes('pbs.twimg.com/media/');
+    const hasValidSize = imgWidth > 100 && imgHeight > 100;
+    if (!hasValidSize && !isTwimgMedia) {
+        return null;
+    }
+
+    const normalizedUrl = normalizeImageUrl(src);
+    if (seenUrls.has(normalizedUrl)) {
+        return null;
+    }
+    seenUrls.add(normalizedUrl);
+
+    const image: ImageCandidate = {
+        id: generateId(),
+        url: src,
+        normalizedUrl,
+        kind: 'img',
+        order: 0,
+        inMainContent: true,
+        width: imgWidth,
+        height: imgHeight,
+        alt: img.alt || '',
+    };
+
+    const rawAlt = (img.alt || '').trim();
+    const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
+        rawAlt === 'null' || rawAlt === 'undefined';
+    const altText = (rawAlt && !isGeneric) ? rawAlt : '';
+
+    return {
+        image,
+        block: {
+            id: generateId(),
+            type: 'image',
+            html: `<img src="${src}" alt="${altText}" data-mowen-id="${image.id}" />`,
+            text: altText,
+        },
+    };
+}
+
+function isExternalQuoteCardContainer(container: HTMLElement): boolean {
+    return Boolean(container.querySelector(TWITTER_CARD_DETAIL_SELECTOR)) &&
+        !container.querySelector('[data-testid="tweetText"], .public-DraftStyleDefault-block, article[data-testid="tweet"], [data-testid="quoteTweet"]');
+}
+
+function extractExternalQuoteCardHref(container: HTMLElement): string {
+    if (!isExternalQuoteCardContainer(container)) {
+        return '';
+    }
+
+    const anchors = Array.from(container.querySelectorAll('a[href]'))
+        .filter((anchor): anchor is HTMLAnchorElement => anchor instanceof HTMLAnchorElement);
+    const preferredAnchor = anchors.find((anchor) => {
+        const href = anchor.href || anchor.getAttribute('href') || '';
+        return /^https?:\/\//i.test(href) && !isPrimaryQuoteContentHref(href);
+    });
+
+    return preferredAnchor?.href || '';
+}
+
+function extractQuoteCardDetailSegments(detailNode: HTMLElement): TweetTextSegment[] {
+    const detailRows = getVisibleElementChildren(detailNode);
+    const rowElements = detailRows.length > 0 ? detailRows : [detailNode];
+    const rowGroups: TweetTextSegment[][] = [];
+
+    rowElements.forEach((rowElement) => {
+        const rowText = trimExtractedSegmentText(rowElement.innerText || rowElement.textContent || '');
+        if (!rowText || isTwitterCardMetadataText(rowText)) {
+            return;
+        }
+
+        const rowSegments = splitTweetTextIntoSegments(rowElement, {
+            allowReferenceDrivenSplit: false,
+        }).filter((segment) => {
+            if (segment.role === 'spacer') {
+                return false;
+            }
+
+            return !isTwitterCardMetadataText(segment.text);
+        });
+
+        if (rowSegments.length > 0) {
+            rowGroups.push(rowSegments);
+            return;
+        }
+
+        rowGroups.push([{
+            html: escapeHtml(rowText),
+            text: rowText,
+            role: 'normal',
+        }]);
+    });
+
+    return buildTwitterCardSegments(rowGroups, generateId);
+}
+
+function extractQuoteArticleCoverSegments(quoteContainer: HTMLElement): TweetTextSegment[] {
+    if (
+        quoteContainer.querySelector('.public-DraftStyleDefault-block, [data-testid="tweetText"], [data-testid="quoteTweet"], article[data-testid="tweet"], ' + TWITTER_CARD_DETAIL_SELECTOR)
+    ) {
+        return [];
+    }
+
+    const articleCover = quoteContainer.querySelector('[data-testid="article-cover-image"]');
+    if (!(articleCover instanceof HTMLElement)) {
+        return [];
+    }
+
+    const cardRoot = articleCover.parentElement;
+    if (!(cardRoot instanceof HTMLElement)) {
+        return [];
+    }
+
+    const textSection = Array.from(cardRoot.children)
+        .filter((child): child is HTMLElement => child instanceof HTMLElement && child !== articleCover)
+        .find((child) => !!trimExtractedSegmentText(child.innerText || child.textContent || ''));
+    if (!textSection) {
+        return [];
+    }
+
+    const autoRows = Array.from(textSection.querySelectorAll('[dir="auto"]'))
+        .filter((row): row is HTMLElement => row instanceof HTMLElement)
+        .filter((row) => {
+            const rowText = trimExtractedSegmentText(row.innerText || row.textContent || '');
+            if (!rowText || isTwitterCardMetadataText(rowText)) {
+                return false;
+            }
+
+            return !Array.from(textSection.querySelectorAll('[dir="auto"]'))
+                .some((other) => other !== row && other.contains(row));
+        });
+    const rowElements = autoRows.length > 0
+        ? autoRows
+        : getVisibleElementChildren(textSection).filter((row) => {
+            const rowText = trimExtractedSegmentText(row.innerText || row.textContent || '');
+            return !!rowText && !isTwitterCardMetadataText(rowText);
+        });
+
+    const rowGroups: TweetTextSegment[][] = [];
+    rowElements.forEach((rowElement) => {
+        const rowText = trimExtractedSegmentText(rowElement.innerText || rowElement.textContent || '');
+        if (!rowText) {
+            return;
+        }
+
+        const rowSegments = splitTweetTextIntoSegments(rowElement, {
+            allowReferenceDrivenSplit: false,
+        }).filter((segment) => {
+            if (segment.role === 'spacer') {
+                return false;
+            }
+
+            return !isTwitterCardMetadataText(segment.text);
+        });
+
+        if (rowSegments.length > 0) {
+            rowGroups.push(rowSegments);
+            return;
+        }
+
+        rowGroups.push([{
+            html: escapeHtml(rowText),
+            text: rowText,
+            role: 'normal',
+        }]);
+    });
+
+    return buildTwitterCardSegments(rowGroups, generateId);
+}
+
+function hasQuoteHandledAncestor(node: Element, container: HTMLElement): boolean {
+    let current = node.parentElement;
+
+    while (current && current !== container) {
+        if (
+            current.classList.contains('public-DraftStyleDefault-block') ||
+            current.getAttribute('data-testid') === 'tweetText' ||
+            current.getAttribute('data-testid') === 'tweetPhoto'
+        ) {
+            return true;
+        }
+        current = current.parentElement;
+    }
+
+    return false;
+}
+
+function extractQuoteOrderedBlocks(quoteContainer: HTMLElement): {
+    blocks: ContentBlock[];
+    images: ImageCandidate[];
+    text: string;
+    html: string;
+    segments: TweetTextSegment[];
+} | null {
+    const blocks: ContentBlock[] = [];
+    const images: ImageCandidate[] = [];
+    const textParts: string[] = [];
+    const htmlParts: string[] = [];
+    const segments: TweetTextSegment[] = [];
+    const seenImageUrls = new Set<string>();
+    const processedTextNodes = new Set<HTMLElement>();
+
+    const articleCoverSegments = extractQuoteArticleCoverSegments(quoteContainer);
+    if (articleCoverSegments.length > 0) {
+        segments.push(...articleCoverSegments);
+        const quoteBlocks = buildQuoteBlocksFromSegments(articleCoverSegments);
+        quoteBlocks.forEach((block) => {
+            blocks.push(block);
+            htmlParts.push(block.html);
+            if (block.text.trim()) {
+                textParts.push(block.text);
+            }
+        });
+    }
+
+    const contentNodes = Array.from(quoteContainer.querySelectorAll(
+        `.public-DraftStyleDefault-block, [data-testid="tweetText"], ${TWITTER_CARD_DETAIL_SELECTOR}, [data-testid="tweetPhoto"], img`
+    )).filter((node): node is HTMLElement => node instanceof HTMLElement);
+
+    for (const node of contentNodes) {
+        if (hasQuoteHandledAncestor(node, quoteContainer)) {
+            continue;
+        }
+
+        if (node.classList.contains('public-DraftStyleDefault-block')) {
+            const blockSegments = extractQuoteDraftBlockSegments(node);
+            if (blockSegments.length === 0) {
+                continue;
+            }
+
+            processedTextNodes.add(node);
+            segments.push(...blockSegments);
+            const quoteBlocks = buildQuoteBlocksFromSegments(blockSegments);
+            quoteBlocks.forEach((block) => {
+                blocks.push(block);
+                htmlParts.push(block.html);
+                if (block.text.trim()) {
+                    textParts.push(block.text);
+                }
+            });
+            continue;
+        }
+
+        if (node.getAttribute('data-testid') === 'tweetText') {
+            if (processedTextNodes.has(node)) {
+                continue;
+            }
+
+            const blockSegments = splitTweetTextIntoSegments(node, {
+                allowReferenceDrivenSplit: false,
+            });
+            if (blockSegments.length === 0) {
+                continue;
+            }
+
+            processedTextNodes.add(node);
+            segments.push(...blockSegments);
+            const quoteBlocks = buildQuoteBlocksFromSegments(blockSegments);
+            quoteBlocks.forEach((block) => {
+                blocks.push(block);
+                htmlParts.push(block.html);
+                if (block.text.trim()) {
+                    textParts.push(block.text);
+                }
+            });
+            continue;
+        }
+
+        if (node.matches(TWITTER_CARD_DETAIL_SELECTOR)) {
+            if (processedTextNodes.has(node)) {
+                continue;
+            }
+
+            const blockSegments = extractQuoteCardDetailSegments(node);
+            if (blockSegments.length === 0) {
+                continue;
+            }
+
+            processedTextNodes.add(node);
+            segments.push(...blockSegments);
+            const quoteBlocks = buildQuoteBlocksFromSegments(blockSegments);
+            quoteBlocks.forEach((block) => {
+                blocks.push(block);
+                htmlParts.push(block.html);
+                if (block.text.trim()) {
+                    textParts.push(block.text);
+                }
+            });
+            continue;
+        }
+
+        const imageResult = extractQuoteImageCandidate(node, seenImageUrls);
+        if (imageResult) {
+            imageResult.image.order = images.length;
+            images.push(imageResult.image);
+            blocks.push(imageResult.block);
+            htmlParts.push(imageResult.block.html);
+        }
+    }
+
+    if (blocks.length === 0) {
+        return null;
+    }
+
+    return {
+        blocks,
+        images,
+        text: textParts.join('\n'),
+        html: htmlParts.join(''),
+        segments,
+    };
 }
 
 function getQuoteLinkLabel(url: string, text: string): string {
@@ -2175,6 +2918,7 @@ function getQuoteLinkLabel(url: string, text: string): string {
         .find((line) =>
             line &&
             line !== url &&
+            !isTwitterCardMetadataText(line) &&
             line !== '（引用推文内容请查看原文）' &&
             line !== '（引用内容为图片）'
         );
@@ -2186,252 +2930,27 @@ function getQuoteLinkLabel(url: string, text: string): string {
     return candidate.length > 80 ? `${candidate.substring(0, 80).trim()}...` : candidate;
 }
 
-function getParagraphLanguageKind(text: string): 'english' | 'chinese' | 'other' {
-    const normalized = text.trim();
-    if (!normalized) {
-        return 'other';
+export function getQuoteLinkLabelFromBlocks(url: string, blocks: ContentBlock[]): string {
+    const candidateLines = blocks
+        .filter((block) => block.type !== 'image')
+        .flatMap((block) => block.text.split('\n'))
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const firstMeaningfulLine = candidateLines.find((line) =>
+        line !== url &&
+        !isTwitterCardMetadataText(line) &&
+        line !== '（引用推文内容请查看原文）' &&
+        line !== '（引用内容为图片）'
+    );
+
+    if (firstMeaningfulLine) {
+        return firstMeaningfulLine.length > 80
+            ? `${firstMeaningfulLine.substring(0, 80).trim()}...`
+            : firstMeaningfulLine;
     }
 
-    const hanCount = countHanCharacters(normalized);
-    const latinWordCount = countLatinWords(normalized);
-
-    if (hanCount >= 2 && (latinWordCount === 0 || hanCount >= latinWordCount || hanCount >= 6)) {
-        return 'chinese';
-    }
-
-    if (
-        latinWordCount >= 2 &&
-        (hanCount === 0 || (hanCount <= 2 && /^[^\u4e00-\u9fff]*[A-Za-z]/.test(normalized)))
-    ) {
-        return 'english';
-    }
-
-    return 'other';
-}
-
-function getDominantParagraphLanguageKind(segments: Array<{ html: string; text: string }>): 'english' | 'chinese' | 'other' {
-    let englishCount = 0;
-    let chineseCount = 0;
-
-    for (const segment of segments) {
-        const kind = getParagraphLanguageKind(segment.text);
-        if (kind === 'english') {
-            englishCount += 1;
-        } else if (kind === 'chinese') {
-            chineseCount += 1;
-        }
-    }
-
-    if (englishCount === 0 && chineseCount === 0) {
-        return 'other';
-    }
-
-    return englishCount >= chineseCount ? 'english' : 'chinese';
-}
-
-function isTranslatedTweetParagraphPair(
-    firstSegments: TweetTextSegment[],
-    secondSegments: TweetTextSegment[]
-): boolean {
-    if (firstSegments.length === 0 || secondSegments.length === 0) {
-        return false;
-    }
-
-    if (firstSegments.length !== secondSegments.length || firstSegments.length < 3) {
-        return false;
-    }
-
-    const firstLanguage = getDominantParagraphLanguageKind(firstSegments);
-    const secondLanguage = getDominantParagraphLanguageKind(secondSegments);
-
-    if (firstLanguage === secondLanguage || firstLanguage === 'other' || secondLanguage === 'other') {
-        return false;
-    }
-
-    const headingLikeMatches = firstSegments.filter((segment, index) => {
-        const other = secondSegments[index];
-        if (!other) {
-            return false;
-        }
-
-        const firstText = segment.text.trim();
-        const secondText = other.text.trim();
-        if (!firstText || !secondText) {
-            return false;
-        }
-
-        return (
-            startsWithExplicitBlockMarker(firstText) === startsWithExplicitBlockMarker(secondText) ||
-            looksLikeStandaloneHeading(firstText, getXArticleSegmentLanguageKind(firstText)) ||
-            looksLikeStandaloneHeading(secondText, getXArticleSegmentLanguageKind(secondText))
-        );
-    }).length;
-
-    return headingLikeMatches >= Math.min(3, firstSegments.length);
-}
-
-function buildBilingualTweetParagraphSegments(
-    originalSegments: TweetTextSegment[],
-    translatedSegments: TweetTextSegment[]
-): TweetTextSegment[] {
-    const originalLanguage = getDominantParagraphLanguageKind(originalSegments);
-    const translatedLanguage = getDominantParagraphLanguageKind(translatedSegments);
-    const englishFirst = originalLanguage === 'english' || translatedLanguage !== 'english';
-    const primarySegments = englishFirst ? originalSegments : translatedSegments;
-    const secondarySegments = englishFirst ? translatedSegments : originalSegments;
-    const total = Math.max(primarySegments.length, secondarySegments.length);
-
-    const result: TweetTextSegment[] = [];
-
-    for (let index = 0; index < total; index++) {
-        const primary = primarySegments[index];
-        const secondary = secondarySegments[index];
-
-        if (!primary && !secondary) {
-            continue;
-        }
-
-        if (primary) {
-            result.push({
-                ...primary,
-                role: 'original',
-                textOnly: primary.textOnly,
-            });
-        }
-
-        if (secondary) {
-            result.push({
-                ...secondary,
-                role: 'translation',
-                textOnly: true,
-            });
-        }
-
-        if (index < total - 1) {
-            result.push(createTweetParagraphSpacerSegment());
-        }
-    }
-
-    return result;
-}
-
-function countHanCharacters(text: string): number {
-    return (text.match(/[\u4e00-\u9fff]/g) || []).length;
-}
-
-function countLatinWords(text: string): number {
-    return (text.match(/[A-Za-z]+(?:['’][A-Za-z]+)*/g) || []).length;
-}
-
-function splitMixedLanguageText(text: string): string[] {
-    const normalizedText = text.trim();
-    if (!normalizedText || countHanCharacters(normalizedText) === 0 || countLatinWords(normalizedText) === 0) {
-        return normalizedText ? [normalizedText] : [];
-    }
-
-    const boundaries = findMixedLanguageSplitBoundaries(normalizedText);
-    if (boundaries.length === 0) {
-        return [normalizedText];
-    }
-
-    const parts: string[] = [];
-    let start = 0;
-
-    for (const boundary of boundaries) {
-        const part = normalizedText.slice(start, boundary).trim();
-        if (part) {
-            parts.push(part);
-        }
-        start = boundary;
-    }
-
-    const trailingPart = normalizedText.slice(start).trim();
-    if (trailingPart) {
-        parts.push(trailingPart);
-    }
-
-    return parts.length > 0 ? parts : [normalizedText];
-}
-
-type XArticleSegmentLanguageKind = 'english' | 'chinese' | 'other';
-
-function getXArticleSegmentLanguageKind(text: string): XArticleSegmentLanguageKind {
-    const normalized = text.trim();
-    if (!normalized) {
-        return 'other';
-    }
-
-    const hanCount = countHanCharacters(normalized);
-    const latinWordCount = countLatinWords(normalized);
-
-    if (hanCount >= 2 && (latinWordCount === 0 || hanCount >= latinWordCount || hanCount >= 6)) {
-        return 'chinese';
-    }
-
-    if (
-        latinWordCount >= 2 &&
-        (hanCount === 0 || (hanCount <= 2 && /^[^\u4e00-\u9fff]*[A-Za-z]/.test(normalized)))
-    ) {
-        return 'english';
-    }
-
-    return 'other';
-}
-
-function endsWithHardParagraphBoundary(text: string): boolean {
-    return /[。！？!?；;:：]$/.test(text.trim());
-}
-
-function startsWithExplicitBlockMarker(text: string): boolean {
-    return /^([→➜•\-–—*]|\d+\.)\s*/.test(text.trim());
-}
-
-function looksLikeStandaloneHeading(text: string, kind: XArticleSegmentLanguageKind): boolean {
-    const normalized = text.trim();
-    if (!normalized || endsWithHardParagraphBoundary(normalized)) {
-        return false;
-    }
-
-    if (kind === 'english') {
-        const words = countLatinWords(normalized);
-        return words > 0 && words <= 8 && /^[A-Z0-9]/.test(normalized);
-    }
-
-    if (kind === 'chinese') {
-        const hanCount = countHanCharacters(normalized);
-        return hanCount > 0 && hanCount <= 10 && !/[，,]/.test(normalized);
-    }
-
-    return false;
-}
-
-function getSegmentJoiner(left: string, right: string, kind: XArticleSegmentLanguageKind): string {
-    const leftTrimmed = left.trimEnd();
-    const rightTrimmed = right.trimStart();
-    if (!leftTrimmed || !rightTrimmed) {
-        return '';
-    }
-
-    const leftLast = leftTrimmed[leftTrimmed.length - 1];
-    const rightFirst = rightTrimmed[0];
-    const leftIsLatin = /[A-Za-z0-9]/.test(leftLast);
-    const rightIsLatin = /[A-Za-z0-9]/.test(rightFirst);
-    const leftIsHan = /[\u4e00-\u9fff]/.test(leftLast);
-    const rightIsHan = /[\u4e00-\u9fff]/.test(rightFirst);
-
-    if (leftIsLatin && rightIsLatin) {
-        return ' ';
-    }
-
-    if (kind === 'english' && !/\s$/.test(leftTrimmed) && !/^\s/.test(rightTrimmed)) {
-        return ' ';
-    }
-
-    if (leftIsHan || rightIsHan) {
-        return '';
-    }
-
-    return '';
+    return getQuoteLinkLabel(url, getContentBlocksText(blocks));
 }
 
 function mergeXArticleContinuationSegments(segments: Array<{ html: string; text: string }>): Array<{ html: string; text: string }> {
@@ -2451,8 +2970,8 @@ function mergeXArticleContinuationSegments(segments: Array<{ html: string; text:
             continue;
         }
 
-        const previousKind = getXArticleSegmentLanguageKind(previous.text);
-        const currentKind = getXArticleSegmentLanguageKind(currentText);
+        const previousKind = detectTwitterSegmentLanguage(previous.text);
+        const currentKind = detectTwitterSegmentLanguage(currentText);
         const sameLanguage = previousKind !== 'other' && previousKind === currentKind;
 
         if (
@@ -2493,7 +3012,7 @@ function refineXArticleParagraphSegments(segments: Array<{ html: string; text: s
         return [{ html, text }];
     });
 
-    return mergeXArticleContinuationSegments(refined);
+    return refined;
 }
 
 /**
@@ -2513,10 +3032,10 @@ function splitNestedBrTextSegments(html: string): Array<{ html: string; text: st
         return [];
     }
 
-    return textLines.map((line) => ({
+    return mergeXArticleContinuationSegments(textLines.map((line) => ({
         html: escapeHtml(line),
         text: line,
-    }));
+    })));
 }
 
 function extractXArticleParagraphSegments(element: HTMLElement): Array<{ html: string; text: string }> {
@@ -2590,6 +3109,21 @@ function getFirstXArticleSegmentText(): string {
         .filter((block): block is HTMLElement => block instanceof HTMLElement);
 
     for (const block of draftBlocks) {
+        const translationPairGroups = extractXArticleTranslationPairSegments(block.cloneNode(true) as HTMLElement);
+        const preferredOriginal = translationPairGroups
+            ?.find((group) => group.original?.text?.trim())
+            ?.original?.text;
+        if (preferredOriginal) {
+            return preferredOriginal;
+        }
+
+        const fallbackTranslation = translationPairGroups
+            ?.find((group) => group.translation?.text?.trim())
+            ?.translation?.text;
+        if (fallbackTranslation) {
+            return fallbackTranslation;
+        }
+
         const segments = extractXArticleParagraphSegments(block);
         const firstText = segments.find((segment) => !!segment.text)?.text;
         if (firstText) {
@@ -2743,7 +3277,7 @@ async function extractTweetContent(container: HTMLElement, contentStart?: string
         if (nextElement && nextFullText) {
             const nextSegments = splitTweetTextIntoSegments(nextElement);
             if (isTranslatedTweetParagraphPair(segments, nextSegments)) {
-                segments = buildBilingualTweetParagraphSegments(segments, nextSegments);
+                segments = buildBilingualTweetParagraphSegments(segments, nextSegments, generateId);
                 elementIndex += 1;
             }
         }
@@ -2796,100 +3330,33 @@ async function extractTweetContent(container: HTMLElement, contentStart?: string
         if (seenTexts.has(normalizedCanonicalText)) continue;
         seenTexts.add(normalizedCanonicalText);
 
-        // 每个 segment 生成独立的 ContentBlock，并显式补回段落间空行。
-        // X 的 tweetText 真实段落边界来自空行文本，而墨问里相邻 paragraph 默认间距较紧，
-        // 因此这里插入一个空 paragraph 作为视觉分段，只作用于 Twitter/X 提取链路。
-        segments.forEach((seg, segmentIndex) => {
-            if (seg.role === 'spacer') {
-                contentParts.push(TWEET_PARAGRAPH_SPACER_HTML);
-                blocks.push({
-                    id: generateId(),
-                    type: 'paragraph',
-                    html: TWEET_PARAGRAPH_SPACER_HTML,
-                    text: '',
-                });
-                return;
-            }
-
-            if (!seg.text.trim()) return;
-            contentParts.push(`<div class="tweet-text">${seg.html}</div>`);
-            textParts.push(seg.text);
-            blocks.push({
-                id: generateId(),
-                type: 'paragraph',
-                html: seg.textOnly ? '' : `<p>${seg.html}</p>`,
-                text: seg.text,
-            });
-
-            const nextSeg = segments[segmentIndex + 1];
-            const shouldInsertSpacer =
-                nextSeg &&
-                nextSeg.role !== 'spacer' &&
-                seg.role !== 'original' &&
-                nextSeg.role !== 'translation';
-
-            if (shouldInsertSpacer) {
-                contentParts.push(TWEET_PARAGRAPH_SPACER_HTML);
-                blocks.push({
-                    id: generateId(),
-                    type: 'paragraph',
-                    html: TWEET_PARAGRAPH_SPACER_HTML,
-                    text: '',
-                });
+        segments.forEach((segment) => {
+            if (segment.role !== 'spacer' && segment.text.trim()) {
+                textParts.push(segment.text);
             }
         });
+        appendTwitterParagraphSegments(blocks, contentParts, segments);
     }
 
     console.log(`[twitterExtractor] 📝 主推文提取: ${mainTweetTextElements.length} 个文本块, ${textParts.length} 个有效段落`);
 
     // 4. 拼装引用推文（严格遵循 Link -> Quote -> Images 顺序）
     quoteTweets.forEach((qt, qtIndex) => {
-        // (1) 引用链接行
-        const linkLabel = escapeHtml(qt.linkLabel || qt.url);
-        const linkBlock: ContentBlock = {
-            id: generateId(),
-            type: 'paragraph',
-            html: `<p data-mowen-preserve-inline-paragraph="1">🔗 引用文章：<a href="${qt.url}">${linkLabel}</a></p>`,
-            text: `🔗 引用文章：${qt.linkLabel || qt.url}`,
-            layout: {
-                preserveInlineParagraphs: true,
-            },
-        };
-        blocks.push(linkBlock);
-        contentParts.push(linkBlock.html);
-        textParts.push(linkBlock.text);
-
-        // (2) 引用内容
-        // 仅在 X 剪藏链路内，把双语引用拆成多个独立 quote block + 空段，
-        // 避免进入通用 NoteAtom 转换时丢失“原文→译文→空行”的顺序。
-        appendQuoteTweetContentBlocks(blocks, contentParts, textParts, qt);
-
-        // (3) 引用图片（独立节点，在 quote 之后）
-        qt.images.forEach((img) => {
-            // Use real alt text if available and meaningful, otherwise empty string
-            const rawAlt = (img.alt || '').trim();
-            // Filter out generic placeholders
-            const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
-                rawAlt === 'null' || rawAlt === 'undefined';
-            const altText = (rawAlt && !isGeneric) ? rawAlt : '';
-
-            const imgBlock: ContentBlock = {
-                id: generateId(),
-                type: 'image',
-                html: `<img src="${img.url}" alt="${altText}" data-mowen-id="${img.id}" />`,
-                text: altText,
-            };
-            blocks.push(imgBlock);
-            contentParts.push(imgBlock.html);
-        });
+        appendQuoteTweetBlocks(blocks, contentParts, textParts, qt);
 
         console.log(`[twitterExtractor] 📝 Quote #${qtIndex + 1} 拼装: 图片=${qt.images.length}`);
     });
 
+    const {
+        blocks: normalizedBlocks,
+        contentHtml,
+        textContent,
+    } = finalizeTwitterContentBlocks(blocks);
+
     return {
-        contentHtml: contentParts.join(''),
-        blocks,
-        textContent: textParts.join('\n'),
+        contentHtml,
+        blocks: normalizedBlocks,
+        textContent,
         quoteTweets,
         quoteTweetContainers,
     };
@@ -3033,35 +3500,6 @@ function createEmptyResult(url: string, domain: string): ExtractResult {
 }
 
 /**
- * 检测是否为 X Article（长文章）
- * X Article 使用 Draft.js 格式渲染，特征是包含 public-DraftStyleDefault-block 类的元素
- */
-function detectXArticle(container: HTMLElement): boolean {
-    // 检测 Draft.js 块元素（X Article 的主要特征）
-    // X Article 页面使用 Draft.js 渲染，内容在 .public-DraftStyleDefault-block 类中
-    const draftBlocks = Array.from(container.querySelectorAll('.public-DraftStyleDefault-block'));
-
-    // 过滤掉可能是编辑器（如回复框）的块
-    const validBlocks = draftBlocks.filter(block => {
-        // 1. 忽略空内容的块（回复框默认是空的）
-        if (!block.textContent?.trim()) return false;
-
-        // 2. 忽略可编辑的块（这是输入框，不是发布的文章）
-        // Draft.js 编辑器的容器通常有 contenteditable="true"
-        if (block.getAttribute('contenteditable') === 'true') return false;
-        if (block.closest('[contenteditable="true"]')) return false;
-        return true;
-    });
-
-    if (validBlocks.length > 0) {
-        console.log(`[twitterExtractor] 📄 检测到 ${validBlocks.length} 个有效的 Draft.js 块 (已过滤空块和编辑器)`);
-        return true;
-    }
-
-    return false;
-}
-
-/**
  * 提取 X Article (长文章) 内容
  *
  * contentStart 参数用于移除已经作为标题使用的正文开头
@@ -3126,44 +3564,10 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                 if (quoteTweet) {
                     quoteTweets.push(quoteTweet);
                     quoteTweetContainers.push(element);
-
-                    // (1) 引用链接行
-                    const linkLabel = escapeHtml(quoteTweet.linkLabel || quoteTweet.url);
-                    const linkBlock: ContentBlock = {
-                        id: generateId(),
-                        type: 'paragraph',
-                        html: `<p data-mowen-preserve-inline-paragraph="1">🔗 引用文章：<a href="${quoteTweet.url}">${linkLabel}</a></p>`,
-                        text: `🔗 引用文章：${quoteTweet.linkLabel || quoteTweet.url}`,
-                        layout: {
-                            preserveInlineParagraphs: true,
+                    appendQuoteTweetBlocks(blocks, contentParts, textParts, quoteTweet, {
+                        onImage: (image) => {
+                            images.push(image);
                         },
-                    };
-                    blocks.push(linkBlock);
-                    contentParts.push(linkBlock.html);
-                    textParts.push(linkBlock.text);
-
-                    // (2) 引用内容
-                    // 仅在 X 剪藏链路内按段落序列写入 quote block，避免双语错位。
-                    appendQuoteTweetContentBlocks(blocks, contentParts, textParts, quoteTweet);
-
-                    // (3) 引用图片
-                    quoteTweet.images.forEach((img: ImageCandidate) => {
-                        // Use real alt text if available and meaningful, otherwise empty string
-                        const rawAlt = (img.alt || '').trim();
-                        // Filter out generic placeholders
-                        const isGeneric = /^(图片|图像|引用图|Image|Img|Picture|Photo)(\s*\d+)?$/i.test(rawAlt) ||
-                            rawAlt === 'null' || rawAlt === 'undefined';
-                        const altText = (rawAlt && !isGeneric) ? rawAlt : '';
-
-                        const imgBlock: ContentBlock = {
-                            id: generateId(),
-                            type: 'image',
-                            html: `<img src="${img.url}" alt="${altText}" data-mowen-id="${img.id}" />`,
-                            text: altText,
-                        };
-                        blocks.push(imgBlock);
-                        contentParts.push(imgBlock.html);
-                        images.push(img); // X Article 模式下图片统一收集
                     });
 
                     console.log(`[twitterExtractor] 📝 Quote Tweet 按顺序插入: url=${quoteTweet.url}, images=${quoteTweet.images.length}`);
@@ -3214,24 +3618,11 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
 
                         seenTexts.add(fullText);
                         textParts.push(fullText);
-
-                        translationPairGroups.forEach((group, groupIndex) => {
-                            if (group.original) {
-                                appendXArticleParagraphBlock(blocks, contentParts, group.original, {
-                                    groupId: group.id,
-                                    role: 'original',
-                                });
-                            }
-                            if (group.translation) {
-                                appendXArticleParagraphBlock(blocks, contentParts, group.translation, {
-                                    groupId: group.id,
-                                    role: 'translation',
-                                });
-                            }
-                            if (groupIndex < translationPairGroups.length - 1) {
-                                appendXArticleSpacerBlock(blocks, contentParts, group.id);
-                            }
-                        });
+                        appendTwitterParagraphSegments(
+                            blocks,
+                            contentParts,
+                            buildTwitterSegmentsFromXArticleTranslationGroups(translationPairGroups)
+                        );
                     }
                     stack.pop();
                     continue;
@@ -3263,17 +3654,15 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
                     const paragraphSegments = segments.length > 0
                         ? segments
                         : [];
-
-                    paragraphSegments.forEach((segment, segmentIndex) => {
-                        const groupId = generateId();
-                        appendXArticleParagraphBlock(blocks, contentParts, segment, {
-                            groupId,
-                            role: 'normal',
-                        });
-                        if (segmentIndex < paragraphSegments.length - 1) {
-                            appendXArticleSpacerBlock(blocks, contentParts, groupId);
-                        }
-                    });
+                    appendTwitterParagraphSegments(
+                        blocks,
+                        contentParts,
+                        paragraphSegments.map((segment) => ({
+                            html: segment.html,
+                            text: segment.text,
+                            role: 'normal' as const,
+                        }))
+                    );
                 }
                 stack.pop(); // 不再递归处理文字块内部
                 continue;
@@ -3421,15 +3810,13 @@ async function extractXArticleContent(container: HTMLElement, contentStart?: str
         }
     }
 
-    debugLogXArticleBlockSequence('重排前', blocks);
-    const normalizedBlocks = insertXArticleSpacing(rebalanceXArticleBilingualBlocks(blocks));
-    debugLogXArticleBlockSequence('重排后', normalizedBlocks);
-    // 使用空字符串连接，避免产生额外的空行（空行会被 noteAtom 解析为空段落）
-    const contentHtml = normalizedBlocks.map((block) => block.html).join('');
-    const textContent = normalizedBlocks
-        .map((block) => block.text.trim())
-        .filter(Boolean)
-        .join('\n');
+    debugLogXArticleBlockSequence('结构化输出前', blocks);
+    const {
+        blocks: normalizedBlocks,
+        contentHtml,
+        textContent,
+    } = finalizeTwitterContentBlocks(blocks);
+    debugLogXArticleBlockSequence('结构化输出后', normalizedBlocks);
 
     console.log(`[twitterExtractor] 📄 X Article 按顺序提取完成: ${normalizedBlocks.length} 个块, ${textContent.length} 字, ${images.length} 张图片, ${quoteTweets.length} 个引用`);
 

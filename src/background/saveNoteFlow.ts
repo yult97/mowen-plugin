@@ -1,5 +1,6 @@
 import {
   ContentBlock,
+  CreateNoteRequest,
   ExtractResult,
   ImageCandidate,
   ImageProcessResult,
@@ -9,33 +10,6 @@ import {
 import { createNote, createNoteWithBody } from '../services/api';
 import { GlobalRateLimiter } from '../utils/rateLimiter';
 import { sleep } from '../utils/helpers';
-
-interface NoteAtomMark {
-  type: string;
-  attrs?: Record<string, unknown>;
-}
-
-interface NoteAtomNode {
-  type: string;
-  text?: string;
-  marks?: NoteAtomMark[];
-  content?: NoteAtomNode[];
-  attrs?: Record<string, unknown>;
-}
-
-interface NoteAtomDoc {
-  type: string;
-  content?: NoteAtomNode[];
-}
-
-export interface NoteSplitPart {
-  index: number;
-  total: number;
-  title: string;
-  content?: string;
-  body?: NoteAtomDoc;
-  isIndex?: boolean;
-}
 
 interface CreatedNote {
   partIndex: number;
@@ -130,7 +104,7 @@ export async function prepareContentForSave(params: {
 }
 
 export async function createSplitNotes(params: {
-  parts: NoteSplitPart[];
+  parts: CreateNoteRequest[];
   maxRetryRounds: number;
   tabId: number;
   taskId: string;
@@ -203,13 +177,16 @@ export async function createSplitNotes(params: {
 
       try {
         result = await GlobalRateLimiter.schedule(async () => {
-          if (part.body) {
+          if (part.createMode === 'body') {
             return createNoteWithBody(
               apiKey,
               part.body as unknown as Record<string, unknown>,
-              isPublic,
-              enableAutoTag,
-              signal
+              {
+                isPublic,
+                enableAutoTag,
+                signal,
+                title: part.title,
+              }
             );
           }
 
@@ -217,10 +194,10 @@ export async function createSplitNotes(params: {
           return createNote(
             apiKey,
             part.title,
-            part.content || '',
+            part.content,
             isPublic,
             logWrapper,
-            sourceUrl,
+            part.sourceUrl || sourceUrl,
             enableAutoTag,
             signal
           );
@@ -268,7 +245,7 @@ export async function createSplitNotes(params: {
 
 export async function createIndexNoteIfNeeded(params: {
   createIndexNote: boolean;
-  parts: NoteSplitPart[];
+  parts: CreateNoteRequest[];
   createdNotes: CreatedNote[];
   title: string;
   sourceUrl: string;
@@ -319,7 +296,12 @@ export async function createIndexNoteIfNeeded(params: {
   }
 
   const indexResult = await GlobalRateLimiter.schedule(async () => (
-    createNoteWithBody(apiKey, indexBody, isPublic, enableAutoTag, signal)
+    createNoteWithBody(apiKey, indexBody, {
+      isPublic,
+      enableAutoTag,
+      signal,
+      title: `${title}（合集）`,
+    })
   ));
 
   if (indexResult.success) {

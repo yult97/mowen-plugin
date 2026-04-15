@@ -34,6 +34,7 @@ export interface ExtractResult {
   domain: string;
   author?: string;
   publishTime?: string;
+  clipKind?: ClipKind;
   contentHtml: string;
   blocks: ContentBlock[];
   images: ImageCandidate[];
@@ -94,6 +95,36 @@ export interface NotePart {
   content: string;
   isIndex?: boolean;
 }
+
+export type ClipKind =
+  | 'default'
+  | 'twitter-post'
+  | 'x-longform';
+
+interface CreateNoteRequestBase {
+  index: number;
+  total: number;
+  title: string;
+  isIndex?: boolean;
+}
+
+export interface HtmlCreateNoteRequest extends CreateNoteRequestBase {
+  createMode: 'html';
+  content: string;
+  sourceUrl?: string;
+}
+
+export interface BodyCreateNoteRequest extends CreateNoteRequestBase {
+  createMode: 'body';
+  body: {
+    type: string;
+    content?: unknown[];
+  };
+}
+
+export type CreateNoteRequest =
+  | HtmlCreateNoteRequest
+  | BodyCreateNoteRequest;
 
 export interface NoteCreateResult {
   success: boolean;
