@@ -131,3 +131,57 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #D0C8C2;
 }
+
+.md-import-preview-article pre.md-import-codeblock {
+  position: relative;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  box-sizing: border-box;
+  scrollbar-gutter: stable both-edges;
+}
+
+.md-import-preview-article pre.md-import-codeblock code {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  padding-right: 2.5rem;
+  white-space: inherit;
+  word-break: inherit;
+  overflow-wrap: inherit;
+}
+
+.md-import-preview-article pre.md-import-codeblock::after {
+  content: '⧉';
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  font-size: 18px;
+  line-height: 1;
+  color: #4B8FF5;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.md-import-preview-article p.md-import-list-paragraph {
+  padding-left: 1.8em;
+  text-indent: -1.2em;
+}
+
+.md-import-preview-article p.md-import-list-paragraph-ordered {
+  padding-left: 2.2em;
+  text-indent: -1.55em;
+}
+
+.md-import-preview-article mark {
+  background: #ffe34d;
+  color: inherit;
+  border-radius: 0;
+  padding: 0 0.08em;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}

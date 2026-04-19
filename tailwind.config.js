@@ -2,6 +2,7 @@
 export default {
   content: [
     "./popup.html",
+    "./mdImport.html",
     "./options.html",
     "./src/**/*.{js,ts,jsx,tsx}",
   ],

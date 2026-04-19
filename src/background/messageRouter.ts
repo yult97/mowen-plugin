@@ -42,6 +42,7 @@ export function registerBackgroundMessageRouter(deps: {
   };
   saveSettings: (payload: Record<string, unknown>) => Promise<void>;
   handleSaveNote: (payload: any, tabId: number) => Promise<NoteCreateResult>;
+  handleSaveMarkdownNote: (payload: any, tabId: number) => Promise<NoteCreateResult>;
   handleSaveHighlight: (payload: SaveHighlightPayload) => Promise<HighlightSaveResult>;
   isTrustedExtensionPageSender: (sender: chrome.runtime.MessageSender) => boolean;
   isAllowedMowenWebApiPath: (path: string) => boolean;
@@ -58,6 +59,7 @@ export function registerBackgroundMessageRouter(deps: {
     taskStore,
     saveSettings,
     handleSaveNote,
+    handleSaveMarkdownNote,
     handleSaveHighlight,
     isTrustedExtensionPageSender,
     isAllowedMowenWebApiPath,
@@ -163,7 +165,7 @@ export function registerBackgroundMessageRouter(deps: {
       return true;
     }
 
-    if (message.type === 'SAVE_NOTE') {
+    if (message.type === 'SAVE_NOTE' || message.type === 'SAVE_MARKDOWN_NOTE') {
       if (!message.payload) {
         sendResponse({ success: false, error: 'Payload is undefined' });
         return false;
@@ -199,7 +201,11 @@ export function registerBackgroundMessageRouter(deps: {
         }
 
         try {
-          handleSaveNote(message.payload, targetTabId)
+          const handler = message.type === 'SAVE_MARKDOWN_NOTE'
+            ? handleSaveMarkdownNote
+            : handleSaveNote;
+
+          handler(message.payload, targetTabId)
             .then((result) => {
               chrome.runtime.sendMessage({
                 type: 'SAVE_NOTE_COMPLETE',

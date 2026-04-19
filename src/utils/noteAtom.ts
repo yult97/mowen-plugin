@@ -102,10 +102,65 @@ interface ProtectedInlineParagraph {
 
 interface HtmlToNoteAtomOptions {
   preserveInlineParagraphs?: boolean;
+  enforceSingleTextBlockSpacing?: boolean;
 }
 
 const PRESERVE_INLINE_PARAGRAPH_ATTR = 'data-mowen-preserve-inline-paragraph';
 const INLINE_BREAK_SENTINEL = '\uE000';
+const INVISIBLE_TEXT_CHAR_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/g;
+
+function escapeHtmlAttributeValue(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => (
+    char === '&' ? '&amp;' :
+      char === '<' ? '&lt;' :
+        char === '>' ? '&gt;' :
+          char === '"' ? '&quot;' : '&#39;'
+  ));
+}
+
+function attachFigureCaptionToImageTag(imgTag: string, caption: string): string {
+  const normalizedCaption = caption.trim();
+  if (!normalizedCaption || /data-mowen-caption\s*=/.test(imgTag)) {
+    return imgTag;
+  }
+
+  const closingMatch = imgTag.match(/\s*\/?>$/);
+  if (!closingMatch) {
+    return imgTag;
+  }
+
+  const closing = closingMatch[0];
+  const start = imgTag.slice(0, -closing.length);
+  return `${start} data-mowen-caption="${escapeHtmlAttributeValue(normalizedCaption)}"${closing}`;
+}
+
+function normalizeSimpleFigureImages(html: string): string {
+  return html.replace(/<figure\b[^>]*>([\s\S]*?)<\/figure>/gi, (match, innerHtml: string) => {
+    const imageTags = innerHtml.match(/<img\b[^>]*>/gi) || [];
+    if (imageTags.length !== 1) {
+      return match;
+    }
+
+    const figureCaptionMatches = Array.from(innerHtml.matchAll(/<figcaption\b[^>]*>([\s\S]*?)<\/figcaption>/gi));
+    const strippedRemainder = innerHtml
+      .replace(imageTags[0], '')
+      .replace(/<figcaption\b[^>]*>[\s\S]*?<\/figcaption>/gi, '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/&nbsp;|&#160;/gi, ' ')
+      .replace(/\s+/g, '');
+
+    if (strippedRemainder.length > 0) {
+      return match;
+    }
+
+    const caption = figureCaptionMatches
+      .map((captionMatch) => stripHtmlAndDecodePreserveLineBreaks(captionMatch[1] || '').trim())
+      .filter(Boolean)
+      .join('\n');
+
+    return attachFigureCaptionToImageTag(imageTags[0], caption);
+  });
+}
 
 // Block-level tags are handled inline in parseBlockContent
 
@@ -170,7 +225,7 @@ export function htmlToNoteAtom(html: string, options: HtmlToNoteAtomOptions = {}
     const protectedCode = protectCodeBlocks(html);
 
     // 1. Clean script/style/comments
-    let processed = protectedCode.html
+    let processed = normalizeSimpleFigureImages(protectedCode.html)
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gmi, '')
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gmi, '')
       .replace(/<!--[\s\S]*?-->/g, '');
@@ -250,6 +305,12 @@ function parseBlockContent(
     return convertListItems(content, true);
   });
 
+  // 4.5 Preserve intentionally empty block tags before generic boundary splitting.
+  normalized = normalized.replace(
+    /<(p|div|section|article|main|aside|header|footer)\b[^>]*>(?:\s|&nbsp;|&#160;|<br\s*\/?>)*<\/\1>/gi,
+    '\n<!--EMPTY_BLOCK-->\n'
+  );
+
   // 5.1 保护需要“禁止二次按中英混排拆段”的段落（例如 X Article 原文/译文对照）
   const protectedInlineParagraphs: ProtectedInlineParagraph[] = [];
   normalized = normalized.replace(
@@ -274,6 +335,7 @@ function parseBlockContent(
     .replace(/(<!--QUOTE:\d+-->)/g, '\n$1\n')
     .replace(/(@@MOWEN_CODE_BLOCK_\d+@@)/g, '\n$1\n')
     .replace(/(@@MOWEN_PRESERVE_PARAGRAPH_\d+@@)/g, '\n$1\n')
+    .replace(/(<!--EMPTY_BLOCK-->)/g, '\n$1\n')
     .replace(/(<!--IMG:\d+-->)/g, '$1');
 
   // 7. Split by block boundaries
@@ -295,9 +357,12 @@ function parseBlockContent(
 
       // Handle empty block - create empty paragraph for spacing
       if (isEmptyBlock) {
-        // Only add empty paragraph if we already have content (avoid leading empty lines)
+        continue;
+      }
+
+      if (trimmed === '<!--EMPTY_BLOCK-->') {
         if (blocks.length > 0) {
-          blocks.push({ type: 'paragraph' }); // No content field for empty paragraph per API spec
+          blocks.push({ type: 'paragraph' });
           stats.paragraph++;
         }
         continue;
@@ -461,7 +526,7 @@ function parseBlockContent(
   } // 结束 for (const segment of segments)
 
   // 7. Post-process blocks for better layout (styles, splitting, empty lines)
-  return postProcessBlocks(blocks);
+  return postProcessBlocks(blocks, options);
 }
 
 /**
@@ -471,7 +536,7 @@ function parseBlockContent(
  * 3. Split paragraphs on keywords
  * 4. Insert smart empty lines
  */
-function postProcessBlocks(blocks: NoteAtom[]): NoteAtom[] {
+function postProcessBlocks(blocks: NoteAtom[], options: HtmlToNoteAtomOptions = {}): NoteAtom[] {
   const result: NoteAtom[] = [];
 
   for (let i = 0; i < blocks.length; i++) {
@@ -513,7 +578,10 @@ function postProcessBlocks(blocks: NoteAtom[]): NoteAtom[] {
 
   // Deduplicate consecutive empty paragraphs - keep only one
   // Also filter out unwanted social media content
-  return filterAndDeduplicateBlocks(result);
+  const filtered = filterAndDeduplicateBlocks(result);
+  return options.enforceSingleTextBlockSpacing
+    ? enforceSingleTextBlockSpacing(filtered)
+    : filtered;
 }
 
 /**
@@ -521,6 +589,25 @@ function postProcessBlocks(blocks: NoteAtom[]): NoteAtom[] {
  */
 function isEmptyParagraph(block: NoteAtom): boolean {
   return block.type === 'paragraph' && (!block.content || block.content.length === 0);
+}
+
+function isTextualParagraph(block: NoteAtom | undefined): boolean {
+  return !!block && block.type === 'paragraph' && !!block.content && block.content.length > 0;
+}
+
+function isMetadataParagraph(block: NoteAtom | undefined): boolean {
+  if (!isTextualParagraph(block) || isListLikeParagraph(block)) {
+    return false;
+  }
+
+  const text = getTextFromAtom(block as NoteAtom)
+    .replace(INVISIBLE_TEXT_CHAR_PATTERN, '')
+    .trim();
+  if (!text || text.length > 60) {
+    return false;
+  }
+
+  return /^[A-Za-z0-9\u4e00-\u9fff_()[\]【】《》<>·•、/+\-.]{1,18}[：:]\s*\S+/.test(text);
 }
 
 /**
@@ -538,6 +625,25 @@ function isSelfSpacedBlock(block: NoteAtom | undefined): boolean {
     block.type === 'note' ||
     block.type === 'file'
   );
+}
+
+/**
+ * Markdown 列表在当前链路里会被展平成带前缀的段落。
+ * 这些段落之间不应该再保留占位空段落，否则会把列表项拉成“段落 + 空行 + 段落”。
+ */
+function isListLikeParagraph(block: NoteAtom | undefined): boolean {
+  if (!block || block.type !== 'paragraph' || !block.content || block.content.length === 0) {
+    return false;
+  }
+
+  const text = normalizeListLikeParagraphText(getTextFromAtom(block));
+  return /^(?:[•·▪◦●○]\s+|\d+[.)、]\s*)/.test(text);
+}
+
+function normalizeListLikeParagraphText(text: string): string {
+  return text
+    .replace(INVISIBLE_TEXT_CHAR_PATTERN, '')
+    .trim();
 }
 
 /**
@@ -616,6 +722,7 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
     // Preserve empty paragraphs only between text paragraphs.
     if (isEmptyParagraph(block)) {
       const isAfterSelfSpacedBlock = isSelfSpacedBlock(lastBlock);
+      const isAfterListLikeParagraph = isListLikeParagraph(lastBlock);
 
       // Check if next NON-EMPTY block is a self-spaced block (look-ahead)
       // We need to find the next block that will actually be in the output
@@ -627,9 +734,15 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
         }
       }
       const isBeforeSelfSpacedBlock = isSelfSpacedBlock(nextRealBlock);
+      const isBeforeListLikeParagraph = isListLikeParagraph(nextRealBlock);
 
-      if (isAfterSelfSpacedBlock || isBeforeSelfSpacedBlock) {
-        continue; // Skip placeholder-derived spacers around structural blocks
+      if (
+        isAfterSelfSpacedBlock ||
+        isBeforeSelfSpacedBlock ||
+        isAfterListLikeParagraph ||
+        isBeforeListLikeParagraph
+      ) {
+        continue; // Skip placeholder-derived spacers around structural blocks and list items
       }
     }
 
@@ -639,7 +752,10 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
       const altText = String(lastBlock.attrs?.alt || '').trim();
       if (altText) {
         // Normalize: remove punctuation and whitespace for loose comparison
-        const normalize = (s: string) => s.replace(/[.,;!。，；！\s]/g, '').toLowerCase();
+        const normalize = (s: string) => s
+          .replace(INVISIBLE_TEXT_CHAR_PATTERN, '')
+          .replace(/[.,;:!。，；：！\s]/g, '')
+          .toLowerCase();
         const currentText = getTextFromAtom(block).trim();
 
         if (currentText) {
@@ -672,6 +788,41 @@ function filterAndDeduplicateBlocks(blocks: NoteAtom[]): NoteAtom[] {
   return filtered;
 }
 
+function enforceSingleTextBlockSpacing(blocks: NoteAtom[]): NoteAtom[] {
+  const normalized: NoteAtom[] = [];
+
+  for (const block of blocks) {
+    const lastBlock = normalized[normalized.length - 1];
+
+    if (shouldInsertSpacerParagraph(lastBlock, block)) {
+      normalized.push({ type: 'paragraph' });
+    }
+
+    normalized.push(block);
+  }
+
+  return normalized;
+}
+
+function shouldInsertSpacerParagraph(previous: NoteAtom | undefined, current: NoteAtom | undefined): boolean {
+  if (!isTextualParagraph(previous) || !isTextualParagraph(current)) {
+    return false;
+  }
+
+  if (isMetadataParagraph(previous) && isMetadataParagraph(current)) {
+    return false;
+  }
+
+  const previousIsList = isListLikeParagraph(previous);
+  const currentIsList = isListLikeParagraph(current);
+
+  if (previousIsList && currentIsList) {
+    return false;
+  }
+
+  return true;
+}
+
 /**
  * Process a single block and apply formatting/empty line rules
  */
@@ -679,11 +830,14 @@ function processSingleBlock(block: NoteAtom, result: NoteAtom[]) {
   // Apply formatting (Heading detection)
   if (block.type === 'paragraph') {
     const text = getTextFromAtom(block).trim();
+    const isListParagraph = isListLikeParagraph(block);
 
     // Rule 1 & 4 (Heading patterns): "一、", "二、", "16 个..." (Title-like?), "5 个..."
     // Heuristic: Short lines starting with number patterns or specific chars
-    const isHeadingPattern = /^(一|二|三|四|五|六|七|八|九|十|\d+)(\.|、|\s)/.test(text) ||
-      text.length < 30 && /^(提示词|适用|核心问题)/.test(text);
+    const isHeadingPattern = !isListParagraph && (
+      /^(一|二|三|四|五|六|七|八|九|十|\d+)(\.|、|\s)/.test(text) ||
+      (text.length < 30 && /^(提示词|适用|核心问题)/.test(text))
+    );
 
     // Apply bold if heading pattern (and not already bold)
     if (isHeadingPattern && block.content) {
@@ -935,7 +1089,7 @@ function shouldPreserveInlineParagraph(text: string): boolean {
   // Preserve metadata rows such as source / quoted-article labels.
   // These rows often intentionally mix Chinese labels with English link titles
   // and should stay inline instead of being split into separate paragraphs.
-  return /^([📄🔗]\s*)?(来源：|引用文章：)/.test(normalized);
+  return /^([📄🔗]\s*)?(来源：|引用文章：)/u.test(normalized);
 }
 
 function sliceInlineContentNodes(content: NoteAtom[], start: number, end: number): NoteAtom[] {
@@ -1409,10 +1563,7 @@ function extractImageData(imgTag: string): ImageData | null {
   } else if (dataIdMatch?.[1] && uuidRegex.test(dataIdMatch[1])) {
     uuid = dataIdMatch[1];
   } else {
-    const mowenCdnMatch = srcMatch[1].match(/(?:mowen\.cn|mw-assets)\/([a-zA-Z0-9_-]{10,})/);
-    if (mowenCdnMatch) {
-      uuid = mowenCdnMatch[1];
-    }
+    uuid = extractMowenUuidFromImageUrl(srcMatch[1]);
   }
 
   // 优先使用提取到的 Caption 作为 alt
@@ -1435,6 +1586,33 @@ function extractImageData(imgTag: string): ImageData | null {
     alt: finalAlt,
     uuid: uuid || undefined
   };
+}
+
+function extractMowenUuidFromImageUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const isMowenHost = /(^|\.)mowen\.cn$/i.test(parsed.hostname) || /mw-assets/i.test(parsed.hostname);
+    if (!isMowenHost) {
+      return '';
+    }
+
+    const segments = parsed.pathname
+      .split('/')
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const candidate = segments[index] || '';
+      if (/^[a-zA-Z0-9_-]{10,}$/.test(candidate)) {
+        return candidate;
+      }
+    }
+
+    return '';
+  } catch {
+    const match = rawUrl.match(/\/([a-zA-Z0-9_-]{10,})(?:[#?].*)?$/);
+    return match?.[1] || '';
+  }
 }
 
 /**

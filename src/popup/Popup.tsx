@@ -68,6 +68,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     chrome.tabs.create({ url });
   };
 
+  const openMdImport = () => {
+    const url = chrome.runtime.getURL('mdImport.html');
+    chrome.tabs.create({ url });
+  };
+
   const matchesCurrentTaskMessage = (tabId?: number, taskId?: string) => {
     return (
       typeof tabId === 'number' &&
@@ -1758,20 +1763,33 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
   return (
     <div className={isSidePanel ? 'sidepanel-container p-4' : 'popup-container p-4'}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <h1 className="text-lg font-semibold text-text-primary">墨问笔记助手</h1>
-        <div className="flex items-center gap-1.5">
+      <div className="mb-4 flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate pr-1 text-[17px] font-semibold tracking-[-0.02em] text-text-primary">
+            墨问笔记助手
+          </h1>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5 whitespace-nowrap">
           <button
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
+            className="inline-flex shrink-0 items-center gap-1 px-2.5 py-1.5 text-[13px] leading-none text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
             onClick={openNotesExport}
             title="我的笔记"
           >
             <BookOpen size={15} />
-            <span>我的笔记</span>
-            <ExternalLink size={13} />
+            <span className="whitespace-nowrap">我的笔记</span>
+            <ExternalLink size={13} className="shrink-0" />
           </button>
           <button
-            className="p-2 hover:bg-brand-soft rounded-lg transition-colors"
+            className="inline-flex shrink-0 items-center gap-1 px-2.5 py-1.5 text-[13px] leading-none text-text-secondary hover:text-brand-primary hover:bg-brand-soft rounded-lg transition-colors"
+            onClick={openMdImport}
+            title="导入 Markdown"
+          >
+            <FileText size={15} />
+            <span className="whitespace-nowrap">导入 MD</span>
+            <ExternalLink size={13} className="shrink-0" />
+          </button>
+          <button
+            className="shrink-0 p-2 hover:bg-brand-soft rounded-lg transition-colors"
             onClick={() => openOptions()}
             title="设置"
           >
@@ -1779,7 +1797,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           </button>
           {!isSidePanel && (
             <button
-              className="p-2 hover:bg-brand-soft rounded-lg transition-colors"
+              className="shrink-0 p-2 hover:bg-brand-soft rounded-lg transition-colors"
               onClick={() => window.close()}
               title="关闭"
             >

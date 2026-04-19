@@ -35,10 +35,91 @@ export interface ExtractResult {
   author?: string;
   publishTime?: string;
   clipKind?: ClipKind;
+  sourceType?: 'web' | 'markdown_import';
+  sourceMeta?: MarkdownImportSourceMeta;
   contentHtml: string;
   blocks: ContentBlock[];
   images: ImageCandidate[];
   wordCount: number;
+}
+
+export type MdImportWarningLevel = 'info' | 'warning' | 'error';
+
+export type MdImportWarningCode =
+  | 'EMPTY_CONTENT'
+  | 'UNSUPPORTED_SYNTAX'
+  | 'LOCAL_IMAGE_DEGRADED'
+  | 'DATA_IMAGE_DEGRADED'
+  | 'TABLE_RENDER_FAILED'
+  | 'TABLE_FALLBACK_TEXT'
+  | 'INVALID_LINK'
+  | 'FRONT_MATTER_IGNORED'
+  | 'HTML_SANITIZED'
+  | 'LARGE_FILE';
+
+export interface MdImportWarning {
+  code: MdImportWarningCode;
+  level: MdImportWarningLevel;
+  message: string;
+  count?: number;
+}
+
+export interface MarkdownImportSourceMeta {
+  fileName?: string;
+  warnings: MdImportWarning[];
+  unsupportedSyntax: string[];
+  hasLocalImages: boolean;
+  tableImageCount: number;
+  tableFallbackCount: number;
+}
+
+export interface MarkdownImportStats {
+  title: string;
+  wordCount: number;
+  remoteImageCount: number;
+  localImageCount: number;
+  dataImageCount: number;
+  tableCount: number;
+  tableFallbackCount: number;
+  estimatedPartCount: number;
+  warningCount: number;
+}
+
+export interface MarkdownPreviewNode {
+  id: string;
+  type: 'heading' | 'paragraph' | 'quote' | 'code' | 'list' | 'image';
+  html: string;
+  text?: string;
+  level?: number;
+  ordered?: boolean;
+  language?: string;
+  previewSrc?: string;
+  alt?: string;
+}
+
+export interface MarkdownPreviewModel {
+  title: string;
+  html: string;
+  blocks: MarkdownPreviewNode[];
+}
+
+export interface MarkdownTableArtifact {
+  id: string;
+  alt: string;
+  dataUrl?: string;
+  html: string;
+  fallbackText: string;
+  success: boolean;
+  width?: number;
+  height?: number;
+}
+
+export interface MarkdownImportResult {
+  extractResult: ExtractResult;
+  previewModel: MarkdownPreviewModel;
+  stats: MarkdownImportStats;
+  warnings: MdImportWarning[];
+  editableTitle: string;
 }
 
 export interface ContentBlockLayout {
@@ -175,6 +256,7 @@ export type MessageType =
   | 'EXTRACT_CONTENT'
   | 'EXTRACT_RESULT'
   | 'SAVE_NOTE'
+  | 'SAVE_MARKDOWN_NOTE'
   | 'SAVE_PROGRESS'
   | 'SAVE_COMPLETE'
   | 'GET_SETTINGS'

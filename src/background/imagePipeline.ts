@@ -65,6 +65,38 @@ export async function fetchImageBlobFromContentScript(
   }
 }
 
+function decodeDataUrlToBlob(dataUrl: string): { blob: Blob; mimeType: string } | null {
+  const match = dataUrl.match(/^data:([^;,]+)?(;base64)?,(.*)$/);
+  if (!match) {
+    return null;
+  }
+
+  const mimeType = match[1] || 'application/octet-stream';
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || '';
+
+  try {
+    if (isBase64) {
+      const binaryString = atob(payload);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return {
+        blob: new Blob([bytes], { type: mimeType }),
+        mimeType,
+      };
+    }
+
+    return {
+      blob: new Blob([decodeURIComponent(payload)], { type: mimeType }),
+      mimeType,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function processImageWithBlob(
   apiKey: string,
   image: ImageCandidate,
@@ -177,6 +209,10 @@ export async function processImages(
 
     try {
       const fetchBlobFn = async (): Promise<{ blob: Blob; mimeType: string } | null> => {
+        if (image.normalizedUrl.startsWith('data:')) {
+          return decodeDataUrlToBlob(image.normalizedUrl);
+        }
+
         const normalizedResult = await fetchImageBlobFromContentScript(image.normalizedUrl, tabId);
         if (normalizedResult) {
           return normalizedResult;

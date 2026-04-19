@@ -158,6 +158,40 @@ export const SHIKI_LANGUAGE_ALIASES: Record<string, string> = {
 
   // === 网页中常见的非标准别名 ===
   "golang": "go",
+  "python3": "python",
+  "py3": "python",
+  "python2": "python",
+  "py2": "python",
+  "node": "javascript",
+  "nodejs": "javascript",
+  "jscript": "javascript",
+  "shell-session": "shellsession",
+  "bash-session": "shellsession",
+  "sh-session": "shellsession",
+  "zsh-session": "shellsession",
+  "terminal": "shellsession",
+  "terminal-output": "shellsession",
+  "cmdline": "shellsession",
+  "env": "dotenv",
+  "docker-compose": "yaml",
+  "compose": "yaml",
+  "postgres": "sql",
+  "postgresql": "sql",
+  "psql": "sql",
+  "mysql": "sql",
+  "sqlite": "sql",
+  "conf": "ini",
+  "cfg": "ini",
+  "plist": "xml",
+  "objectivec": "objective-c",
+  "obj-c": "objective-c",
+  "cxx": "cpp",
+  "cc": "cpp",
+  "hh": "cpp",
+  "hpp": "cpp",
+  "psm1": "powershell",
+  "powershellscript": "powershell",
+  "proto3": "proto",
   "plain": "text",
   "plaintext": "text",
   "txt": "text",
@@ -235,4 +269,165 @@ export function detectCodeLanguage(preAttrs: string, codeAttrs: string): string 
 
   // 解析为 Shiki 主 ID（不在列表中 → null → 保持 quote）
   return resolveShikiLanguageId(rawLang);
+}
+
+export function inferCodeLanguageFromText(text: string): string | null {
+  const sample = text.trim();
+  if (!sample) {
+    return null;
+  }
+
+  const lower = sample.toLowerCase();
+
+  if (/^diff --git\b/m.test(lower) || /^@@\s+[-+]/m.test(sample) || /^(?:\+\+\+|---)\s+\S+/m.test(sample)) {
+    return 'diff';
+  }
+
+  if (/^<\?php\b/i.test(sample)) {
+    return 'php';
+  }
+
+  if (/\bfrom\s+[^\n]+\n(?:\s*\w+\s+.+\n)*(?:\s*run|cmd|entrypoint|copy|add|workdir|expose|env|arg|user|label|volume|healthcheck)\b/i.test(sample)
+    || /^(?:from|run|cmd|entrypoint|copy|add|workdir|expose|env|arg|user|label|volume|healthcheck)\b/m.test(lower)) {
+    return 'docker';
+  }
+
+  if (/\b(import\s+react\b|from\s+['"]react['"]|from\s+['"]next\/|\buse(?:state|effect|memo|callback)\b)/i.test(sample) && /<\w[\s\S]*>/.test(sample)) {
+    if (/: \s*(React\.)?[A-Z]\w+|interface\s+\w+Props|type\s+\w+\s*=/.test(sample)) {
+      return 'tsx';
+    }
+    return 'jsx';
+  }
+
+  if (/<template\b[\s\S]*<\/template>/i.test(sample) || /<script\s+setup\b/i.test(sample)) {
+    return 'vue';
+  }
+
+  if (/\b(terraform|required_providers|provider|resource|module|variable|output|locals)\b[\s\S]*?=/i.test(sample) || /\bresource\s+"[^"]+"\s+"[^"]+"/i.test(sample)) {
+    return 'terraform';
+  }
+
+  if ((sample.startsWith('{') || sample.startsWith('[')) && looksLikeJson(sample)) {
+    return 'json';
+  }
+
+  const normalizedLines = sample
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (normalizedLines.length > 0) {
+    const posixPathLines = normalizedLines.filter((line) => (
+      /^(?:\.{1,2}\/|~\/|\/)[^\s]+$/.test(line)
+      || /^(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/.test(line)
+    ));
+    const windowsPathLines = normalizedLines.filter((line) => (
+      /^[A-Za-z]:\\[^\s]+$/.test(line) || /^\\\\[^\s]+\\[^\s]+/.test(line)
+    ));
+
+    if (windowsPathLines.length > 0 && windowsPathLines.length === normalizedLines.length) {
+      return 'powershell';
+    }
+
+    if (posixPathLines.length > 0 && posixPathLines.length === normalizedLines.length) {
+      return 'shellscript';
+    }
+  }
+
+  if (/^<!doctype html\b/i.test(sample) || /<\/?(html|head|body|div|span|section|article|script|style|main|header|footer)\b/i.test(sample)) {
+    return 'html';
+  }
+
+  if (/^<\?xml\b/i.test(sample) || /<\/?[a-z_][\w:.-]*\b[^>]*>/i.test(sample)) {
+    return 'xml';
+  }
+
+  if (/^\[[^\]\n]+\]\s*$/m.test(sample) && /^\s*[\w.-]+\s*=\s*.+$/m.test(sample)) {
+    return 'toml';
+  }
+
+  if (/^\[[^\]\n]+\]\s*$/m.test(sample) && /^\s*[\w.-]+\s*[:=]\s*.+$/m.test(sample)) {
+    return 'ini';
+  }
+
+  if ((/^[\w.-]+\s*:\s*.+$/m.test(sample) || /^-\s+\w[^:]*:\s*.+$/m.test(sample)) && !/[{};]/.test(sample)) {
+    return 'yaml';
+  }
+
+  if (/\b(select|insert|update|delete|create|alter|drop|with)\b[\s\S]*\b(from|into|table)\b/i.test(sample)) {
+    return 'sql';
+  }
+
+  if (/^#!.*\b(bash|sh|zsh)\b/m.test(sample) || /(^|\n)\s*(export|echo|npm|pnpm|yarn|curl|grep|awk|sed|chmod|mkdir|ls)\b/m.test(sample) || /(^|\n)\s*\$\s+\S+/m.test(sample)) {
+    return 'shellscript';
+  }
+
+  if (/\b(get-[a-z]+|set-[a-z]+|write-host|write-output|foreach-object|where-object)\b/i.test(sample) || /\$env:[a-z_][\w-]*/i.test(sample) || /\bparam\s*\(/i.test(sample)) {
+    return 'powershell';
+  }
+
+  if (/\bpackage\s+main\b/.test(lower) || /\bfunc\s+\w+\s*\(/.test(lower) || /\bfmt\.\w+\(/.test(lower)) {
+    return 'go';
+  }
+
+  if (/\busing\s+system\b/.test(lower) || /\bconsole\.writeline\s*\(/.test(lower) || /\bnamespace\s+[A-Z][\w.]*/.test(sample)) {
+    return 'csharp';
+  }
+
+  if (/\bpublic\s+(class|interface|enum)\b/.test(lower) || /\bpublic\s+static\s+void\s+main\b/.test(lower) || /\b(system\.out|import\s+java\.)/.test(lower)) {
+    return 'java';
+  }
+
+  if (/\bfun\s+main\s*\(/.test(lower) || /\bdata\s+class\b/.test(lower) || /\bval\s+\w+\s*[:=]/.test(lower) && /\bprintln\s*\(/.test(lower)) {
+    return 'kotlin';
+  }
+
+  if (/\bimport\s+(swiftui|foundation)\b/.test(lower) || /\bstruct\s+\w+\s*:\s*view\b/.test(lower)) {
+    return 'swift';
+  }
+
+  if (/\bdef\s+\w+\s*\(/.test(lower) || /\bfrom\s+\w+(?:\.\w+)*\s+import\b/.test(lower) || /\bif\s+__name__\s*==\s*['"]__main__['"]/.test(lower) || /\bprint\s*\(/.test(lower)) {
+    return 'python';
+  }
+
+  if (
+    (/\bclass\s+\w+\b/.test(sample) && /\bdef\s+\w+[!?=]?\b/.test(sample) && /\bend\b/.test(lower))
+    || /\bputs\s+['"]/.test(sample)
+    || /\brequire\s+['"][^'"]+['"]/.test(sample)
+  ) {
+    return 'ruby';
+  }
+
+  if (/\bfn\s+\w+\s*\(/.test(lower) || /\blet\s+mut\b/.test(lower) || /\bprintln!\s*\(/.test(lower)) {
+    return 'rust';
+  }
+
+  if (/^\s*#include\s+<[^>]+>/m.test(sample)) {
+    if (/\bstd::|cout\s*<</.test(sample) || /<iostream>/.test(sample)) {
+      return 'cpp';
+    }
+    return 'c';
+  }
+
+  if (/[.#]?[a-z-][\w-]*\s*\{[\s\S]*:[^;]+;/.test(sample)) {
+    return 'css';
+  }
+
+  if (/\binterface\s+\w+\b/.test(lower) || /\btype\s+\w+\s*=/.test(lower) || /\bimport\s+type\b/.test(lower) || /:\s*(string|number|boolean|unknown|never|void|any)(\[\])?[\s,)=;]/.test(lower)) {
+    return 'typescript';
+  }
+
+  if (/\b(const|let|var)\b/.test(lower) || /\bfunction\s+\w+\s*\(/.test(lower) || /=>/.test(sample) || /\bconsole\.\w+\(/.test(lower)) {
+    return 'javascript';
+  }
+
+  return null;
+}
+
+function looksLikeJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }

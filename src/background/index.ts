@@ -4,8 +4,6 @@ import {
   ContentBlock,
   CreateNoteRequest,
   ExtractResult,
-  ImageCandidate,
-  ImageProcessResult,
   NoteCreateResult,
   SaveHighlightPayload,
   HighlightSaveResult,
@@ -17,7 +15,7 @@ import { isValidPageTitle, extractTitleFromText, formatErrorForLog } from '../ut
 import { createNote, buildNoteBody, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
 import { TaskStore } from '../utils/taskStore';
-import { htmlToNoteAtom } from '../utils/noteAtom';
+import { htmlToNoteAtom, noteAtomToHtml } from '../utils/noteAtom';
 import { stabilizeLatinHanLineBreaks } from '../utils/mixedLanguage';
 import { registerSidePanelHandlers } from './sidePanel';
 import { registerContextMenuHandlers } from './contextMenu';
@@ -37,6 +35,11 @@ import {
   waitForTaskRunnable,
 } from './saveTaskRuntime';
 import { processImages } from './imagePipeline';
+import {
+  injectUploadedImages,
+  removeAllImageTags,
+  replaceImageUrls,
+} from './imageHtml';
 import {
   createIndexNoteIfNeeded,
   createSplitNotes,
@@ -107,6 +110,7 @@ registerBackgroundMessageRouter({
   },
   saveSettings,
   handleSaveNote,
+  handleSaveMarkdownNote,
   handleSaveHighlight,
   isTrustedExtensionPageSender,
   isAllowedMowenWebApiPath,
@@ -345,7 +349,16 @@ function formatHighlightContent(highlight: Highlight): string {
   return `<p>${highlight.text}</p>`;
 }
 
-async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<NoteCreateResult> {
+async function handleSaveNote(
+  payload: SaveNotePayload,
+  tabId: number,
+  options: {
+    normalizeMarkdownTextSpacing?: boolean;
+    preferContentHtml?: boolean;
+    preserveInlineParagraphs?: boolean;
+    preserveBodyMode?: boolean;
+  } = {}
+): Promise<NoteCreateResult> {
   // Defensive check for payload
   if (!payload) {
     console.error('[墨问 Background] ❌ Payload is undefined/null');
@@ -436,6 +449,15 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
       logToContentScript,
     });
 
+    const shouldUseContentHtml = options.preferContentHtml === true || processedBlocks.length === 0;
+    const effectiveProcessedContent = options.normalizeMarkdownTextSpacing && shouldUseContentHtml
+      ? noteAtomToHtml(htmlToNoteAtom(processedContent, {
+        preserveInlineParagraphs: options.preserveInlineParagraphs,
+        enforceSingleTextBlockSpacing: true,
+      }) as Parameters<typeof noteAtomToHtml>[0])
+      : processedContent;
+    const effectiveProcessedBlocks = shouldUseContentHtml ? [] : processedBlocks;
+
     if (signal.aborted) {
       console.log('[墨问 Background] ⚠️ Cancel requested, aborting note creation');
       return finalizeSaveTask(tabId, taskId, { success: false, error: '已取消保存', errorCode: 'CANCELLED' }, formatErrorForLog, { clearTask: true });
@@ -449,16 +471,26 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
         clipKind,
         title: normalizedTitle,
         sourceUrl: extractResult.sourceUrl,
-        content: processedContent,
+        content: effectiveProcessedContent,
         limit: SAFE_LIMIT,
-        blocks: processedBlocks,
+        blocks: effectiveProcessedBlocks,
       })
       : splitContent(
         normalizedTitle,
         extractResult.sourceUrl,
-        processedContent,
+        effectiveProcessedContent,
         SAFE_LIMIT,
-        processedBlocks
+        effectiveProcessedBlocks,
+        {
+          preserveBodyMode: options.preserveBodyMode === true,
+          normalizeMarkdownBodySpacing: options.normalizeMarkdownTextSpacing,
+          htmlToNoteAtomOptions: options.normalizeMarkdownTextSpacing
+            ? {
+              preserveInlineParagraphs: options.preserveInlineParagraphs,
+              enforceSingleTextBlockSpacing: true,
+            }
+            : {},
+        }
       );
 
     console.log(`[note] create start title="${normalizedTitle.substring(0, 30)}..." partsCount=${parts.length}`);
@@ -541,253 +573,13 @@ async function handleSaveNote(payload: SaveNotePayload, tabId: number): Promise<
   }
 }
 
-function replaceImageUrls(
-  content: string,
-  imageResults: ImageProcessResult[],
-  extraImages: ImageCandidate[]
-): string {
-  interface ImageReplacementAction {
-    kind: 'inject_uid' | 'replace_with_link';
-    originalUrl: string;
-    uid?: string;
-    label?: string;
-  }
-
-  const actions: ImageReplacementAction[] = [
-    ...imageResults
-      .filter((result) => result.success && result.uid)
-      .map((result) => ({
-        kind: 'inject_uid' as const,
-        originalUrl: result.originalUrl,
-        uid: result.uid!,
-      })),
-    ...imageResults
-      .filter((result) => !result.success)
-      .map((result) => ({
-        kind: 'replace_with_link' as const,
-        originalUrl: result.originalUrl,
-      })),
-    ...extraImages.map((image) => ({
-      kind: 'replace_with_link' as const,
-      originalUrl: image.url,
-      label: buildImageFallbackLabel(image.alt),
-    })),
-  ];
-
-  let successCount = 0;
-  let failCount = 0;
-
-  const processed = content.replace(/<img\b[^>]*>/gi, (imgTag) => {
-    const tagUrls = extractImageUrlsFromTag(imgTag);
-    const action = actions.find((candidate) => tagUrls.some((url) => matchesImageUrl(url, candidate.originalUrl)));
-
-    if (!action) {
-      return imgTag;
-    }
-
-    if (action.kind === 'inject_uid' && action.uid) {
-      if (imgTag.includes('data-mowen-uid=')) {
-        return imgTag;
-      }
-      successCount++;
-      return imgTag.replace(/\s*\/?>$/, ` data-mowen-uid="${escapeHtmlAttribute(action.uid)}">`);
-    }
-
-    const safeLinkUrl = [action.originalUrl, ...tagUrls].find((url) => isSafeHttpUrl(url));
-    if (!safeLinkUrl) {
-      return imgTag;
-    }
-
-    failCount++;
-    return buildImageFallbackLinkHtml(
-      safeLinkUrl,
-      action.label || buildImageFallbackLabel(extractImageAltFromTag(imgTag))
-    );
+async function handleSaveMarkdownNote(payload: SaveNotePayload, tabId: number): Promise<NoteCreateResult> {
+  return handleSaveNote(payload, tabId, {
+    normalizeMarkdownTextSpacing: true,
+    preserveInlineParagraphs: true,
+    preserveBodyMode: true,
   });
-
-  console.log(`[sw] replaceImageUrls: done replacements. Success: ${successCount}, Fail: ${failCount}`);
-  return processed;
 }
-
-function buildImageFallbackLabel(alt?: string): string {
-  const normalizedAlt = alt?.trim();
-  if (!normalizedAlt) {
-    return '查看原图';
-  }
-  return `查看原图：${normalizedAlt}`;
-}
-
-function buildImageFallbackLinkHtml(url: string, label: string): string {
-  return `<p><a href="${escapeHtmlAttribute(url)}" target="_blank" rel="noopener noreferrer">${escapeHtmlText(label)}</a></p>`;
-}
-
-function extractImageUrlsFromTag(imgTag: string): string[] {
-  const urls: string[] = [];
-  const attributeNames = ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-actualsrc'];
-
-  for (const attributeName of attributeNames) {
-    const match = imgTag.match(new RegExp(`${attributeName}=["']([^"']+)["']`, 'i'));
-    if (match?.[1]) {
-      urls.push(match[1].trim());
-    }
-  }
-
-  const srcsetNames = ['srcset', 'data-srcset'];
-  for (const attributeName of srcsetNames) {
-    const match = imgTag.match(new RegExp(`${attributeName}=["']([^"']+)["']`, 'i'));
-    if (!match?.[1]) continue;
-    const srcsetUrls = match[1]
-      .split(',')
-      .map((value) => value.trim().split(/\s+/)[0])
-      .filter(Boolean);
-    urls.push(...srcsetUrls);
-  }
-
-  return Array.from(new Set(urls));
-}
-
-function extractImageAltFromTag(imgTag: string): string {
-  const captionMatch = imgTag.match(/data-mowen-caption=["']([^"']+)["']/i);
-  if (captionMatch?.[1]) {
-    return captionMatch[1].trim();
-  }
-
-  const altMatch = imgTag.match(/alt=["']([^"']+)["']/i);
-  return altMatch?.[1]?.trim() || '';
-}
-
-function matchesImageUrl(candidateUrl: string, targetUrl: string): boolean {
-  if (!candidateUrl || !targetUrl) {
-    return false;
-  }
-
-  if (candidateUrl === targetUrl) {
-    return true;
-  }
-
-  const candidateBase = stripUrlSearchAndHash(candidateUrl);
-  const targetBase = stripUrlSearchAndHash(targetUrl);
-
-  if (candidateBase === targetBase) {
-    return true;
-  }
-
-  if (stripWidthSuffix(candidateBase) === stripWidthSuffix(targetBase)) {
-    return true;
-  }
-
-  const candidateMediumId = extractMediumImageId(candidateUrl);
-  const targetMediumId = extractMediumImageId(targetUrl);
-  if (candidateMediumId && candidateMediumId === targetMediumId) {
-    return true;
-  }
-
-  const candidateUniqueSegment = extractUniquePathSegment(candidateUrl);
-  const targetUniqueSegment = extractUniquePathSegment(targetUrl);
-  if (candidateUniqueSegment && candidateUniqueSegment === targetUniqueSegment) {
-    return true;
-  }
-
-  const candidateFilename = extractImageFilename(candidateUrl);
-  const targetFilename = extractImageFilename(targetUrl);
-  if (candidateFilename && candidateFilename.length > 5 && candidateFilename === targetFilename) {
-    return true;
-  }
-
-  return false;
-}
-
-function stripUrlSearchAndHash(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    return rawUrl.split('#')[0].split('?')[0];
-  }
-}
-
-function stripWidthSuffix(rawUrl: string): string {
-  return rawUrl.replace(/\/\d{1,4}$/, '');
-}
-
-function extractImageFilename(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    return parsed.pathname.split('/').pop() || '';
-  } catch {
-    const cleanUrl = stripUrlSearchAndHash(rawUrl);
-    return cleanUrl.split('/').pop() || '';
-  }
-}
-
-function extractUniquePathSegment(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    const segments = parsed.pathname.split('/').filter((segment) => segment.length > 10);
-    return segments.sort((a, b) => b.length - a.length)[0] || '';
-  } catch {
-    return '';
-  }
-}
-
-function extractMediumImageId(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    const match = parsed.pathname.match(/(\d\*[A-Za-z0-9_-]+)/);
-    return match?.[1] || '';
-  } catch {
-    return '';
-  }
-}
-
-function isSafeHttpUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
-function escapeHtmlAttribute(value: string): string {
-  return value.replace(/[&<>"']/g, (char) => (
-    char === '&' ? '&amp;' :
-      char === '<' ? '&lt;' :
-        char === '>' ? '&gt;' :
-          char === '"' ? '&quot;' : '&#39;'
-  ));
-}
-
-function escapeHtmlText(value: string): string {
-  return escapeHtmlAttribute(value);
-}
-
-function injectUploadedImages(
-  content: string,
-  imageResults: ImageProcessResult[]
-): string {
-  const processed = content;
-  // Check if content already has all uploaded images
-  // Logic: Iterate results, if result.success and we can't find its uid in processed, append it
-  // This is a safety net for images that were extracted but not found in the final HTML (e.g. background images or removed by cleanup)
-  // For now, we only log missing ones to avoid cluttering the note with duplicate images if regex failed
-
-  const missingImages = imageResults.filter(r => r.success && r.uid && !processed.includes(r.uid));
-
-  if (missingImages.length > 0) {
-    console.log(`[sw] injectUploadedImages: found ${missingImages.length} uploaded images not matched in content`);
-    // Optional: Append them to bottom? Or just ignore?
-    // Current decision: Ignore to avoid duplicates, as regex matching is the primary way
-  }
-
-  return processed;
-}
-
-function removeAllImageTags(content: string): string {
-  // Replace all img tags with empty string
-  return content.replace(/<img[^>]*>/gi, '');
-}
-
 // function createMetaHeader removed
 
 
@@ -822,10 +614,7 @@ function convertExtractBlocksToNoteBlocks(blocks: ContentBlock[]): NoteBlockEntr
 
     if (block.layout?.preserveInlineParagraphs === true && block.layout?.role === 'spacer') {
       noteBlocks.push({
-        node: {
-          type: 'paragraph',
-          content: [],
-        },
+        node: createMarkdownSpacerParagraphNode(),
         groupId: block.layout?.groupId,
       });
       continue;
@@ -873,11 +662,76 @@ function convertExtractBlocksToNoteBlocks(blocks: ContentBlock[]): NoteBlockEntr
 }
 
 function normalizeTitleForComparison(text: string): string {
-  return text.replace(/[\s.,;:!?。，；：！？\u200B]/g, '').toLowerCase();
+  return stripInvisibleTitleChars(text).replace(/[\s.,;:!?。，；：！？]/g, '').toLowerCase();
+}
+
+const INVISIBLE_TITLE_CHARS_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/g;
+const SINGLE_INVISIBLE_TITLE_CHAR_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/;
+const MARKDOWN_SPACER_TEXT = '\u00A0';
+
+function stripInvisibleTitleChars(text: string): string {
+  return text.replace(INVISIBLE_TITLE_CHARS_PATTERN, '');
+}
+
+function isSpacerOnlyText(text: string): boolean {
+  return stripInvisibleTitleChars(text).replace(/[\s\u00A0\u3000]/g, '').length === 0;
+}
+
+function createMarkdownSpacerParagraphNode(): NoteAtomNode {
+  return {
+    type: 'paragraph',
+    content: [{ type: 'text', text: MARKDOWN_SPACER_TEXT }],
+  };
+}
+
+function isInvisibleTitleChar(char: string): boolean {
+  return SINGLE_INVISIBLE_TITLE_CHAR_PATTERN.test(char);
+}
+
+function extractTrailingTextAfterTitlePrefix(blockText: string, title: string): string | null {
+  const normalizedBlock = stripInvisibleTitleChars(blockText);
+  const normalizedTitle = stripInvisibleTitleChars(title);
+  if (!normalizedBlock.startsWith(normalizedTitle)) {
+    return null;
+  }
+
+  let blockIndex = 0;
+  let titleIndex = 0;
+
+  while (blockIndex < blockText.length && titleIndex < title.length) {
+    const blockChar = blockText[blockIndex];
+    if (isInvisibleTitleChar(blockChar)) {
+      blockIndex += 1;
+      continue;
+    }
+
+    const titleChar = title[titleIndex];
+    if (isInvisibleTitleChar(titleChar)) {
+      titleIndex += 1;
+      continue;
+    }
+
+    if (blockChar !== titleChar) {
+      return null;
+    }
+
+    blockIndex += 1;
+    titleIndex += 1;
+  }
+
+  if (titleIndex < title.length) {
+    return null;
+  }
+
+  while (blockIndex < blockText.length && isInvisibleTitleChar(blockText[blockIndex])) {
+    blockIndex += 1;
+  }
+
+  return blockText.slice(blockIndex);
 }
 
 function isEmptyParagraphNode(node: NoteAtomNode): boolean {
-  return node.type === 'paragraph' && getNodeTextLength(node) === 0;
+  return node.type === 'paragraph' && isSpacerOnlyText(getNodeText(node));
 }
 
 function isLeadMediaNode(node: NoteAtomNode): boolean {
@@ -907,7 +761,7 @@ function shouldTrimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string, n
   }
 
   const blockText = getNodeText(node).trim();
-  if (!blockText || !blockText.startsWith(title)) {
+  if (!blockText) {
     return false;
   }
 
@@ -916,7 +770,7 @@ function shouldTrimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string, n
     return false;
   }
 
-  const trailingText = blockText.slice(title.length);
+  const trailingText = extractTrailingTextAfterTitlePrefix(blockText, title);
   if (!trailingText) {
     return false;
   }
@@ -926,12 +780,12 @@ function shouldTrimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string, n
 
 function trimDuplicateTitlePrefixNode(node: NoteAtomNode, title: string): NoteAtomNode | null {
   const blockText = getNodeText(node).trim();
-  if (!blockText.startsWith(title)) {
+  const trailingText = extractTrailingTextAfterTitlePrefix(blockText, title);
+  if (trailingText == null) {
     return cloneNoteAtomNode(node);
   }
 
-  const trimmedText = blockText
-    .slice(title.length)
+  const trimmedText = trailingText
     .replace(/^[\s\u00a0\-–—:：|丨、,.，。!?！？/()（）]+/, '')
     .trim();
 
@@ -1019,6 +873,114 @@ function removeLeadingDuplicateTitleBlocks(blocks: NoteBlockEntry[], title: stri
   return removed ? remainingBlocks : blocks;
 }
 
+function isTextualParagraphEntry(entry: NoteBlockEntry | undefined): boolean {
+  if (!entry || entry.node.type !== 'paragraph' || !Array.isArray(entry.node.content) || entry.node.content.length === 0) {
+    return false;
+  }
+
+  return !isSpacerOnlyText(getNodeText(entry.node));
+}
+
+function hasBoldMark(marks?: NoteAtomMark[]): boolean {
+  return Array.isArray(marks) && marks.some((mark) => mark.type === 'bold');
+}
+
+function isHeadingLikeParagraphEntry(entry: NoteBlockEntry | undefined): boolean {
+  if (!isTextualParagraphEntry(entry) || !Array.isArray(entry?.node.content)) {
+    return false;
+  }
+
+  let hasVisibleText = false;
+
+  for (const child of entry.node.content) {
+    if (child.type !== 'text') {
+      return false;
+    }
+
+    const text = child.text || '';
+    if (isSpacerOnlyText(text)) {
+      continue;
+    }
+
+    hasVisibleText = true;
+    if (!hasBoldMark(child.marks)) {
+      return false;
+    }
+  }
+
+  return hasVisibleText;
+}
+
+function isListLikeParagraphEntry(entry: NoteBlockEntry | undefined): boolean {
+  if (!isTextualParagraphEntry(entry)) {
+    return false;
+  }
+
+  if (isHeadingLikeParagraphEntry(entry)) {
+    return false;
+  }
+
+  const text = stripInvisibleTitleChars(getNodeText(entry!.node)).trim();
+  return /^(?:[•·▪◦●○]\s+|\d+[.)、]\s*)/.test(text);
+}
+
+function isMetadataParagraphEntry(entry: NoteBlockEntry | undefined): boolean {
+  if (!isTextualParagraphEntry(entry) || isListLikeParagraphEntry(entry)) {
+    return false;
+  }
+
+  const text = stripInvisibleTitleChars(getNodeText(entry!.node)).trim();
+  if (!text || text.length > 60) {
+    return false;
+  }
+
+  return /^[A-Za-z0-9\u4e00-\u9fff_()[\]【】《》<>·•、/+\-.]{1,18}[：:]\s*\S+/.test(text);
+}
+
+function shouldInsertMarkdownBodySpacer(previous: NoteBlockEntry | undefined, current: NoteBlockEntry | undefined): boolean {
+  if (!isTextualParagraphEntry(previous) || !isTextualParagraphEntry(current)) {
+    return false;
+  }
+
+  const previousEntry = previous as NoteBlockEntry;
+  const currentEntry = current as NoteBlockEntry;
+
+  if (isMetadataParagraphEntry(previousEntry) && isMetadataParagraphEntry(currentEntry)) {
+    return false;
+  }
+
+  if (isListLikeParagraphEntry(previousEntry) && isListLikeParagraphEntry(currentEntry)) {
+    if (previousEntry.groupId && currentEntry.groupId && previousEntry.groupId === currentEntry.groupId) {
+      return false;
+    }
+
+    if (previousEntry.groupId || currentEntry.groupId) {
+      return true;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+function normalizeMarkdownBodyEntriesSpacing(entries: NoteBlockEntry[]): NoteBlockEntry[] {
+  const normalized: NoteBlockEntry[] = [];
+
+  for (const entry of entries) {
+    const previous = normalized[normalized.length - 1];
+    if (shouldInsertMarkdownBodySpacer(previous, entry)) {
+      normalized.push({
+        node: createMarkdownSpacerParagraphNode(),
+      });
+    }
+
+    normalized.push(cloneNoteBlockEntry(entry));
+  }
+
+  return normalized;
+}
+
 function splitOversizedEntry(entry: NoteBlockEntry, limit: number): NoteBlockEntry[] {
   return splitOversizedBlock(entry.node, limit).map((node) => ({
     node,
@@ -1101,27 +1063,40 @@ function groupEntriesByLimit(entries: NoteBlockEntry[], limit: number): NoteBloc
   return groupedEntries;
 }
 
-function splitContent(
+export function splitContent(
   title: string,
   sourceUrl: string,
   content: string,
   limit: number,
-  blocks?: ContentBlock[]
+  blocks?: ContentBlock[],
+  options: {
+    preserveBodyMode?: boolean;
+    normalizeMarkdownBodySpacing?: boolean;
+    htmlToNoteAtomOptions?: {
+      preserveInlineParagraphs?: boolean;
+      enforceSingleTextBlockSpacing?: boolean;
+    };
+  } = {}
 ): CreateNoteRequest[] {
   const convertedBlockEntries = blocks && blocks.length > 0
     ? convertExtractBlocksToNoteBlocks(blocks)
     : null;
   const contentBody = convertedBlockEntries
     ? { type: 'doc', content: convertedBlockEntries.map((entry) => entry.node) }
-    : (htmlToNoteAtom(content) as unknown as NoteAtomDoc);
+    : (htmlToNoteAtom(content, options.htmlToNoteAtomOptions || {}) as unknown as NoteAtomDoc);
   const rawContentBlocks = Array.isArray(contentBody.content) ? contentBody.content : [];
-  const contentEntries = convertedBlockEntries
-    ? removeLeadingDuplicateTitleBlocks(convertedBlockEntries, title)
-    : rawContentBlocks.map((block) => ({ node: cloneNoteAtomNode(block) }));
+  const rawContentEntries = rawContentBlocks.map((block) => ({ node: cloneNoteAtomNode(block) }));
+  const dedupedContentEntries = removeLeadingDuplicateTitleBlocks(
+    convertedBlockEntries || rawContentEntries,
+    title
+  );
+  const contentEntries = options.normalizeMarkdownBodySpacing
+    ? normalizeMarkdownBodyEntriesSpacing(dedupedContentEntries)
+    : dedupedContentEntries;
   const totalTextLength = contentEntries.reduce((sum, entry) => sum + getEntryTextLength(entry), 0);
 
   if (totalTextLength <= limit) {
-    if (blocks && blocks.length > 0) {
+    if ((blocks && blocks.length > 0) || options.preserveBodyMode) {
       return [{
         createMode: 'body',
         index: 0,
@@ -1179,13 +1154,13 @@ function buildMultipartBody(
   const metaBlocks = Array.isArray(metaBody.content)
     ? metaBody.content.map((block) => cloneNoteAtomNode(block))
     : [];
-  const needsSourceSpacer = Boolean(sourceUrl && blocks.length > 0);
+  const needsContentSpacer = blocks.length > 0;
 
   return {
     type: 'doc',
     content: [
       ...metaBlocks,
-      ...(needsSourceSpacer ? [{ type: 'paragraph', content: [] } as NoteAtomNode] : []),
+      ...(needsContentSpacer ? [createMarkdownSpacerParagraphNode()] : []),
       ...blocks.map((block) => cloneNoteAtomNode(block)),
     ],
   };
