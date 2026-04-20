@@ -91,15 +91,10 @@ export interface MarkdownPreviewNode {
   html: string;
   text?: string;
   level?: number;
-  ordered?: boolean;
-  language?: string;
-  previewSrc?: string;
-  alt?: string;
 }
 
 export interface MarkdownPreviewModel {
   title: string;
-  html: string;
   blocks: MarkdownPreviewNode[];
 }
 

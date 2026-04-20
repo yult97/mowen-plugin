@@ -7,10 +7,6 @@ export interface MarkdownPreviewRenderableBlock {
   html: string;
   text?: string;
   level?: number;
-  ordered?: boolean;
-  language?: string;
-  previewSrc?: string;
-  alt?: string;
 }
 
 export interface CreateMarkdownPreviewModelInput {
@@ -21,41 +17,16 @@ export interface CreateMarkdownPreviewModelInput {
 export function createMarkdownPreviewModel(
   input: CreateMarkdownPreviewModelInput
 ): MarkdownPreviewModel {
-  const title = input.title.trim();
-  const blocks = input.blocks.map((block) => ({
-    id: block.id,
-    type: block.type,
-    html: block.html,
-    text: block.text || stripHtml(block.html),
-    level: block.level,
-    ordered: block.ordered,
-    language: block.language,
-    previewSrc: block.previewSrc,
-    alt: block.alt,
-  }));
-
   return {
-    title,
-    blocks,
-    html: renderMarkdownPreviewHtml({ title, blocks }),
+    title: input.title.trim(),
+    blocks: input.blocks.map((block) => ({
+      id: block.id,
+      type: block.type,
+      html: block.html,
+      text: block.text || stripHtml(block.html),
+      level: block.level,
+    })),
   };
-}
-
-export function renderMarkdownPreviewHtml(input: {
-  title: string;
-  blocks: MarkdownPreviewRenderableBlock[];
-}): string {
-  const title = input.title.trim();
-  const blockHtml = renderMarkdownPreviewBodyHtml(input.blocks);
-
-  return [
-    '<article class="md-import-preview-article">',
-    '  <header class="md-import-preview-header">',
-    `    <h1 class="md-import-preview-title">${escapeHtml(title || '未命名 Markdown')}</h1>`,
-    '  </header>',
-    `  <div class="md-import-preview-body">${blockHtml}</div>`,
-    '</article>',
-  ].join('');
 }
 
 function renderPreviewBlock(block: MarkdownPreviewRenderableBlock): string {

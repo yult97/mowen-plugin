@@ -75,20 +75,6 @@ export function replaceImageUrls(
   return processed;
 }
 
-export function injectUploadedImages(
-  content: string,
-  imageResults: ImageProcessResult[]
-): string {
-  const processed = content;
-  const missingImages = imageResults.filter((result) => result.success && result.uid && !processed.includes(result.uid));
-
-  if (missingImages.length > 0) {
-    console.log(`[sw] injectUploadedImages: found ${missingImages.length} uploaded images not matched in content`);
-  }
-
-  return processed;
-}
-
 export function removeAllImageTags(content: string): string {
   return content.replace(/<img[^>]*>/gi, '');
 }

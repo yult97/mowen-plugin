@@ -114,10 +114,6 @@ interface InternalBlock {
   text: string;
   layout?: ContentBlockLayout;
   level?: number;
-  ordered?: boolean;
-  language?: string;
-  previewSrc?: string;
-  alt?: string;
 }
 
 interface ParsedMarkdown {
@@ -216,10 +212,6 @@ export async function convertMarkdownToImportResult(
     html: block.html,
     text: block.text,
     level: block.level,
-    ordered: block.ordered,
-    language: block.language,
-    previewSrc: block.previewSrc,
-    alt: block.alt,
   }));
 
   const warningList = buildWarnings(warnings, ignoredFrontMatterKeys.length);
@@ -272,11 +264,11 @@ export async function convertMarkdownImport(
   return convertMarkdownToImportResult(params.markdown, params);
 }
 
-export function normalizeMarkdownSource(markdown: string): string {
+function normalizeMarkdownSource(markdown: string): string {
   return markdown.replace(/\r\n?/g, '\n').trim();
 }
 
-export function deriveMarkdownTitle(
+function deriveMarkdownTitle(
   frontMatter: MarkdownFrontMatter,
   tokens: Token[],
   markdownBody: string
@@ -474,7 +466,6 @@ function renderCodeBlock(token: Tokens.Code): InternalBlock {
   return buildBlock({
     type: 'code',
     previewType: 'code',
-    language: language || undefined,
     html: sanitizeHtml(`<pre><code${classAttr}>${escapeHtml(token.text)}</code></pre>`),
   });
 }
@@ -508,7 +499,6 @@ async function renderListBlock(token: Tokens.List, ctx: ConversionContext): Prom
     return buildBlock({
       type: 'code',
       previewType: 'code',
-      language,
       html: sanitizeHtml(`<pre><code class="language-${escapeHtmlAttribute(language)}">${escapeHtml(codeText)}</code></pre>`),
       text: codeText,
     });
@@ -523,7 +513,6 @@ async function renderListBlock(token: Tokens.List, ctx: ConversionContext): Prom
     previewType: 'list',
     html: sanitizeHtml(listHtml),
     layout: { groupId, preserveInlineParagraphs: true },
-    ordered: shouldRenderHighlightListAsOrdered(token.items) || token.ordered,
     text: itemDetails.map((item) => item.quotedText).join('\n'),
   });
 }
@@ -554,8 +543,6 @@ async function renderTableBlock(token: Tokens.Table, ctx: ConversionContext): Pr
       type: 'image',
       previewType: 'image',
       html,
-      previewSrc: artifact.dataUrl,
-      alt: artifact.alt,
       text: artifact.alt,
       id: imageCandidate.id,
     });
@@ -570,7 +557,6 @@ async function renderTableBlock(token: Tokens.Table, ctx: ConversionContext): Pr
   return buildBlock({
     type: 'code',
     previewType: 'code',
-    language: 'markdown',
     html: sanitizeHtml(`<pre><code class="language-markdown">${escapeHtml(artifact.fallbackText)}</code></pre>`),
     text: artifact.fallbackText,
   });
@@ -807,10 +793,6 @@ function buildBlock(input: {
   layout?: ContentBlockLayout;
   id?: string;
   level?: number;
-  ordered?: boolean;
-  language?: string;
-  previewSrc?: string;
-  alt?: string;
 }): InternalBlock {
   const html = input.html.trim();
   return {
@@ -821,10 +803,6 @@ function buildBlock(input: {
     text: input.text ?? stripHtml(html),
     layout: input.layout,
     level: input.level,
-    ordered: input.ordered,
-    language: input.language,
-    previewSrc: input.previewSrc,
-    alt: input.alt,
   };
 }
 
@@ -1171,8 +1149,6 @@ function renderStandaloneImageBlock(token: Tokens.Image, ctx: ConversionContext)
           alt,
           imageId: imageCandidate.id,
         })}</p>`),
-        previewSrc: src,
-        alt,
         text: alt,
       });
     }
@@ -1198,8 +1174,6 @@ function renderStandaloneImageBlock(token: Tokens.Image, ctx: ConversionContext)
           alt,
           imageId: imageCandidate.id,
         })}</p>`),
-        previewSrc: src,
-        alt,
         text: alt,
       });
     }

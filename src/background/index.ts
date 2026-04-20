@@ -36,7 +36,6 @@ import {
 } from './saveTaskRuntime';
 import { processImages } from './imagePipeline';
 import {
-  injectUploadedImages,
   removeAllImageTags,
   replaceImageUrls,
 } from './imageHtml';
@@ -444,7 +443,6 @@ async function handleSaveNote(
         })
       ),
       replaceImageUrls,
-      injectUploadedImages,
       removeAllImageTags,
       logToContentScript,
     });

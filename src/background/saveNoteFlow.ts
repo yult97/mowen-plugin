@@ -49,7 +49,6 @@ export async function prepareContentForSave(params: {
     signal: AbortSignal
   ) => Promise<ImageProcessResult[]>;
   replaceImageUrls: (content: string, imageResults: ImageProcessResult[], extraImages: ImageCandidate[]) => string;
-  injectUploadedImages: (content: string, imageResults: ImageProcessResult[]) => string;
   removeAllImageTags: (content: string) => string;
   logToContentScript: (msg: string, tabId?: number) => void;
 }): Promise<{
@@ -67,7 +66,6 @@ export async function prepareContentForSave(params: {
     signal,
     processImages,
     replaceImageUrls,
-    injectUploadedImages,
     removeAllImageTags,
     logToContentScript,
   } = params;
@@ -84,10 +82,9 @@ export async function prepareContentForSave(params: {
 
     imageResults = await processImages(apiKey, imagesToProcess, tabId, taskId, signal);
     processedContent = replaceImageUrls(processedContent, imageResults, extraImages);
-    processedContent = injectUploadedImages(processedContent, imageResults);
     processedBlocks = processedBlocks.map((block) => ({
       ...block,
-      html: injectUploadedImages(replaceImageUrls(block.html, imageResults, extraImages), imageResults),
+      html: replaceImageUrls(block.html, imageResults, extraImages),
     }));
 
     const imgTagsWithUid = processedContent.match(/<img[^>]*data-mowen-uid[^>]*>/gi);

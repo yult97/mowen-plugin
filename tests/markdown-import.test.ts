@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import type { MarkdownImportResult, MarkdownTableArtifact } from '../src/types';
 import { convertMarkdownImport } from '../src/utils/markdownImport';
+import { renderMarkdownPreviewBodyHtml } from '../src/utils/markdownPreview';
 import { inferCodeLanguageFromText, resolveShikiLanguageId } from '../src/utils/shikiLanguages';
 
 const OPTIONAL_SPACING_PATTERN = '(?:\\s|\\u00A0|\\u200B|\\u200C|\\u200D|\\u2060|\\uFEFF)*';
@@ -306,8 +307,9 @@ test('markdown import falls back when table rendering fails and records warning 
 
   assert.match(result.extractResult.contentHtml, /name/i);
   assert.match(result.extractResult.contentHtml, /score/i);
-  assert.match(result.previewModel.html, /Ada/i);
-  assert.match(result.previewModel.html, /Lin/i);
+  const previewHtml = renderMarkdownPreviewBodyHtml(result.previewModel.blocks);
+  assert.match(previewHtml, /Ada/i);
+  assert.match(previewHtml, /Lin/i);
 });
 
 test('markdown import keeps paragraph separation as a single blank line in preview/save output', async () => {
@@ -324,11 +326,12 @@ Second paragraph after extra blank lines.
   });
 
   const paragraphBlocks = result.previewModel.blocks.filter((block) => block.type === 'paragraph');
+  const previewHtml = renderMarkdownPreviewBodyHtml(result.previewModel.blocks);
 
   assert.equal(paragraphBlocks.length, 2);
-  assert.match(result.previewModel.html, /First paragraph\./);
-  assert.match(result.previewModel.html, /Second paragraph after extra blank lines\./);
-  assert.equal((result.previewModel.html.match(/Second paragraph after extra blank lines\./g) || []).length, 1);
+  assert.match(previewHtml, /First paragraph\./);
+  assert.match(previewHtml, /Second paragraph after extra blank lines\./);
+  assert.equal((previewHtml.match(/Second paragraph after extra blank lines\./g) || []).length, 1);
 });
 
 test('markdown import drops thematic separators from mowen preview and saved content', async () => {
@@ -343,7 +346,7 @@ test('markdown import drops thematic separators from mowen preview and saved con
   });
 
   assert.doesNotMatch(result.extractResult.contentHtml, /────────|---|<hr/i);
-  assert.doesNotMatch(result.previewModel.html, /────────|---|<hr/i);
+  assert.doesNotMatch(renderMarkdownPreviewBodyHtml(result.previewModel.blocks), /────────|---|<hr/i);
   assert.match(result.extractResult.contentHtml, /第一章/);
   assert.match(result.extractResult.contentHtml, /第二章/);
 });

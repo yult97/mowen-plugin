@@ -14,7 +14,6 @@ import {
 import { htmlToNoteAtom, noteAtomToHtml } from '../src/utils/noteAtom';
 import { TaskStore } from '../src/utils/taskStore';
 import {
-  injectUploadedImages as injectUploadedMarkdownImages,
   removeAllImageTags as stripAllImageTags,
   replaceImageUrls as replaceMarkdownImageUrls,
 } from '../src/background/imageHtml';
@@ -181,7 +180,6 @@ test('prepareContentForSave removes image tags and skips processing when include
       return [];
     },
     replaceImageUrls: (content) => content,
-    injectUploadedImages: (content) => content,
     removeAllImageTags: removeInlineImageTags,
     logToContentScript: () => undefined,
   });
@@ -247,24 +245,14 @@ test('prepareContentForSave preserves body flow when some image uploads fail', a
     replaceImageUrls: (content, results) => results.reduce((current, item) => {
       if (item.success) {
         return current.replace(
-          item.originalUrl,
-          item.assetUrl || item.originalUrl
+          `<img src="${item.originalUrl}">`,
+          `<img src="${item.assetUrl || item.originalUrl}" data-mowen-uid="${item.uid}">`
         );
       }
 
       return current.replace(
         `<img src="${item.originalUrl}">`,
         `<a href="${item.originalUrl}">${item.originalUrl}</a>`
-      );
-    }, content),
-    injectUploadedImages: (content, results) => results.reduce((current, item) => {
-      if (!item.success || !item.uid) {
-        return current;
-      }
-
-      return current.replace(
-        `<img src="${item.assetUrl}">`,
-        `<img src="${item.assetUrl}" data-mowen-uid="${item.uid}">`
       );
     }, content),
     removeAllImageTags: removeInlineImageTags,
@@ -839,7 +827,6 @@ test('prepareContentForSave keeps uploaded markdown table images as mowen image 
       assetUrl: 'https://image.mowen.cn/mowen/table-image-uid',
     }) satisfies ImageProcessResult),
     replaceImageUrls: replaceMarkdownImageUrls,
-    injectUploadedImages: injectUploadedMarkdownImages,
     removeAllImageTags: stripAllImageTags,
     logToContentScript: () => {},
   });
@@ -900,7 +887,6 @@ test('edited markdown preview table images survive body round-trip without leaki
       assetUrl: 'https://image.mowen.cn/mowen/table-image-uid',
     }) satisfies ImageProcessResult),
     replaceImageUrls: replaceMarkdownImageUrls,
-    injectUploadedImages: injectUploadedMarkdownImages,
     removeAllImageTags: stripAllImageTags,
     logToContentScript: () => {},
   });
