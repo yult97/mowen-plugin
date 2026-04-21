@@ -32,7 +32,7 @@ export async function fetchImageBlobFromContentScript(
     }
 
     const response = await Promise.race([
-      chrome.tabs.sendMessage(tabId, { type: 'FETCH_IMAGE', payload: { url: imageUrl } }),
+      chrome.tabs.sendMessage(tabId, { type: 'FETCH_IMAGE_V2', payload: { url: imageUrl } }),
       new Promise<{ success: false; error: string }>((resolve) =>
         setTimeout(() => resolve({ success: false, error: 'Timeout' }), 10000)
       ),

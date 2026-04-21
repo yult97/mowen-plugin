@@ -7,11 +7,6 @@ export interface TwitterTitleResult {
     title: string;
 }
 
-function hasBilingualStructure(segments: TwitterTextSegment[]): boolean {
-    return segments.some((segment) => segment.role === 'original')
-        && segments.some((segment) => segment.role === 'translation');
-}
-
 function cleanTwitterPageTitle(title: string): string {
     return title
         .replace(/\s*\/\s*(X|Twitter)$/i, '')
@@ -218,12 +213,9 @@ export function deriveTwitterTitle(options: {
     });
     const rawContentStart = preferredTweetTitle || normalizeTwitterTitleCandidate(primaryTweetText.split('\n')[0] || '');
     const contentPreview = truncateTwitterTitle(rawContentStart, 30);
-    const shouldSkipContentStartDedup = clipKind === 'tweet-longform' || hasBilingualStructure(primarySegments);
 
     if (contentPreview) {
-        return shouldSkipContentStartDedup
-            ? { title: contentPreview }
-            : { title: contentPreview, contentStart: rawContentStart };
+        return { title: contentPreview };
     }
 
     if (authorName) {

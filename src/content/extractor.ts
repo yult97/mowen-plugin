@@ -115,13 +115,15 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
         cleanContent(contentClone);
         removeWeixinMetadataArtifacts(contentClone, { author, publishTime, ipWording });
         injectWeixinPicturePageImages(contentClone, picturePageImages);
+        prepareWeixinCloneForParsing(contentClone);
         contentHtml = contentClone.innerHTML;
-        blocks = parseBlocks(contentClone);
+        blocks = parseWeixinBlocks(contentClone);
     } else if (picturePageImages.length > 0) {
         const contentClone = document.createElement('div');
         injectWeixinPicturePageImages(contentClone, picturePageImages);
+        prepareWeixinCloneForParsing(contentClone);
         contentHtml = contentClone.innerHTML;
-        blocks = parseBlocks(contentClone);
+        blocks = parseWeixinBlocks(contentClone);
     }
 
     // 处理无标题情况：从正文中提取第一句话作为标题
@@ -150,8 +152,9 @@ export function extractWeixinContent(url: string, domain: string): ExtractResult
 
                 if (isSmallBlock && isExactMatch && startsWithTitle) {
                     block.remove();
+                    prepareWeixinCloneForParsing(tempDiv);
                     contentHtml = tempDiv.innerHTML;
-                    blocks = parseBlocks(tempDiv);
+                    blocks = parseWeixinBlocks(tempDiv);
                     break;
                 }
             }
@@ -1663,4 +1666,224 @@ export function parseBlocks(element: HTMLElement): ContentBlock[] {
     }
 
     return blocks;
+}
+
+function shouldPreserveWeixinInlineParagraph(element: HTMLElement): boolean {
+    if (element.querySelector('img, picture, figure, video, iframe, pre, code, table, ul, ol, blockquote')) {
+        return false;
+    }
+
+    const text = (element.innerText || '').trim();
+    if (!text) {
+        return false;
+    }
+
+    return true;
+}
+
+function ensureWeixinPreserveInlineAttr(element: HTMLElement): void {
+    if (!element.hasAttribute('data-mowen-preserve-inline-paragraph')) {
+        element.setAttribute('data-mowen-preserve-inline-paragraph', '1');
+    }
+}
+
+function cloneElementAttributes(source: HTMLElement, target: HTMLElement): void {
+    Array.from(source.attributes).forEach((attribute) => {
+        target.setAttribute(attribute.name, attribute.value);
+    });
+}
+
+function isWeixinRenderedBlockBoundary(element: HTMLElement): boolean {
+    const tagName = element.tagName.toLowerCase();
+    if (['p', 'div', 'section'].includes(tagName)) {
+        return true;
+    }
+
+    if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') {
+        return false;
+    }
+
+    const display = window.getComputedStyle(element).display;
+    return (
+        display === 'block' ||
+        display === 'list-item' ||
+        display === 'flex' ||
+        display === 'grid' ||
+        display === 'table' ||
+        display === 'table-row' ||
+        display === 'table-cell'
+    );
+}
+
+function hasMeaningfulWeixinNodeContent(node: Node): boolean {
+    const TEXT_NODE = typeof Node !== 'undefined' ? Node.TEXT_NODE : 3;
+    const ELEMENT_NODE = typeof Node !== 'undefined' ? Node.ELEMENT_NODE : 1;
+
+    if (node.nodeType === TEXT_NODE) {
+        return Boolean(node.textContent?.trim());
+    }
+
+    if (node.nodeType !== ELEMENT_NODE) {
+        return false;
+    }
+
+    const element = node as HTMLElement;
+    if (element.tagName.toLowerCase() === 'br') {
+        return false;
+    }
+
+    return Boolean((element.innerText || element.textContent || '').trim());
+}
+
+function createWeixinSegmentElement(source: HTMLElement, nodes: Node[]): HTMLElement | null {
+    const segmentElement = document.createElement(source.tagName.toLowerCase());
+    cloneElementAttributes(source, segmentElement);
+
+    nodes.forEach((node) => {
+        segmentElement.appendChild(node.cloneNode(true));
+    });
+
+    if (!shouldPreserveWeixinInlineParagraph(segmentElement)) {
+        return null;
+    }
+
+    return segmentElement;
+}
+
+function splitRenderedWeixinParagraph(element: HTMLElement): void {
+    if (!shouldPreserveWeixinInlineParagraph(element) || !element.parentElement) {
+        return;
+    }
+
+    const segments: Node[][] = [];
+    let currentSegment: Node[] = [];
+
+    Array.from(element.childNodes).forEach((childNode) => {
+        const ELEMENT_NODE = typeof Node !== 'undefined' ? Node.ELEMENT_NODE : 1;
+        if (childNode.nodeType === ELEMENT_NODE && isWeixinRenderedBlockBoundary(childNode as HTMLElement)) {
+            if (currentSegment.some(hasMeaningfulWeixinNodeContent)) {
+                segments.push(currentSegment);
+            }
+            currentSegment = [];
+
+            if (hasMeaningfulWeixinNodeContent(childNode)) {
+                segments.push([childNode]);
+            }
+            return;
+        }
+
+        currentSegment.push(childNode);
+    });
+
+    if (currentSegment.some(hasMeaningfulWeixinNodeContent)) {
+        segments.push(currentSegment);
+    }
+
+    if (segments.length <= 1) {
+        return;
+    }
+
+    const nextElements = segments
+        .map((segment) => createWeixinSegmentElement(element, segment))
+        .filter((segmentElement): segmentElement is HTMLElement => Boolean(segmentElement));
+
+    if (nextElements.length <= 1) {
+        return;
+    }
+
+    element.replaceWith(...nextElements);
+}
+
+function splitWeixinRenderedParagraphs(root: HTMLElement): void {
+    if (typeof (root as { querySelectorAll?: unknown }).querySelectorAll !== 'function') {
+        return;
+    }
+
+    const candidates = Array.from(root.querySelectorAll<HTMLElement>('p, div, section'))
+        .filter((element) => element !== root);
+
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+        splitRenderedWeixinParagraph(candidates[index]);
+    }
+}
+
+function isElementLike(value: unknown): value is HTMLElement {
+    return Boolean(
+        value &&
+        typeof value === 'object' &&
+        typeof (value as { tagName?: unknown }).tagName === 'string'
+    );
+}
+
+function markWeixinTextParagraphs(root: HTMLElement): void {
+    Array.from(root.children).forEach((child) => {
+        if (!isElementLike(child)) {
+            return;
+        }
+
+        const tagName = child.tagName.toLowerCase();
+        if (!['p', 'div', 'section'].includes(tagName)) {
+            return;
+        }
+
+        if (!shouldPreserveWeixinInlineParagraph(child)) {
+            return;
+        }
+
+        ensureWeixinPreserveInlineAttr(child);
+    });
+}
+
+function prepareWeixinCloneForParsing(root: HTMLElement): void {
+    if (typeof document === 'undefined' || !document.body) {
+        splitWeixinRenderedParagraphs(root);
+        markWeixinTextParagraphs(root);
+        return;
+    }
+
+    const host = document.createElement('div');
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText = [
+        'position:fixed',
+        'left:-99999px',
+        'top:0',
+        'width:720px',
+        'visibility:hidden',
+        'pointer-events:none',
+        'z-index:-1',
+        'overflow:hidden',
+    ].join(';');
+
+    host.appendChild(root);
+    document.body.appendChild(host);
+
+    try {
+        splitWeixinRenderedParagraphs(root);
+        markWeixinTextParagraphs(root);
+    } finally {
+        host.remove();
+    }
+}
+
+export function parseWeixinBlocks(element: HTMLElement): ContentBlock[] {
+    splitWeixinRenderedParagraphs(element);
+    markWeixinTextParagraphs(element);
+    const blocks = parseBlocks(element);
+
+    return blocks.map((block) => {
+        if (
+            block.type === 'paragraph' &&
+            /data-mowen-preserve-inline-paragraph=["']1["']/i.test(block.html)
+        ) {
+            return {
+                ...block,
+                layout: {
+                    ...(block.layout || {}),
+                    preserveInlineParagraphs: true,
+                },
+            };
+        }
+
+        return block;
+    });
 }

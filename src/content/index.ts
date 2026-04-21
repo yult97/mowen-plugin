@@ -18,18 +18,30 @@ import {
   clearCache
 } from './extractor';
 import { clearQuoteUrlCache } from './twitterExtractor';
+import { isTwitterPage } from './twitterExtractor';
+import {
+  getTwitterRuntimeReadinessSnapshot,
+  shouldReuseTwitterCachedResult,
+} from './twitter/runtime';
 import { fetchImageAsBase64 } from './imageFetcher';
 import { ExtractResult } from '../types';
 import { initHighlighter } from './highlighter';
 
+const CONTENT_SCRIPT_VERSION = '2026-04-21-v2';
+
 const contentScriptGlobal = globalThis as typeof globalThis & {
   __mowenContentScriptLoaded__?: boolean;
   __mowenContentScriptBootstrapped__?: boolean;
+  __mowenContentScriptVersion__?: string;
 };
 
 contentScriptGlobal.__mowenContentScriptLoaded__ = true;
+const isSameVersionBootstrapped =
+  contentScriptGlobal.__mowenContentScriptBootstrapped__ === true &&
+  contentScriptGlobal.__mowenContentScriptVersion__ === CONTENT_SCRIPT_VERSION;
+contentScriptGlobal.__mowenContentScriptVersion__ = CONTENT_SCRIPT_VERSION;
 
-if (contentScriptGlobal.__mowenContentScriptBootstrapped__) {
+if (isSameVersionBootstrapped) {
   console.log('[content] Content script bootstrap already completed, skipping duplicate setup');
 } else {
   contentScriptGlobal.__mowenContentScriptBootstrapped__ = true;
@@ -61,14 +73,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // console.log('[content] Received message:', message.type);
 
   // PING: Health check
-  if (message.type === 'PING') {
+  if (message.type === 'PING_V2') {
     sendResponse({ success: true, status: 'ready' });
     return false;
   }
 
   // START_EXTRACTION: Enable observer and trigger extraction
-  if (message.type === 'START_EXTRACTION') {
-    console.log('[content] 🚀 START_EXTRACTION received');
+  if (message.type === 'START_EXTRACTION_V2') {
+    console.log('[content] 🚀 START_EXTRACTION_V2 received');
     startAutoExtraction();
 
     // 内容稳定性检测：连续两次提取结果字数差异 < 5% 时认为内容已稳定
@@ -125,18 +137,33 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   // STOP_EXTRACTION: Disable observer
-  if (message.type === 'STOP_EXTRACTION') {
-    console.log('[content] 🛑 STOP_EXTRACTION received');
+  if (message.type === 'STOP_EXTRACTION_V2') {
+    console.log('[content] 🛑 STOP_EXTRACTION_V2 received');
     stopAutoExtraction();
     sendResponse({ success: true });
     return false;
   }
 
   // GET_CACHED_CONTENT: Return cached content if available
-  if (message.type === 'GET_CACHED_CONTENT') {
-    console.log('[content] 💾 GET_CACHED_CONTENT request');
-    const cached = getCachedResult();
+  if (message.type === 'GET_CACHED_CONTENT_V2') {
+    console.log('[content] 💾 GET_CACHED_CONTENT_V2 request');
+    let cached = getCachedResult();
     const isExtracting = isExtractingContent();
+
+    if (cached && isTwitterPage(window.location.href)) {
+      const snapshot = getTwitterRuntimeReadinessSnapshot(document);
+      if (!shouldReuseTwitterCachedResult(cached, snapshot)) {
+        console.log('[content] ♻️ Twitter cache is incomplete for hydrated DOM, forcing fresh extraction', {
+          cachedWordCount: cached.wordCount,
+          cachedBlocks: cached.blocks?.length || 0,
+          articleCount: snapshot.articleCount,
+          tweetTextCount: snapshot.tweetTextCount,
+          tweetTextLength: snapshot.tweetTextLength,
+        });
+        clearCache();
+        cached = null;
+      }
+    }
 
     console.log('[content] Cache status:', {
       hasCache: !!cached,
@@ -197,7 +224,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   // FETCH_IMAGE: Fetch image as base64 for upload
-  if (message.type === 'FETCH_IMAGE') {
+  if (message.type === 'FETCH_IMAGE_V2') {
     fetchImageAsBase64(message.payload.url)
       .then((result) => {
         if (result) {
@@ -419,7 +446,13 @@ function startAutoExtraction(): void {
 
   observer = new MutationObserver((mutations) => {
     const hasSignificantChanges = mutations.some((mutation) => {
-      if (mutation.type !== 'childList') return false;
+      if (mutation.type === 'characterData') {
+        return (mutation.target.textContent || '').trim().length > 50;
+      }
+
+      if (mutation.type !== 'childList') {
+        return false;
+      }
 
       return mutation.addedNodes.length > 0 &&
         Array.from(mutation.addedNodes).some((node) => {
@@ -428,7 +461,8 @@ function startAutoExtraction(): void {
             return !['SCRIPT', 'STYLE', 'IFRAME'].includes(el.tagName) &&
               (el.children.length > 0 || (el.textContent?.length || 0) > 50);
           }
-          return false;
+
+          return node.nodeType === Node.TEXT_NODE && (node.textContent?.trim().length || 0) > 50;
         });
     });
 
@@ -441,6 +475,7 @@ function startAutoExtraction(): void {
 
   observer.observe(document.body, {
     childList: true,
+    characterData: true,
     subtree: true,
   });
 
@@ -466,7 +501,7 @@ console.log('[墨问笔记助手] Content script loaded (Lazy Mode)');
 console.log('[content] Page URL:', window.location.href);
 
 // Note: We NO LONGER automatically call startAutoExtraction()
-// It will be triggered by the sidepanel/popup sending 'START_EXTRACTION'
+// It will be triggered by the sidepanel/popup sending 'START_EXTRACTION_V2'
 
 // Notify popup/sidepanel that content script is ready
 // This enables event-driven communication instead of polling

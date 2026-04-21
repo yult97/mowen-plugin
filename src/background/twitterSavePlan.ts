@@ -4,11 +4,14 @@ import {
   CreateNoteRequest,
 } from '../types';
 import {
+  createVisibleTwitterSpacerNode,
   NoteAtomDoc,
   NoteAtomNode,
   NoteBlockEntry,
   cloneNoteAtomNode,
   createTwitterPrefixSections,
+  isBlankParagraphNode,
+  isVisibleTwitterSpacerNode,
   joinNoteBlockSectionsWithSingleSpacer,
   normalizeTwitterHtmlContent,
   normalizeTwitterNoteEntries,
@@ -162,13 +165,81 @@ function buildTwitterMultipartBody(
   sourceUrl: string,
   contentBlocks: NoteAtomNode[]
 ): NoteAtomDoc {
+  const mergedContent = joinNoteBlockSectionsWithSingleSpacer([
+    ...createTwitterPrefixSections(title, sourceUrl),
+    contentBlocks.map((block) => cloneNoteAtomNode(block)),
+  ]);
+
   return {
     type: 'doc',
-    content: joinNoteBlockSectionsWithSingleSpacer([
-      ...createTwitterPrefixSections(title, sourceUrl),
-      contentBlocks.map((block) => cloneNoteAtomNode(block)),
-    ]),
+    content: stabilizeTwitterLinkParagraphSpacing(mergedContent),
   };
+}
+
+function isLinkOnlyParagraphNode(node: NoteAtomNode | undefined): boolean {
+  if (!node || node.type !== 'paragraph' || !Array.isArray(node.content) || node.content.length === 0) {
+    return false;
+  }
+
+  let hasLinkedText = false;
+
+  for (const child of node.content) {
+    const text = typeof child.text === 'string' ? child.text : '';
+    if (!text.trim()) {
+      continue;
+    }
+
+    const hasLinkMark = Array.isArray(child.marks) && child.marks.some((mark) => mark.type === 'link');
+    if (!hasLinkMark) {
+      return false;
+    }
+
+    hasLinkedText = true;
+  }
+
+  return hasLinkedText;
+}
+
+function stabilizeTwitterLinkParagraphSpacing(blocks: NoteAtomNode[]): NoteAtomNode[] {
+  const normalizedBlocks = blocks.map((block) => cloneNoteAtomNode(block));
+
+  for (let index = 0; index < normalizedBlocks.length; index += 1) {
+    const current = normalizedBlocks[index];
+    if (!isBlankParagraphNode(current)) {
+      continue;
+    }
+
+    const previous = normalizedBlocks[index - 1];
+    const next = normalizedBlocks[index + 1];
+    if (isLinkOnlyParagraphNode(previous) || isLinkOnlyParagraphNode(next)) {
+      normalizedBlocks[index] = createVisibleTwitterSpacerNode();
+    }
+  }
+
+  const result: NoteAtomNode[] = [];
+
+  for (let index = 0; index < normalizedBlocks.length; index += 1) {
+    const current = normalizedBlocks[index];
+
+    if (!isLinkOnlyParagraphNode(current)) {
+      result.push(current);
+      continue;
+    }
+
+    const previous = result[result.length - 1];
+    if (previous && !isBlankParagraphNode(previous) && !isVisibleTwitterSpacerNode(previous)) {
+      result.push(createVisibleTwitterSpacerNode());
+    }
+
+    result.push(current);
+
+    const next = normalizedBlocks[index + 1];
+    if (next && !isBlankParagraphNode(next) && !isVisibleTwitterSpacerNode(next)) {
+      result.push(createVisibleTwitterSpacerNode());
+    }
+  }
+
+  return result;
 }
 
 function cloneNoteBlockEntry(entry: NoteBlockEntry): NoteBlockEntry {

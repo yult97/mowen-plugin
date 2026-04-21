@@ -10,7 +10,7 @@ import {
   Highlight,
 } from '../types';
 import { getSettings, saveSettings } from '../utils/storage';
-import { isValidPageTitle, extractTitleFromText, formatErrorForLog } from '../utils/helpers';
+import { isValidPageTitle, extractTitleFromText, formatErrorForLog, isWeixinArticle } from '../utils/helpers';
 
 import { createNote, buildNoteBody, editNote } from '../services/api';
 import { LIMITS, backgroundLogger as logger } from '../utils/constants';
@@ -447,10 +447,13 @@ async function handleSaveNote(
       logToContentScript,
     });
 
+    const isWeixinClip = isWeixinArticle(extractResult.sourceUrl);
+    const shouldNormalizeTextSpacing = options.normalizeMarkdownTextSpacing === true || isWeixinClip;
+    const shouldPreserveInlineParagraphs = options.preserveInlineParagraphs === true || isWeixinClip;
     const shouldUseContentHtml = options.preferContentHtml === true || processedBlocks.length === 0;
-    const effectiveProcessedContent = options.normalizeMarkdownTextSpacing && shouldUseContentHtml
+    const effectiveProcessedContent = shouldNormalizeTextSpacing && shouldUseContentHtml
       ? noteAtomToHtml(htmlToNoteAtom(processedContent, {
-        preserveInlineParagraphs: options.preserveInlineParagraphs,
+        preserveInlineParagraphs: shouldPreserveInlineParagraphs,
         enforceSingleTextBlockSpacing: true,
       }) as Parameters<typeof noteAtomToHtml>[0])
       : processedContent;
@@ -481,10 +484,10 @@ async function handleSaveNote(
         effectiveProcessedBlocks,
         {
           preserveBodyMode: options.preserveBodyMode === true,
-          normalizeMarkdownBodySpacing: options.normalizeMarkdownTextSpacing,
-          htmlToNoteAtomOptions: options.normalizeMarkdownTextSpacing
+          normalizeMarkdownBodySpacing: shouldNormalizeTextSpacing,
+          htmlToNoteAtomOptions: shouldNormalizeTextSpacing
             ? {
-              preserveInlineParagraphs: options.preserveInlineParagraphs,
+              preserveInlineParagraphs: shouldPreserveInlineParagraphs,
               enforceSingleTextBlockSpacing: true,
             }
             : {},

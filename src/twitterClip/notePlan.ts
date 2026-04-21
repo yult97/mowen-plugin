@@ -24,6 +24,8 @@ export interface NoteBlockEntry {
   groupId?: string;
 }
 
+const TWITTER_VISIBLE_SPACER_TEXT = '\u00A0';
+
 export function cloneNoteAtomNode<T extends NoteAtomNode>(node: T): T {
   return JSON.parse(JSON.stringify(node)) as T;
 }
@@ -667,12 +669,29 @@ function createEmptyParagraphNode(): NoteAtomNode {
   };
 }
 
+export function createVisibleTwitterSpacerNode(): NoteAtomNode {
+  return {
+    type: 'paragraph',
+    content: [{ type: 'text', text: TWITTER_VISIBLE_SPACER_TEXT }],
+  };
+}
+
 export function isBlankParagraphNode(node: NoteAtomNode): boolean {
   if (node.type !== 'paragraph') {
     return false;
   }
 
   return getNoteNodeText(node).trim().length === 0;
+}
+
+export function isVisibleTwitterSpacerNode(node: NoteAtomNode | undefined): boolean {
+  return Boolean(
+    node?.type === 'paragraph' &&
+    Array.isArray(node.content) &&
+    node.content.length === 1 &&
+    node.content[0]?.type === 'text' &&
+    node.content[0]?.text === TWITTER_VISIBLE_SPACER_TEXT
+  );
 }
 
 export function normalizeNoteParagraphSpacing(blocks: NoteAtomNode[]): NoteAtomNode[] {

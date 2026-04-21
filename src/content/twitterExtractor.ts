@@ -171,7 +171,7 @@ function preserveTextNodeLineBreaks(root: HTMLElement): void {
 
     textNodes.forEach((textNode) => {
         const value = textNode.nodeValue || '';
-        if (!value.includes('\n') || !value.trim()) {
+        if (!value.includes('\n')) {
             return;
         }
 
@@ -181,7 +181,7 @@ function preserveTextNodeLineBreaks(root: HTMLElement): void {
         }
 
         const fragment = document.createDocumentFragment();
-        const parts = value.split(/\n+/);
+        const parts = splitTextIntoTwitterInlineBreakTokens(value);
 
         parts.forEach((part, index) => {
             if (part) {
@@ -194,6 +194,53 @@ function preserveTextNodeLineBreaks(root: HTMLElement): void {
 
         parent.replaceChild(fragment, textNode);
     });
+}
+
+export function splitTextIntoTwitterInlineBreakTokens(value: string): string[] {
+    return value.replace(/\r\n?/g, '\n').split('\n');
+}
+
+function isComputedBoldElement(element: HTMLElement): boolean {
+    const computedStyle = window.getComputedStyle(element);
+    const fontWeight = computedStyle.fontWeight || '';
+    const numericWeight = Number.parseInt(fontWeight, 10);
+
+    if (Number.isFinite(numericWeight) && numericWeight >= 700) {
+        return true;
+    }
+
+    return fontWeight.toLowerCase() === 'bold';
+}
+
+function promoteBoldInlineFormatting(sourceNode: Node, cloneNode: Node): Node {
+    if (!(sourceNode instanceof HTMLElement) || !(cloneNode instanceof HTMLElement)) {
+        return cloneNode;
+    }
+
+    let effectiveCloneNode: HTMLElement = cloneNode;
+
+    if (
+        sourceNode.tagName === 'SPAN' &&
+        cloneNode.tagName === 'SPAN' &&
+        isComputedBoldElement(sourceNode)
+    ) {
+        const strongElement = document.createElement('strong');
+        while (effectiveCloneNode.firstChild) {
+            strongElement.appendChild(effectiveCloneNode.firstChild);
+        }
+        effectiveCloneNode.replaceWith(strongElement);
+        effectiveCloneNode = strongElement;
+    }
+
+    const sourceChildren = Array.from(sourceNode.childNodes);
+    const cloneChildren = Array.from(effectiveCloneNode.childNodes);
+    const childCount = Math.min(sourceChildren.length, cloneChildren.length);
+
+    for (let index = 0; index < childCount; index++) {
+        promoteBoldInlineFormatting(sourceChildren[index], cloneChildren[index]);
+    }
+
+    return effectiveCloneNode;
 }
 
 /**
@@ -1535,6 +1582,21 @@ function appendXArticleSpacerBlock(
     blocks.push(block);
 }
 
+export function shouldInsertSpacerBetweenTweetTextBatches(
+    previousBlock: ContentBlock | undefined,
+    nextSegments: TweetTextSegment[]
+): boolean {
+    if (!previousBlock || !previousBlock.text.trim()) {
+        return false;
+    }
+
+    if (previousBlock.layout?.role === 'spacer') {
+        return false;
+    }
+
+    return nextSegments.some((segment) => segment.role !== 'spacer' && segment.text.trim());
+}
+
 function createXArticleParagraphContentBlock(
     segment: { html: string; text: string },
     options: {
@@ -2450,6 +2512,8 @@ function splitTweetTextIntoSegments(
     // 克隆后归一化翻译插件注入的元素（保留翻译内容，确保与原文正确分行）
     const cleanedElement = element.cloneNode(true) as HTMLElement;
     normalizeTranslationPluginElements(cleanedElement);
+    promoteBoldInlineFormatting(element, cleanedElement);
+    preserveTextNodeLineBreaks(cleanedElement);
     const fullText = (cleanedElement.innerText || cleanedElement.textContent || '').trim();
 
     if (!fullText) return [];
@@ -2477,15 +2541,6 @@ function splitTweetTextIntoSegments(
         return [{ html: cleanedHtml, text: fullText, role: 'normal' }];
     }
 
-    const paragraphTexts = splitTweetTextParagraphs(fullText);
-    if (paragraphTexts.length > 1) {
-        return paragraphTexts.map((paragraphText) => ({
-            html: escapeHtml(paragraphText),
-            text: paragraphText,
-            role: 'normal',
-        }));
-    }
-
     // 多段：对每段检查中英文混合（仅纯文本段落）
     const result: Array<{ html: string; text: string; role?: 'normal' }> = [];
     for (const seg of htmlSegments) {
@@ -2507,6 +2562,13 @@ function splitTweetTextIntoSegments(
     }
 
     return result;
+}
+
+export function splitTweetTextIntoSegmentsForTest(
+    element: HTMLElement,
+    options: BilingualAlignmentOptions = {}
+): TweetTextSegment[] {
+    return splitTweetTextIntoSegments(element, options);
 }
 
 function splitTweetTextParagraphs(text: string): string[] {
@@ -2766,6 +2828,56 @@ function extractQuoteArticleCoverSegments(quoteContainer: HTMLElement): TweetTex
     });
 
     return buildTwitterCardSegments(rowGroups, generateId);
+}
+
+export function buildMainTweetGenericFallbackSegmentsFromText(text: string): TweetTextSegment[] {
+    return splitTweetTextParagraphs(text)
+        .map((paragraph) => paragraph.trim())
+        .filter((paragraph) => paragraph && !isTwitterCardMetadataText(paragraph))
+        .map((paragraph) => ({
+            html: escapeHtml(paragraph),
+            text: paragraph,
+            role: 'normal' as const,
+        }));
+}
+
+function extractMainTweetFallbackSegments(
+    mainTweetArticle: HTMLElement,
+    quoteTweetContainers: HTMLElement[]
+): TweetTextSegment[] {
+    const cardDetailNodes = Array.from(mainTweetArticle.querySelectorAll(TWITTER_CARD_DETAIL_SELECTOR))
+        .filter((node): node is HTMLElement => node instanceof HTMLElement)
+        .filter((node) => !quoteTweetContainers.some((container) => container.contains(node)));
+
+    const cardSegments = cardDetailNodes.flatMap((node) => extractQuoteCardDetailSegments(node));
+    if (cardSegments.length > 0) {
+        return cardSegments;
+    }
+
+    const articleCoverSegments = extractQuoteArticleCoverSegments(mainTweetArticle);
+    if (articleCoverSegments.length > 0) {
+        return articleCoverSegments;
+    }
+
+    const fallbackClone = mainTweetArticle.cloneNode(true) as HTMLElement;
+    fallbackClone.querySelectorAll(
+        '[data-testid="User-Name"], time, [role="button"], svg, ' +
+        '[data-testid="reply"], [data-testid="retweet"], [data-testid="like"], ' +
+        '[data-testid="bookmark"], [data-testid="share"], [data-testid="analyticsButton"], ' +
+        '[data-testid="tweetPhoto"], [data-testid="quoteTweet"], img'
+    ).forEach((node) => node.remove());
+    normalizeTranslationPluginElements(fallbackClone);
+
+    const fallbackText = (fallbackClone.innerText || fallbackClone.textContent || '')
+        .replace(/^文章\n?/gm, '')
+        .replace(/^Article\n?/gm, '')
+        .trim();
+
+    if (!fallbackText) {
+        return [];
+    }
+
+    return buildMainTweetGenericFallbackSegmentsFromText(trimExtractedSegmentText(fallbackText));
 }
 
 function hasQuoteHandledAncestor(node: Element, container: HTMLElement): boolean {
@@ -3330,12 +3442,29 @@ async function extractTweetContent(container: HTMLElement, contentStart?: string
         if (seenTexts.has(normalizedCanonicalText)) continue;
         seenTexts.add(normalizedCanonicalText);
 
+        if (shouldInsertSpacerBetweenTweetTextBatches(blocks[blocks.length - 1], segments)) {
+            appendXArticleSpacerBlock(blocks, contentParts);
+        }
+
         segments.forEach((segment) => {
             if (segment.role !== 'spacer' && segment.text.trim()) {
                 textParts.push(segment.text);
             }
         });
         appendTwitterParagraphSegments(blocks, contentParts, segments);
+    }
+
+    if (textParts.length === 0) {
+        const fallbackSegments = extractMainTweetFallbackSegments(mainTweetArticle, quoteTweetContainers);
+        if (fallbackSegments.length > 0) {
+            fallbackSegments.forEach((segment) => {
+                if (segment.role !== 'spacer' && segment.text.trim()) {
+                    textParts.push(segment.text);
+                }
+            });
+            appendTwitterParagraphSegments(blocks, contentParts, fallbackSegments);
+            console.log(`[twitterExtractor] 🛟 主推文 fallback 提取生效: ${fallbackSegments.length} 个段落`);
+        }
     }
 
     console.log(`[twitterExtractor] 📝 主推文提取: ${mainTweetTextElements.length} 个文本块, ${textParts.length} 个有效段落`);

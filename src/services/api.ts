@@ -283,6 +283,8 @@ type NoteBody = Record<string, unknown> & {
   content?: unknown[];
 };
 
+const TITLE_SOURCE_SPACER_TEXT = '\u00A0';
+
 /**
  * Create original link HTML section with icon
  * Format: 📄 来源：🔗查看原文
@@ -295,8 +297,9 @@ function createOriginalLinkHtml(sourceUrl?: string): string {
 function buildNoteHtml(title: string, content: string, sourceUrl?: string): string {
   const cleanedContent = removeDuplicateTitleFromContent(content, title);
   const originalLinkHtml = createOriginalLinkHtml(sourceUrl);
+  const titleSpacerHtml = originalLinkHtml ? '<p><br></p>' : '';
   const sourceSpacerHtml = originalLinkHtml && cleanedContent ? '<p><br></p>' : '';
-  return `<h1>${escapeHtml(title)}</h1>${originalLinkHtml}${sourceSpacerHtml}${cleanedContent}`;
+  return `<h1>${escapeHtml(title)}</h1>${titleSpacerHtml}${originalLinkHtml}${sourceSpacerHtml}${cleanedContent}`;
 }
 
 export function buildNoteBody(
@@ -306,7 +309,81 @@ export function buildNoteBody(
   preparedHtml?: string
 ): NoteBody {
   const fullHtml = preparedHtml ?? buildNoteHtml(title, content, sourceUrl);
-  return htmlToNoteAtom(fullHtml) as unknown as NoteBody;
+  const body = htmlToNoteAtom(fullHtml) as unknown as NoteBody;
+  stabilizeTitleSourceSpacer(body, Boolean(sourceUrl));
+  return body;
+}
+
+function createVisibleSpacerParagraph(): Record<string, unknown> {
+  return {
+    type: 'paragraph',
+    content: [{ type: 'text', text: TITLE_SOURCE_SPACER_TEXT }],
+  };
+}
+
+function getParagraphText(block: unknown): string {
+  if (!block || typeof block !== 'object') {
+    return '';
+  }
+
+  const content: unknown[] = Array.isArray((block as { content?: unknown[] }).content)
+    ? ((block as { content?: unknown[] }).content ?? [])
+    : [];
+
+  return content
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+
+      return typeof (item as { text?: unknown }).text === 'string'
+        ? ((item as { text?: string }).text || '')
+        : '';
+    })
+    .join('');
+}
+
+function isParagraphBlock(block: unknown): boolean {
+  return Boolean(block && typeof block === 'object' && (block as { type?: unknown }).type === 'paragraph');
+}
+
+function isEmptyParagraphBlock(block: unknown): boolean {
+  if (!isParagraphBlock(block)) {
+    return false;
+  }
+
+  const content: unknown[] = Array.isArray((block as { content?: unknown[] }).content)
+    ? ((block as { content?: unknown[] }).content ?? [])
+    : [];
+
+  if (content.length === 0) {
+    return true;
+  }
+
+  return getParagraphText(block).replace(/[\s\u00A0\u3000]/g, '').length === 0;
+}
+
+function isSourceParagraphBlock(block: unknown): boolean {
+  return isParagraphBlock(block) && getParagraphText(block).replace(/\u2060/g, '').trim().startsWith('📄 来源：');
+}
+
+function stabilizeTitleSourceSpacer(body: NoteBody, hasSourceUrl: boolean): void {
+  if (!hasSourceUrl || !Array.isArray(body.content) || body.content.length === 0) {
+    return;
+  }
+
+  const sourceIndex = body.content.findIndex((block) => isSourceParagraphBlock(block));
+  if (sourceIndex <= 0) {
+    return;
+  }
+
+  const spacerIndex = sourceIndex - 1;
+  if (isEmptyParagraphBlock(body.content[spacerIndex])) {
+    body.content.splice(spacerIndex, 1, createVisibleSpacerParagraph());
+    return;
+  }
+
+  body.content.splice(sourceIndex, 0, createVisibleSpacerParagraph());
 }
 
 export async function createNote(

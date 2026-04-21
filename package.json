@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives",
     "typecheck": "tsc --noEmit",
+    "test:weixin-regression": "node scripts/verify-weixin-regressions.mjs",
     "test:x-twitter-regression": "node scripts/verify-x-twitter-regressions.mjs",
     "build:zip": "rm -rf dist && npm run build && mkdir -p releases && VERSION=$(node -p \"require('./package.json').version\") && cd dist && zip -r ../releases/mowen-plugin-v$VERSION.zip ."
   },

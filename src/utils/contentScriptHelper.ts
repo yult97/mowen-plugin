@@ -7,6 +7,8 @@
 
 import { TIMEOUT, popupLogger as logger } from './constants';
 
+const CONTENT_SCRIPT_VERSION = '2026-04-21-v2';
+
 /**
  * Inject the content script into a tab.
  * @param tabId - The tab ID to inject into
@@ -14,13 +16,13 @@ import { TIMEOUT, popupLogger as logger } from './constants';
  */
 export async function injectContentScript(tabId: number): Promise<boolean> {
     try {
-        const [{ result: isAlreadyInjected } = { result: false }] = await chrome.scripting.executeScript({
+        const [{ result: injectedVersion } = { result: null }] = await chrome.scripting.executeScript({
             target: { tabId },
-            func: () => Boolean((globalThis as { __mowenContentScriptLoaded__?: boolean }).__mowenContentScriptLoaded__),
+            func: () => (globalThis as { __mowenContentScriptVersion__?: string }).__mowenContentScriptVersion__ || null,
         });
 
-        if (isAlreadyInjected) {
-            logger.debug('Content script already injected, skipping executeScript');
+        if (injectedVersion === CONTENT_SCRIPT_VERSION) {
+            logger.debug('Content script already injected with current version, skipping executeScript');
             return true;
         }
 
@@ -57,7 +59,7 @@ export async function injectContentScript(tabId: number): Promise<boolean> {
 export async function pingContentScript(tabId: number, timeout: number = TIMEOUT.PING): Promise<boolean> {
     try {
         const response = await Promise.race([
-            chrome.tabs.sendMessage(tabId, { type: 'PING' }),
+            chrome.tabs.sendMessage(tabId, { type: 'PING_V2' }),
             new Promise<never>((_, reject) =>
                 setTimeout(() => reject(new Error('Timeout')), timeout)
             )

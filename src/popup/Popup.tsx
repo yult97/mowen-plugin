@@ -26,6 +26,13 @@ const TutorialModal = lazy(() => import('../components/TutorialModal'));
 // Card 4 state machine: P0-P5
 type PreviewState = 'P0_Idle' | 'P1_PreviewLoading' | 'P2_PreviewReady' | 'P3_Saving' | 'P4_Success' | 'P5_Failed';
 
+const CONTENT_SCRIPT_MESSAGE = {
+  PING: 'PING_V2',
+  START_EXTRACTION: 'START_EXTRACTION_V2',
+  STOP_EXTRACTION: 'STOP_EXTRACTION_V2',
+  GET_CACHED_CONTENT: 'GET_CACHED_CONTENT_V2',
+} as const;
+
 interface PopupProps {
   isSidePanel?: boolean;
 }
@@ -80,6 +87,10 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       Boolean(taskId) &&
       currentTaskIdRef.current === taskId
     );
+  };
+
+  const isCurrentTabMessage = (tabId?: number | null) => {
+    return typeof tabId === 'number' && currentTabIdRef.current === tabId;
   };
 
   useEffect(() => {
@@ -330,8 +341,14 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     };
 
     // Listen for content updates from lazy execution observer
-    const handleContentUpdate = (message: { type: string; data?: ExtractResult }) => {
+    const handleContentUpdate = (
+      message: { type: string; data?: ExtractResult },
+      sender?: chrome.runtime.MessageSender
+    ) => {
       if (message.type === 'CONTENT_UPDATED' && message.data) {
+        if (!isCurrentTabMessage(sender?.tab?.id)) {
+          return;
+        }
         // Guard: Don't interrupt saving or success state
         if (previewStateRef.current === 'P3_Saving' || previewStateRef.current === 'P4_Success') {
           console.log('[墨问 Popup] 🛑 Ignoring content update during save/success state');
@@ -390,7 +407,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       handleSaveProgress(message);
       handleSavePaused(message);
       handleSaveResumed(message);
-      handleContentUpdate(message);
+      handleContentUpdate(message, sender);
       handleContentScriptReady(message, sender);
       handleTabActivated(message);
     };
@@ -423,6 +440,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           setPreviewState('P0_Idle');
           return;
         }
+        const requestedTabId = tab.id;
 
         // Check if page is clippable
         if (tab.url) {
@@ -446,7 +464,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           for (let i = 0; i < maxAttempts; i++) {
             try {
               const pingRes = await Promise.race([
-                chrome.tabs.sendMessage(tabId, { type: 'PING' }),
+                chrome.tabs.sendMessage(tabId, { type: CONTENT_SCRIPT_MESSAGE.PING }),
                 new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 500))
               ]) as { success: boolean };
 
@@ -482,9 +500,14 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
         // OPTIMIZATION: Use START_EXTRACTION instead of EXTRACT_CONTENT to wake up the script if needed
         try {
           const response = await Promise.race([
-            chrome.tabs.sendMessage(tab.id, { type: 'START_EXTRACTION' }),
+            chrome.tabs.sendMessage(requestedTabId, { type: CONTENT_SCRIPT_MESSAGE.START_EXTRACTION }),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
           ]) as { success: boolean; data?: any; error?: string };
+
+          if (!isCurrentTabMessage(requestedTabId)) {
+            console.log('[墨问 Popup] Ignoring stale auto-fetch response from tab:', requestedTabId);
+            return;
+          }
 
           if (response?.success && response?.data) {
             console.log('[墨问 Popup] Auto-fetch success, images:', response.data.images?.length || 0);
@@ -583,6 +606,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       console.log('[墨问 Popup] Clippable:', canClip, 'URL:', tab?.url);
 
       if (canClip && tab?.id) {
+        const requestedTabId = tab.id;
         // Immediately try to get cached content without showing loading UI
         try {
           // Helper to inject content script (Removed: imported from utils)
@@ -591,18 +615,18 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           let pingResponse: { success: boolean; status: string } | undefined;
           try {
             pingResponse = await Promise.race([
-              chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
+              chrome.tabs.sendMessage(requestedTabId, { type: CONTENT_SCRIPT_MESSAGE.PING }),
               new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1000))
             ]) as { success: boolean; status: string } | undefined;
           } catch (pingErr) {
             console.log('[墨问 Popup] ⚠️ Content script not responding, attempting injection...');
             // Content script not available, try to inject it
-            const injected = await injectContentScript(tab.id);
+            const injected = await injectContentScript(requestedTabId);
             if (injected) {
               // Retry PING after injection
               try {
                 pingResponse = await Promise.race([
-                  chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
+                  chrome.tabs.sendMessage(requestedTabId, { type: CONTENT_SCRIPT_MESSAGE.PING }),
                   new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
                 ]) as { success: boolean; status: string } | undefined;
               } catch {
@@ -616,12 +640,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
             // Try to get cached content
             const cachedResponse = await Promise.race([
-              chrome.tabs.sendMessage(tab.id, { type: 'GET_CACHED_CONTENT' }),
+              chrome.tabs.sendMessage(requestedTabId, { type: CONTENT_SCRIPT_MESSAGE.GET_CACHED_CONTENT }),
               new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Cache check timeout')), 2000))
             ]) as { success: boolean; data?: ExtractResult; fromCache?: boolean; extracting?: boolean } | undefined;
 
             // If we have cached content, use it immediately and show preview state
-            if (cachedResponse?.success && cachedResponse?.data) {
+            if (cachedResponse?.success && cachedResponse?.data && isCurrentTabMessage(requestedTabId)) {
               console.log('[墨问 Popup] ✅ Loaded cached content, word count:', cachedResponse.data.wordCount);
               setExtractResult(cachedResponse.data);
               setPreviewState('P2_PreviewReady');
@@ -630,10 +654,10 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
               // Wait a bit and try again
               const tabId = tab.id; // Capture tab.id for closure
               setTimeout(async () => {
-                if (!tabId) return;
+                if (!tabId || !isCurrentTabMessage(tabId)) return;
                 try {
-                  const retryResponse = await chrome.tabs.sendMessage(tabId, { type: 'GET_CACHED_CONTENT' }) as { success: boolean; data?: ExtractResult; fromCache?: boolean } | undefined;
-                  if (retryResponse?.success && retryResponse?.data) {
+                  const retryResponse = await chrome.tabs.sendMessage(tabId, { type: CONTENT_SCRIPT_MESSAGE.GET_CACHED_CONTENT }) as { success: boolean; data?: ExtractResult; fromCache?: boolean } | undefined;
+                  if (retryResponse?.success && retryResponse?.data && isCurrentTabMessage(tabId)) {
                     console.log('[墨问 Popup] ✅ Got content after waiting');
                     setExtractResult(retryResponse.data);
                     setPreviewState('P2_PreviewReady');
@@ -743,6 +767,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       if (!tab?.id) {
         throw new Error('No active tab');
       }
+      const requestedTabId = tab.id;
 
       // Helper to inject content script (Removed: imported from utils)
 
@@ -752,7 +777,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
       try {
         const pingResponse = await Promise.race([
-          chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
+          chrome.tabs.sendMessage(tab.id, { type: CONTENT_SCRIPT_MESSAGE.PING }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 2000))
         ]) as { success: boolean; status: string } | undefined;
         isContentScriptReady = pingResponse?.success === true;
@@ -767,7 +792,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
           // Retry PING after injection
           try {
             const retryPing = await Promise.race([
-              chrome.tabs.sendMessage(tab.id, { type: 'PING' }),
+              chrome.tabs.sendMessage(tab.id, { type: CONTENT_SCRIPT_MESSAGE.PING }),
               new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
             ]) as { success: boolean; status: string } | undefined;
             isContentScriptReady = retryPing?.success === true;
@@ -798,12 +823,12 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
       // First, try to get cached content (fast path)
       const cachedResponse = await Promise.race([
-        chrome.tabs.sendMessage(tab.id, { type: 'GET_CACHED_CONTENT' }),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Cache check timeout')), 1000))
-      ]) as { success: boolean; data?: ExtractResult; fromCache?: boolean; extracting?: boolean } | undefined;
+          chrome.tabs.sendMessage(tab.id, { type: CONTENT_SCRIPT_MESSAGE.GET_CACHED_CONTENT }),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Cache check timeout')), 1000))
+        ]) as { success: boolean; data?: ExtractResult; fromCache?: boolean; extracting?: boolean } | undefined;
 
       // If we have cached content, use it immediately
-      if (cachedResponse?.success && cachedResponse?.data && cachedResponse?.fromCache) {
+      if (cachedResponse?.success && cachedResponse?.data && cachedResponse?.fromCache && isCurrentTabMessage(requestedTabId)) {
         console.log('[墨问] Using cached content, word count:', cachedResponse.data.wordCount);
         setExtractResult(cachedResponse.data);
         setPreviewState('P2_PreviewReady');
@@ -817,11 +842,11 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
 
         // Try again to get cached content
         const retryResponse = await Promise.race([
-          chrome.tabs.sendMessage(tab.id, { type: 'GET_CACHED_CONTENT' }),
+          chrome.tabs.sendMessage(tab.id, { type: CONTENT_SCRIPT_MESSAGE.GET_CACHED_CONTENT }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Cache retry timeout')), 5000))
         ]) as { success: boolean; data?: ExtractResult; fromCache?: boolean } | undefined;
 
-        if (retryResponse?.success && retryResponse?.data) {
+        if (retryResponse?.success && retryResponse?.data && isCurrentTabMessage(requestedTabId)) {
           console.log('[墨问] Got content after waiting, word count:', retryResponse.data.wordCount);
           setExtractResult(retryResponse.data);
           setPreviewState('P2_PreviewReady');
@@ -832,9 +857,14 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
       // No cache available, do full extraction (fallback)
       console.log('[墨问] No cache available, doing full extraction');
       const response = await Promise.race([
-        chrome.tabs.sendMessage(tab.id, { type: 'START_EXTRACTION' }),
+        chrome.tabs.sendMessage(requestedTabId, { type: CONTENT_SCRIPT_MESSAGE.START_EXTRACTION }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('请求超时')), 15000))
       ]);
+
+      if (!isCurrentTabMessage(requestedTabId)) {
+        console.log('[墨问 Popup] Ignoring stale manual preview response from tab:', requestedTabId);
+        return;
+      }
 
       if (response?.success) {
         setExtractResult(response.data);
@@ -913,7 +943,7 @@ const Popup: React.FC<PopupProps> = ({ isSidePanel = false }) => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) {
-        chrome.tabs.sendMessage(tab.id, { type: 'STOP_EXTRACTION' }).catch(() => { });
+        chrome.tabs.sendMessage(tab.id, { type: CONTENT_SCRIPT_MESSAGE.STOP_EXTRACTION }).catch(() => { });
       }
     } catch (e) {
       // Ignore

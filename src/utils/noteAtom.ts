@@ -107,6 +107,7 @@ interface HtmlToNoteAtomOptions {
 
 const PRESERVE_INLINE_PARAGRAPH_ATTR = 'data-mowen-preserve-inline-paragraph';
 const INLINE_BREAK_SENTINEL = '\uE000';
+const HTML_BREAK_TAG_RE = /<br\b[^>]*\/?>/gi;
 const INVISIBLE_TEXT_CHAR_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/g;
 
 function escapeHtmlAttributeValue(value: string): string {
@@ -307,7 +308,7 @@ function parseBlockContent(
 
   // 4.5 Preserve intentionally empty block tags before generic boundary splitting.
   normalized = normalized.replace(
-    /<(p|div|section|article|main|aside|header|footer)\b[^>]*>(?:\s|&nbsp;|&#160;|<br\s*\/?>)*<\/\1>/gi,
+    /<(p|div|section|article|main|aside|header|footer)\b[^>]*>(?:\s|&nbsp;|&#160;|<br\b[^>]*\/?>)*<\/\1>/gi,
     '\n<!--EMPTY_BLOCK-->\n'
   );
 
@@ -327,7 +328,7 @@ function parseBlockContent(
   normalized = normalized
     .replace(/<\/(p|div|section|article|main|aside|header|footer|figure|figcaption|tr|td|th)>/gi, '\n<!--BLOCK_END-->\n')
     .replace(/<(p|div|section|article|main|aside|header|footer|figure|figcaption|tr|td|th)\b[^>]*>/gi, '\n<!--BLOCK_START-->\n')
-    .replace(/<br\s*\/?>/gi, '\n<!--EMPTY_LINE-->\n')
+    .replace(HTML_BREAK_TAG_RE, '\n<!--EMPTY_LINE-->\n')
     .replace(/<hr\s*\/?>/gi, '\n<!--HR-->\n');
 
   // 6. 确保 QUOTE、CODE、IMG 占位符独立成行，便于后续匹配
@@ -405,7 +406,7 @@ function parseBlockContent(
 
           // Normalize various line break patterns to a consistent marker
           quoteContent = quoteContent
-            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(HTML_BREAK_TAG_RE, '\n')
             .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
             .replace(/<\/div>\s*<div[^>]*>/gi, '\n')
             .replace(/<\/?(?:p|div)[^>]*>/gi, '\n')
@@ -449,7 +450,7 @@ function parseBlockContent(
 
           // 移除 HTML 标签但保留换行
           codeText = codeText
-            .replace(/<br\s*\/?>/gi, '\n')  // 将 <br> 转为换行
+            .replace(HTML_BREAK_TAG_RE, '\n')  // 将 <br> 转为换行
             .replace(/<[^>]+>/g, '')         // 移除其他 HTML 标签
             .replace(/&lt;/g, '<')           // 解码常见实体
             .replace(/&gt;/g, '>')
@@ -1019,7 +1020,7 @@ function appendParagraphBlocks(
 
 function isBlankPreservedInlineParagraphHtml(html: string): boolean {
   const normalized = html
-    .replace(/<br\s*\/?>/gi, '')
+    .replace(HTML_BREAK_TAG_RE, '')
     .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;|&#160;/gi, ' ')
     .trim();
@@ -1043,8 +1044,100 @@ function appendPreservedInlineParagraphBlock(
     return;
   }
 
-  blocks.push({ type: 'paragraph', content: inline });
-  stats.paragraph++;
+  const segments = splitPreservedInlineParagraphSegments(inline);
+  for (const segment of segments) {
+    if (segment === 'spacer') {
+      blocks.push({ type: 'paragraph' });
+      stats.paragraph++;
+      continue;
+    }
+
+    if (!hasRealContent(segment)) {
+      continue;
+    }
+
+    blocks.push({ type: 'paragraph', content: segment });
+    stats.paragraph++;
+  }
+}
+
+function splitPreservedInlineParagraphSegments(inline: NoteAtom[]): Array<NoteAtom[] | 'spacer'> {
+  const text = inline
+    .map((node) => (node.type === 'text' ? node.text || '' : ''))
+    .join('');
+
+  if (!text.includes('\n')) {
+    return [trimInlineBoundaryWhitespace(inline)];
+  }
+
+  const contentStart = text.search(/[^\n]/);
+  if (contentStart === -1) {
+    return ['spacer'];
+  }
+
+  let contentEnd = text.length;
+  while (contentEnd > contentStart && text[contentEnd - 1] === '\n') {
+    contentEnd -= 1;
+  }
+  const trailingLineBreakCount = text.length - contentEnd;
+  const contentText = text.slice(contentStart, contentEnd);
+  const shouldPromoteSingleLineBreakAsParagraphBoundary =
+    trailingLineBreakCount >= 2 && contentText.includes('\n');
+
+  const segments: Array<NoteAtom[] | 'spacer'> = [];
+  let cursor = contentStart;
+
+  while (cursor < contentEnd) {
+    let boundaryStart = -1;
+    let boundaryEnd = -1;
+
+    for (let index = cursor; index < contentEnd; index += 1) {
+      if (text[index] !== '\n') {
+        continue;
+      }
+
+      let runEnd = index;
+      while (runEnd < contentEnd && text[runEnd] === '\n') {
+        runEnd += 1;
+      }
+
+      const lineBreakCount = runEnd - index;
+      const shouldSplitAtBoundary = shouldPromoteSingleLineBreakAsParagraphBoundary
+        ? lineBreakCount >= 1
+        : lineBreakCount >= 2;
+
+      if (shouldSplitAtBoundary) {
+        boundaryStart = index;
+        boundaryEnd = runEnd;
+        break;
+      }
+
+      index = runEnd - 1;
+    }
+
+    if (boundaryStart === -1 || boundaryEnd === -1) {
+      const tail = trimInlineBoundaryWhitespace(sliceInlineContentNodes(inline, cursor, contentEnd));
+      if (tail.length > 0) {
+        segments.push(tail);
+      }
+      break;
+    }
+
+    const paragraph = trimInlineBoundaryWhitespace(sliceInlineContentNodes(inline, cursor, boundaryStart));
+    if (paragraph.length > 0) {
+      segments.push(paragraph);
+    }
+
+    const lineBreakCount = boundaryEnd - boundaryStart;
+    const shouldInsertSpacer = lineBreakCount >= 2;
+    if (shouldInsertSpacer && segments[segments.length - 1] !== 'spacer') {
+      segments.push('spacer');
+    }
+
+    cursor = boundaryEnd;
+  }
+
+  return segments.length > 0 ? segments : [trimInlineBoundaryWhitespace(inline)];
 }
 
 function splitParagraphInlineContent(
@@ -1251,7 +1344,7 @@ function parseInlineContent(
   // Remove placeholders
   html = html.replace(/<!--(?:IMG|QUOTE):\d+-->|@@MOWEN_CODE_BLOCK_\d+@@/g, '');
   if (preserveLineBreaks) {
-    html = html.replace(/<br\s*\/?>/gi, INLINE_BREAK_SENTINEL);
+    html = html.replace(HTML_BREAK_TAG_RE, INLINE_BREAK_SENTINEL);
   }
 
   // Parse inline elements
@@ -1266,7 +1359,9 @@ function parseInlineContent(
     // Add text before this tag
     if (match.index > lastIndex) {
       const text = preserveLineBreaks
-        ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex, match.index))
+        ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex, match.index), {
+          trimBoundaryLineBreaks: false,
+        })
         : stripHtmlAndDecode(html.slice(lastIndex, match.index));
       if (text) {
         result.push(...createTextNodesWithAutoLinks(text, currentMarks));
@@ -1341,7 +1436,9 @@ function parseInlineContent(
   // Add remaining text
   if (lastIndex < html.length) {
     const text = preserveLineBreaks
-      ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex))
+      ? stripHtmlAndDecodePreserveLineBreaks(html.slice(lastIndex), {
+        trimBoundaryLineBreaks: false,
+      })
       : stripHtmlAndDecode(html.slice(lastIndex));
     if (text) {
       result.push(...createTextNodesWithAutoLinks(text, currentMarks));
@@ -1628,7 +1725,11 @@ function stripHtmlAndDecode(html: string): string {
   return text;
 }
 
-function stripHtmlAndDecodePreserveLineBreaks(html: string): string {
+function stripHtmlAndDecodePreserveLineBreaks(
+  html: string,
+  options: { trimBoundaryLineBreaks?: boolean } = {}
+): string {
+  const { trimBoundaryLineBreaks = true } = options;
   let text = html.replace(/<[^>]+>/g, '');
   text = decodeHtmlEntities(text);
   text = text.split(INLINE_BREAK_SENTINEL).join('\n');
@@ -1640,7 +1741,9 @@ function stripHtmlAndDecodePreserveLineBreaks(html: string): string {
   // For non-empty preserved-inline paragraphs, trim boundary <br> runs so they
   // do not stack with block-level spacers later in the save pipeline, while
   // still preserving one intentional blank line inside the paragraph.
-  text = text.replace(/^\n+|\n+$/g, '');
+  if (trimBoundaryLineBreaks) {
+    text = text.replace(/^\n+|\n+$/g, '');
+  }
   text = text.replace(/\n{3,}/g, '\n\n');
   return text;
 }

@@ -129,6 +129,14 @@ function isShortStandalonePrefix(prefix: string, script: 'han' | 'latin'): boole
   return countLatinWords(normalized) >= 2 && countHanCharacters(normalized) === 0;
 }
 
+function hasStrongBoundaryCue(prefix: string, between: string): boolean {
+  if (/[>→\-–—]/.test(between)) {
+    return true;
+  }
+
+  return /[：:。！？!?；;]$/.test(trimMixedLanguageBoundaryTail(prefix));
+}
+
 function findMixedLanguageSplitIndex(text: string): number {
   for (let cursor = 1; cursor < text.length; cursor++) {
     const left = findPreviousScriptCharacter(text, cursor - 1);
@@ -156,7 +164,8 @@ function findMixedLanguageSplitIndex(text: string): number {
     const rightIsLatin = /[A-Za-z]/.test(right.char);
 
     if (leftIsHan && rightIsLatin && startsWithLongEnglishPhrase(suffix)) {
-      if (countHanCharacters(prefix) >= 6) {
+      const shouldSplitLongPrefix = countHanCharacters(prefix) >= 6 && hasStrongBoundaryCue(prefix, between);
+      if (shouldSplitLongPrefix) {
         return splitIndex;
       }
 
@@ -164,7 +173,8 @@ function findMixedLanguageSplitIndex(text: string): number {
         return splitIndex;
       }
     } else if (leftIsLatin && rightIsHan && startsWithLongHanPhrase(suffix)) {
-      if (countLatinWords(prefix) >= 3) {
+      const shouldSplitLongPrefix = countLatinWords(prefix) >= 3 && hasStrongBoundaryCue(prefix, between);
+      if (shouldSplitLongPrefix) {
         // 确保英文前缀包含空格分隔的多个独立词，
         // 避免把连字符连接的单一标识符（如 "tmux-cli-driver"）误判为长英文短语
         const trimmedPrefix = trimMixedLanguageBoundaryTail(prefix);
