@@ -82,7 +82,9 @@ export function buildMowenPreviewBodyHtml(html: string): string {
   const finalHtml = noteAtomToHtml(atom, {
     resolveImageUrl: (uuid) => previewImages.get(uuid)?.src || uuid,
   });
-  return finalizeMowenPreviewHtml(reattachPreviewImageMetadata(finalHtml, Array.from(previewImages.values())));
+  return stripPreviewInvisibleTextFromHtml(
+    finalizeMowenPreviewHtml(reattachPreviewImageMetadata(finalHtml, Array.from(previewImages.values())))
+  );
 }
 
 export function buildEditedPreviewExtractResult(params: {
@@ -92,11 +94,12 @@ export function buildEditedPreviewExtractResult(params: {
   baselineHtml?: string;
 }): ExtractResult {
   const sanitizedHtml = sanitizeEditablePreviewHtml(params.html);
+  const normalizedComparisonHtml = stripPreviewInvisibleTextFromHtml(sanitizedHtml);
   const baselineHtml = params.baselineHtml
-    ? sanitizeEditablePreviewHtml(params.baselineHtml)
+    ? stripPreviewInvisibleTextFromHtml(sanitizeEditablePreviewHtml(params.baselineHtml))
     : '';
 
-  if (baselineHtml && sanitizedHtml === baselineHtml) {
+  if (baselineHtml && normalizedComparisonHtml === baselineHtml) {
     return {
       ...params.extractResult,
       title: params.title,
@@ -360,6 +363,10 @@ function collectPreviewImageCandidates(
 
 function stripPreviewFormatting(text: string): string {
   return text.replace(PREVIEW_INVISIBLE_TEXT_PATTERN, '');
+}
+
+function stripPreviewInvisibleTextFromHtml(html: string): string {
+  return html.replace(PREVIEW_INVISIBLE_TEXT_PATTERN, '');
 }
 
 function normalizeListParagraphText(text: string): string {

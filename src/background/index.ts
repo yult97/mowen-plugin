@@ -74,6 +74,8 @@ interface NoteBlockEntry {
   groupId?: string;
 }
 
+const INVISIBLE_WORD_JOINER_PATTERN = /\u2060/g;
+
 registerSidePanelHandlers({ formatErrorForLog });
 registerContextMenuHandlers({
   getSettings,
@@ -356,6 +358,7 @@ async function handleSaveNote(
     preferContentHtml?: boolean;
     preserveInlineParagraphs?: boolean;
     preserveBodyMode?: boolean;
+    stripInvisibleWordJoiners?: boolean;
   } = {}
 ): Promise<NoteCreateResult> {
   // Defensive check for payload
@@ -485,6 +488,7 @@ async function handleSaveNote(
         {
           preserveBodyMode: options.preserveBodyMode === true,
           normalizeMarkdownBodySpacing: shouldNormalizeTextSpacing,
+          stripInvisibleWordJoiners: options.stripInvisibleWordJoiners === true,
           htmlToNoteAtomOptions: shouldNormalizeTextSpacing
             ? {
               preserveInlineParagraphs: shouldPreserveInlineParagraphs,
@@ -579,6 +583,7 @@ async function handleSaveMarkdownNote(payload: SaveNotePayload, tabId: number): 
     normalizeMarkdownTextSpacing: true,
     preserveInlineParagraphs: true,
     preserveBodyMode: true,
+    stripInvisibleWordJoiners: true,
   });
 }
 // function createMetaHeader removed
@@ -668,8 +673,6 @@ function normalizeTitleForComparison(text: string): string {
 
 const INVISIBLE_TITLE_CHARS_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/g;
 const SINGLE_INVISIBLE_TITLE_CHAR_PATTERN = /(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/;
-const MARKDOWN_SPACER_TEXT = '\u00A0';
-
 function stripInvisibleTitleChars(text: string): string {
   return text.replace(INVISIBLE_TITLE_CHARS_PATTERN, '');
 }
@@ -680,8 +683,9 @@ function isSpacerOnlyText(text: string): boolean {
 
 function createMarkdownSpacerParagraphNode(): NoteAtomNode {
   return {
+    // Keep spacer rows as standard empty paragraphs so Mowen re-editing
+    // treats them like normal blank lines instead of invisible text blocks.
     type: 'paragraph',
-    content: [{ type: 'text', text: MARKDOWN_SPACER_TEXT }],
   };
 }
 
@@ -1073,6 +1077,7 @@ export function splitContent(
   options: {
     preserveBodyMode?: boolean;
     normalizeMarkdownBodySpacing?: boolean;
+    stripInvisibleWordJoiners?: boolean;
     htmlToNoteAtomOptions?: {
       preserveInlineParagraphs?: boolean;
       enforceSingleTextBlockSpacing?: boolean;
@@ -1098,12 +1103,15 @@ export function splitContent(
 
   if (totalTextLength <= limit) {
     if ((blocks && blocks.length > 0) || options.preserveBodyMode) {
+      const body = buildMultipartBody(title, sourceUrl, contentEntries.map((entry) => entry.node));
       return [{
         createMode: 'body',
         index: 0,
         total: 1,
         title,
-        body: buildMultipartBody(title, sourceUrl, contentEntries.map((entry) => entry.node)),
+        body: options.stripInvisibleWordJoiners
+          ? stripInvisibleWordJoinersFromDoc(body)
+          : body,
       }];
     }
 
@@ -1136,12 +1144,15 @@ export function splitContent(
 
   return groupedBlocks.map((blocks, index) => {
     const partTitle = index === 0 ? title : `${title} (${index + 1})`;
+    const body = buildMultipartBody(partTitle, sourceUrl, blocks.map((entry) => entry.node));
     return {
       createMode: 'body' as const,
       index,
       total,
       title: partTitle,
-      body: buildMultipartBody(partTitle, sourceUrl, blocks.map((entry) => entry.node)),
+      body: options.stripInvisibleWordJoiners
+        ? stripInvisibleWordJoinersFromDoc(body)
+        : body,
     };
   });
 }
@@ -1344,6 +1355,29 @@ function getNodeText(node: NoteAtomNode): string {
 
 function cloneNoteAtomNode<T extends NoteAtomNode>(node: T): T {
   return JSON.parse(JSON.stringify(node)) as T;
+}
+
+function stripInvisibleWordJoinersFromNode<T extends NoteAtomNode>(node: T): T {
+  const clonedNode = cloneNoteAtomNode(node);
+
+  if (typeof clonedNode.text === 'string' && clonedNode.text.includes('\u2060')) {
+    clonedNode.text = clonedNode.text.replace(INVISIBLE_WORD_JOINER_PATTERN, '');
+  }
+
+  if (Array.isArray(clonedNode.content)) {
+    clonedNode.content = clonedNode.content.map((child) => stripInvisibleWordJoinersFromNode(child));
+  }
+
+  return clonedNode;
+}
+
+function stripInvisibleWordJoinersFromDoc(doc: NoteAtomDoc): NoteAtomDoc {
+  return {
+    ...doc,
+    content: Array.isArray(doc.content)
+      ? doc.content.map((node) => stripInvisibleWordJoinersFromNode(node))
+      : doc.content,
+  };
 }
 
 

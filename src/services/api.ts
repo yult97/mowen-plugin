@@ -283,8 +283,6 @@ type NoteBody = Record<string, unknown> & {
   content?: unknown[];
 };
 
-const TITLE_SOURCE_SPACER_TEXT = '\u00A0';
-
 /**
  * Create original link HTML section with icon
  * Format: 📄 来源：🔗查看原文
@@ -316,8 +314,9 @@ export function buildNoteBody(
 
 function createVisibleSpacerParagraph(): Record<string, unknown> {
   return {
+    // Use a native empty paragraph to preserve spacing without emitting
+    // an invisible-text paragraph that confuses the Mowen editor.
     type: 'paragraph',
-    content: [{ type: 'text', text: TITLE_SOURCE_SPACER_TEXT }],
   };
 }
 
