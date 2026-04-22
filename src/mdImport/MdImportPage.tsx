@@ -376,6 +376,7 @@ function MdImportPage(): JSX.Element {
 
       const content = await file.text();
       setMarkdown(content);
+      setIsEditorExpanded(true);
       setIsDragOver(false);
     } catch (error) {
       setFileName('');
